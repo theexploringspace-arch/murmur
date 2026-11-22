@@ -43,7 +43,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 42 unit tests: crypto, protocol, attacks, QR codec
+npm test            # 47 unit tests: crypto, protocol, attacks, QR codec, build output
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -82,7 +82,17 @@ install on secure origins). After that first load it runs with no network at all
    - **Android (Chrome):** ⋮ → *Install app* / *Add to Home screen*
 4. Open it from the home screen. Settings shows "Installed — works with no network".
 
-Any static HTTPS host works (Netlify, Cloudflare Pages: `_headers` sets the security headers there).
+### Second host (recommended): Netlify
+
+Some networks can't reach GitHub Pages' servers (`185.199.108–111.153`) at all — the page just
+stalls. Publishing to a second provider gives friends a backup install link:
+
+1. app.netlify.com → sign in with GitHub → import this repository.
+2. **Build command:** `node tools/build.mjs` · **Publish directory:** `dist`
+3. Deploy. `_headers` applies Murmur's security headers there automatically.
+
+Both hosts serve byte-identical code — compare the **build fingerprint** in Settings.
+Test whether a network can reach a host first: `curl.exe -4 -I --max-time 15 https://<site>`
 
 ### Using it with no internet
 
