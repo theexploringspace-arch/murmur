@@ -58,6 +58,14 @@ export class Scanner {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
     });
+    // Ask for continuous autofocus where the platform supports it (Image Capture
+    // constraints; honoured by Chrome on Android, ignored elsewhere). Never fatal.
+    try {
+      const track = this.stream.getVideoTracks()[0];
+      const caps = track.getCapabilities?.() || {};
+      if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous'))
+        await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    } catch { /* unsupported — fine */ }
     this.video.srcObject = this.stream;
     this.video.setAttribute('playsinline', '');
     this.video.muted = true;
