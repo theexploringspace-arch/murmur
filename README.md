@@ -43,7 +43,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 47 unit tests: crypto, protocol, attacks, QR codec, build output
+npm test            # 48 unit tests: crypto, protocol, attacks, QR codec, build output
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -82,17 +82,30 @@ install on secure origins). After that first load it runs with no network at all
    - **Android (Chrome):** ⋮ → *Install app* / *Add to Home screen*
 4. Open it from the home screen. Settings shows "Installed — works with no network".
 
-### Second host (recommended): Netlify
+### Second host (recommended): Cloudflare Pages
 
 Some networks can't reach GitHub Pages' servers (`185.199.108–111.153`) at all — the page just
-stalls. Publishing to a second provider gives friends a backup install link:
+stalls. Publish to a second provider that **serves the files unmodified**:
 
-1. app.netlify.com → sign in with GitHub → import this repository.
-2. **Build command:** `node tools/build.mjs` · **Publish directory:** `dist`
+1. dash.cloudflare.com → **Workers & Pages** → **Create application** → **Pages** →
+   **Connect to Git** (or *Import an existing Git repository*) → pick this repository.
+2. **Framework preset:** None · **Build command:** `node tools/build.mjs` · **Build output directory:** `dist`
 3. Deploy. `_headers` applies Murmur's security headers there automatically.
+
+Cloudflare redirects `/index.html` to `/`. The service worker therefore downloads the page from
+`./` (which every host serves) and still refuses any redirect it didn't expect. The local dev
+server copies Cloudflare's redirect so the offline e2e test covers it.
+
+**Avoid hosts that inject into your pages.** Netlify's free plan adds a "Powered by Netlify"
+script to every HTML page and only lets paid plans turn it off. Murmur's service worker sees
+that `index.html` no longer matches its build hash and **refuses to install** — so offline
+mode never turns on (Settings and a red banner say so). That refusal is the security feature
+working: an injected script runs with Murmur's full permissions.
 
 Both hosts serve byte-identical code — compare the **build fingerprint** in Settings.
 Test whether a network can reach a host first: `curl.exe -4 -I --max-time 15 https://<site>`
+Test whether a host alters the page: `curl.exe -s https://<site>/index.html | Select-String -Pattern "<script" -SimpleMatch`
+— Murmur's own page has exactly one line with `<script`.
 
 ### Using it with no internet
 
