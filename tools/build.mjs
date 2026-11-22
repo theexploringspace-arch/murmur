@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+// build.mjs — src/ → dist/ with integrity manifest + build fingerprint.
+// No bundler, no minifier, no dependencies: what you read in src/ is exactly
+// what runs, so anyone can audit the deployed files against this repository.
+//
+//   node tools/build.mjs            → dist/
+//   node tools/build.mjs --out DIR  → DIR/
+
+import { createHash } from 'node:crypto';
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, rmSync, statSync, copyFileSync } from 'node:fs';
+import { join, relative, dirname, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const src = join(root, 'src');
+const outArg = process.argv.indexOf('--out');
+const out = outArg > 0 ? process.argv[outArg + 1] : join(root, 'dist');
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+
+const walk = (d) => readdirSync(d).flatMap((f) => (statSync(join(d, f)).isDirectory() ? walk(join(d, f)) : [join(d, f)]));
+const sha = (b) => createHash('sha256').update(b).digest('hex');
+const rel = (f) => './' + relative(src, f).split(sep).join('/');
+
+rmSync(out, { recursive: true, force: true });
+mkdirSync(out, { recursive: true });
+const files = {};
+for (const f of walk(src).sort()) {
+  const r = rel(f);
+  if (r === './sw.template.js' || /(^|\/)\./.test(r.slice(2))) continue; // skip dotfiles
+  mkdirSync(dirname(join(out, r)), { recursive: true });
+  copyFileSync(f, join(out, r));
+  files[r] = sha(readFileSync(f));
+}
+
+// Fingerprint = SHA-256 over the sorted "hash  path" list (like sha256sum output).
+const listing = Object.keys(files).sort().map((p) => `${files[p]}  ${p}`).join('\n') + '\n';
+const fp = sha(listing);
+const fingerprint = fp.slice(0, 32).match(/.{4}/g).join('-');
+const info = { name: pkg.name, version: pkg.version, fingerprint, sha256: fp, files };
+const infoJson = JSON.stringify(info, null, 2) + '\n';
+writeFileSync(join(out, 'build-info.json'), infoJson);
+writeFileSync(join(out, 'SHA256SUMS'), listing);
+
+const precache = { ...files, './build-info.json': sha(infoJson) };
+const sw = readFileSync(join(src, 'sw.template.js'), 'utf8')
+  .replace("'__VERSION__'", JSON.stringify(`${pkg.version}-${fp.slice(0, 12)}`))
+  .replace('__PRECACHE__', JSON.stringify(precache, null, 2));
+writeFileSync(join(out, 'sw.js'), sw);
+
+console.log(`Built ${Object.keys(files).length} files → ${relative(process.cwd(), out) || '.'}`);
+console.log(`Build fingerprint: ${fingerprint}`);

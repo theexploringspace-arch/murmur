@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!--
+    Content Security Policy — the page may load NOTHING except its own files.
+    • default-src 'none'         everything denied unless listed
+    • script-src 'self'          no inline scripts, no eval, no third-party JS
+    • connect-src 'self' blob:   fetch only our own origin + in-memory attachments
+    • img-src/media-src blob:    received images & the camera preview stay in memory
+    • require-trusted-types-for  (Chromium) no string → HTML/script sinks at all
+    WebRTC is not governed by CSP; the app configures it with zero ICE servers.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' blob:; worker-src 'self'; manifest-src 'self'; font-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types murmur">
+  <meta name="referrer" content="no-referrer">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0e1116">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Murmur">
+  <meta name="description" content="Offline, end-to-end encrypted messaging. No servers, no cloud.">
+  <title>Murmur</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="./icons/icon-180.png">
+  <link rel="stylesheet" href="./css/app.css">
+  <script type="module" src="./js/app.js"></script>
+</head>
+<body>
+  <div id="app" aria-live="polite"><noscript>Murmur needs JavaScript — it runs entirely on your device.</noscript></div>
+</body>
+</html>

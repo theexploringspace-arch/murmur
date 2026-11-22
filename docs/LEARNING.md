@@ -1,0 +1,69 @@
+# Learning with Murmur
+
+A guided tour for reading this codebase like a security engineer, plus exercises. Do them without
+AI first; each has a hint and a way to check yourself.
+
+## Reading order (≈ 2 hours)
+
+1. `src/js/core/bytes.js` — how bytes move. Note `Reader.end()`: parsers that ignore trailing
+   bytes are a classic source of signature-bypass bugs.
+2. `src/js/core/crypto.js` — the *only* place primitives are called. Ask of every function: what
+   happens on bad input?
+3. `src/js/core/pairing.js` — read `parsePairingCode` top to bottom. Why is the signature checked
+   **before** the kind/expiry checks, and why is that order safe?
+4. `src/js/core/session.js` — the heart. Trace one message: `sendMessage → #encryptAndSend →
+   rawSend → (wire) → receive → #handle → #onData`. Then trace `rekey()` with both queues in mind.
+5. `src/js/core/vault.js` — key hierarchy. Why wrap the identity key with the DEK and not directly
+   with the passphrase key? (Answer: changing the passphrase re-wraps one 32-byte key, not everything.)
+6. `test/unit/core.test.mjs` — every attack test is a claim about the code. Find the line of code
+   each one depends on.
+7. `src/js/qr/decode.js` — computer vision without a library: binarize → find → fit → sample → correct.
+
+## Exercises
+
+### 1. Break it on purpose (debugging)
+In `session.js`, change `if (seq !== chain.seq)` to `if (seq < chain.seq)`.
+Run `npm test`. **Which test fails, and what error message does it now report instead of "missing message"?**
+Why is the session still killed even though the sequence check no longer catches the gap?
+What does this teach about defence in depth — and about misleading error messages when debugging?
+*Hint:* the receiver's chain key is still at step 0 when frame 1 arrives.
+*Check:* revert, and confirm 42/42.
+
+### 2. Threat-model question
+Murmur puts **both DTLS fingerprints** into the transcript `T`. Remove them (pass empty arrays)
+and reason: who could now sit in the middle, and what would they still be unable to do?
+Write your answer as an attack sequence diagram before running the "fingerprint mismatch" test.
+
+### 3. Find the boundary
+Someone reports: "We both scanned, it says *Connecting…* forever." List the layers from
+ARCHITECTURE.md's debugging table in order. For each, name **one observation** that would
+rule it in or out (e.g. `chrome://webrtc-internals` → ICE candidate pair state).
+
+### 4. Implement: safety-number QR
+Today users compare 60 digits by eye. Add a button on the contact screen that shows the safety
+number as a QR, and a "verify by scanning" flow that marks the contact `verified: true` when the
+scanned number equals the computed one. Write the unit test first (`identity.js` is pure).
+*Constraint:* the stored `verified` flag must reset if the contact's key ever changes.
+
+### 5. Implement: per-message expiry enforcement on the sender's history
+`persistHistory` in `app.js` already skips `ttl` messages — but nothing tests it, because it lives in
+the UI layer. Move the filtering into a pure function in `core/` (e.g. `historyToStore(msgs)`), call it
+from `app.js`, and write a test proving a disappearing message is **never** written to the vault, even
+with history on. (Use `MemoryStore` + `Vault` directly — no browser required.) Spotting untested
+security logic in the UI layer and pulling it into a testable core is the real lesson.
+
+### 6. Attack the QR decoder (fuzzing)
+Write a test that feeds `decodeMatrix` 10,000 random 21×21…57×57 matrices and asserts it never
+throws anything except `Error` and never hangs > 50 ms. What's the worst-case path through
+`rsDecode`? Is there any input that makes `tryDecode` loop excessively?
+
+### 7. Threat-model question
+The vault wipes after N wrong passphrases. Describe precisely the attacker for whom this
+helps, and the attacker for whom it does nothing. Then: what would *actually* stop the second
+attacker? (Consider: hardware-backed keys, WebAuthn PRF, memory-hard KDFs.)
+
+### 8. Port the protocol (stretch)
+PROTOCOL.md is transport-agnostic. Implement `SecureSession` in Kotlin with
+`java.security` (ECDH/ECDSA P-256, HKDF via HMAC, AES/GCM) and make it interoperate with the JS
+version over a local WebSocket. The unit tests' handshake vectors are your conformance suite.
+This is the first step toward a native Android client with Wi-Fi Direct — no shared network needed.
