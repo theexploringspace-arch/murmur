@@ -108,4 +108,5 @@ root cause. The unit tests mirror those boundaries, so a failing layer usually h
 | vault | `core.test.mjs` | ciphertext-only storage, wrong pass, wipe, AAD swap, re-wrap |
 | session | `core.test.mjs` | impostor, channel-binding mismatch, tamper, replay, gap, off-curve key, re-key under load, key erasure |
 | QR | `qr.test.mjs` | RS fuzzing; all 40 versions × 4 ECC; camera distortions; OpenCV both ways |
+| build output | `build.test.mjs` | every precached file exists with its hash; host config never precached; fingerprint covers the offline engine; reproducible |
 | whole app | `e2e/run.mjs` | two Chromium profiles; network guard; offline; CSP/TT; fake camera |
