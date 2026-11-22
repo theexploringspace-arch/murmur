@@ -31,7 +31,11 @@ async function precache() {
   {
     const cache = await caches.open(CACHE);
     for (const [path, want] of Object.entries(FILES)) {
-      const res = await fetch(path, { cache: 'no-store', credentials: 'omit', redirect: 'error' });
+      // Hosts disagree about './index.html': Cloudflare Pages redirects it to './' (pretty URLs),
+      // GitHub Pages and Netlify serve it directly. Every host serves the directory URL './',
+      // so fetch that. Redirects stay forbidden: a redirect we didn't expect is not trusted.
+      const url = path === './index.html' ? './' : path;
+      const res = await fetch(url, { cache: 'no-store', credentials: 'omit', redirect: 'error' });
       if (!res.ok) throw new Error(`fetch ${path}: ${res.status}`);
       const body = await res.clone().arrayBuffer();
       const got = hex(await crypto.subtle.digest('SHA-256', body));
