@@ -144,8 +144,23 @@ function purgeExpired() {
   });
 }
 
+/** Last reason the offline engine refused to install (shown in Settings). */
+let offlineError = null;
+
+function explainOfflineError(raw) {
+  const m = /integrity check failed for (\S+)/.exec(raw);
+  if (m) return `Offline mode is OFF: the website hosting Murmur altered ${m[1]} (for example by injecting a badge or script). Murmur refused to install a modified copy. Ask the host owner to disable injection, then reopen Murmur.`;
+  return `Offline mode is OFF: Murmur couldn't download all of its files (${raw}). Open it again while online.`;
+}
+
 async function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    if (e.data?.type !== 'murmur-offline-error') return;
+    offlineError = explainOfflineError(String(e.data.message));
+    toast(offlineError, 'error', 15000);
+    rerenderIf('settings');
+  });
   try { await navigator.serviceWorker.register(scriptUrl('./sw.js'), { scope: './' }); }
   catch (e) { console.warn('Service worker not registered (offline use unavailable):', e.message); }
 }
@@ -308,7 +323,7 @@ VIEWS.home = () => {
       ? h('ul.contacts', list.map((c) => h('li', h('button.contact', { onclick: () => { S.unread.delete(c.id); go('chat', c.id); }, 'data-testid': `contact-${displayName(c)}` },
         h('span.avatar', { 'data-online': isOnline(c.id) }, displayName(c).slice(0, 1).toUpperCase()),
         h('span.cname', displayName(c)),
-        h('span.cstate', isOnline(c.id) ? 'connected' : 'offline'),
+        h('span.cstate', isOnline(c.id) ? 'connected' : 'not connected'),
         S.unread.get(c.id) ? h('span.badge', String(S.unread.get(c.id))) : null))))
       : h('div.empty', h('p', 'No contacts yet.'), h('p', 'Meet up, tap ', h('strong', 'Show my code'), ', and let your friend scan it.')));
 };
@@ -443,7 +458,7 @@ function codeInput(scanArea, onBytes, what, autostart = false) {
   const startCam = async () => {
     stopScanner();
     const video = h('video.cam', { 'aria-label': 'Camera preview' });
-    clear(scanArea).append(h('div.camwrap', video, h('div.reticle')), h('p.hint', `Point the camera at the ${what} code`));
+    clear(scanArea).append(h('div.camwrap', video, h('div.reticle')), h('p.hint', `Point the camera at the ${what} code. Hold the phones about 25–30 cm (a forearm) apart — closer and the camera can't focus. Turn the other screen's brightness up.`));
     S.scanner = new Scanner(video);
     try {
       await S.scanner.start((text) => { take(text).then((keep) => { if (!keep) stopScanner(); }); return true; });
@@ -549,7 +564,7 @@ VIEWS.chat = (id) => {
   const view = h('div.screen.chat',
     header(displayName(c), {
       back: () => go('home'),
-      actions: [h('span.pill', { 'data-online': online, 'data-testid': 'conn-state' }, online ? 'connected' : 'offline'),
+      actions: [h('span.pill', { 'data-online': online, 'data-testid': 'conn-state' }, online ? 'connected' : 'not connected'),
         h('button.icon', { onclick: () => go('contact', id), 'aria-label': 'Contact info', 'data-testid': 'contact-info' }, icon('info'))],
     }),
     online ? null : h('div.reconnect',
@@ -611,7 +626,8 @@ VIEWS.settings = () => {
   fetch('./build-info.json').then((r) => r.json()).then((b) => { fp.textContent = b.fingerprint; }).catch(() => {});
   const myId = h('code.small', '…');
   contactId(S.vault.identity.publicRaw).then((x) => { myId.textContent = x.match(/.{4}/g).slice(0, 4).join(' '); });
-  const sw = h('span', navigator.serviceWorker?.controller ? 'Installed — works with no network' : 'Not installed yet (reload once while online)');
+  const sw = h('span', { 'data-testid': 'offline-status' }, navigator.serviceWorker?.controller ? 'Installed — works with no network'
+    : offlineError || 'Not installed yet (reload once while online)');
 
   return h('div.screen.full',
     header('Settings', { back: () => go('home') }),
