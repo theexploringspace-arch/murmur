@@ -20,6 +20,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dir = join(root, arg('--dir', 'dist'));
 const port = Number(arg('--port', 8080));
 const host = arg('--host', '127.0.0.1');
+// Test-only: imitate a host that injects a script into index.html (as Netlify's badge does).
+const injectHost = process.argv.includes('--imitate-host-injection');
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
@@ -46,7 +48,10 @@ const server = createServer(async (req, res) => {
     const s = await stat(file).catch(() => null);
     if (!s || !s.isFile()) { res.writeHead(404, SECURITY_HEADERS).end('not found'); return; }
     res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': TYPES[extname(file)] || 'application/octet-stream' });
-    res.end(await readFile(file));
+    let body = await readFile(file);
+    if (injectHost && file.endsWith('index.html'))
+      body = Buffer.from(body.toString().replace('</body>', '<script async src="/.host/badge.js"></script></body>'));
+    res.end(body);
   } catch { res.writeHead(500).end(); }
 });
 server.listen(port, host, () => console.log(`Murmur → http://${host === '127.0.0.1' ? 'localhost' : host}:${port}  (serving ${dir})`));
