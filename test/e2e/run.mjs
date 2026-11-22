@@ -305,4 +305,57 @@ with open(sys.argv[2], 'wb') as f:
   } finally { await bA.close(); await bB.close(); }
 });
 
+test('slow human scan: reply scanned 45 s later still connects (was a false "can\'t reach" at 25 s)', { timeout: 180000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const A = await profile(browser, 'alice-slow'), B = await profile(browser, 'bob-slow');
+  try {
+    await onboard(A, 'Alice', 'correct horse battery staple');
+    await onboard(B, 'Bob', 'tr0ub4dor & 3 bananas');
+    await A.page.click(tid('invite'));
+    await A.page.waitForFunction((s) => document.querySelector(s)?.value?.startsWith('mur1.'), tid('invite-code'));
+    const invite = await A.page.$eval(tid('invite-code'), (e) => e.value);
+    await B.page.click(tid('join'));
+    await B.page.click('details summary');
+    await B.page.fill(tid('paste-invite'), invite);
+    await B.page.click(tid('paste-invite-go'));
+    await B.page.waitForFunction((s) => document.querySelector(s)?.value?.startsWith('mur1.'), tid('reply-code'));
+    const reply = await B.page.$eval(tid('reply-code'), (e) => e.value);
+    await B.page.waitForTimeout(45000); // a person fumbling with a camera that won't focus
+    assert.ok(await B.page.$(tid('reply-code')), 'joiner must still be waiting, not bounced home with an error');
+    await A.page.click('details summary');
+    await A.page.fill(tid('paste-reply'), reply);
+    await A.page.click(tid('paste-reply-go'));
+    for (const p of [A, B]) await p.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`, { timeout: 30000 });
+    assert.equal(await A.page.$eval(tid('conn-state'), (e) => e.textContent), 'connected');
+    await send(A, 'worth the wait');
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="msg-in"] .text')?.textContent === 'worth the wait');
+  } finally { await browser.close(); }
+});
+
+test('host injects a script into index.html: offline install is refused AND the user is told why', { timeout: 120000 }, async () => {
+  const port = PORT + 1;
+  const bad = spawn(process.execPath, [join(root, 'tools/serve.mjs'), '--port', String(port), '--imitate-host-injection'], { stdio: 'pipe' });
+  await new Promise((r) => bad.stdout.once('data', r));
+  const browser = await chromium.launch({ executablePath: CHROME });
+  try {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.goto(`http://localhost:${port}/`);
+    // the page itself still works online…
+    await page.waitForSelector(tid('get-started'));
+    // …but the offline engine refuses the altered copy and the app says so, loudly
+    await page.waitForSelector('.toast.error', { timeout: 20000 });
+    const msg = await page.$eval('.toast.error', (e) => e.textContent);
+    assert.match(msg, /Offline mode is OFF/);
+    assert.match(msg, /altered \.\/index\.html/);
+    assert.equal(await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.active ?? null), null, 'no active service worker');
+    // and Settings states the same reason after setup
+    await page.click(tid('get-started'));
+    await page.fill(tid('name'), 'Eve'); await page.fill(tid('pass1'), 'correct horse battery staple'); await page.fill(tid('pass2'), 'correct horse battery staple');
+    await page.click(tid('create')); await page.waitForSelector(tid('settings'));
+    await page.click(tid('settings'));
+    assert.match(await page.$eval(tid('offline-status'), (e) => e.textContent), /altered \.\/index\.html/);
+  } finally { await browser.close(); bad.kill(); }
+});
+
 process.on('exit', () => server.kill());
