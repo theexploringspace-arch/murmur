@@ -332,6 +332,12 @@ test('slow human scan: reply scanned 45 s later still connects (was a false "can
   } finally { await browser.close(); }
 });
 
+test('dev server redirects /index.html like Cloudflare Pages (so the offline test above covers that host)', async () => {
+  const r = await fetch(`http://localhost:${PORT}/index.html`, { redirect: 'manual' });
+  assert.equal(r.status, 308);
+  assert.equal(r.headers.get('location'), '/');
+});
+
 test('host injects a script into index.html: offline install is refused AND the user is told why', { timeout: 120000 }, async () => {
   const port = PORT + 1;
   const bad = spawn(process.execPath, [join(root, 'tools/serve.mjs'), '--port', String(port), '--imitate-host-injection'], { stdio: 'pipe' });
