@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { encodeQR } from '../../src/js/qr/encode.js';
 import { decodeQR, decodeMatrix } from '../../src/js/qr/decode.js';
 import { rsEncode, rsDecode } from '../../src/js/qr/rs.js';
-import { B45, random, toB45 } from '../../src/js/core/bytes.js';
+import { B45, toB45 } from '../../src/js/core/bytes.js';
 
 // ---------- synthetic "camera" ----------
 function render(qr, { scale = 6, quiet = 4 } = {}) {
@@ -55,16 +55,23 @@ function camera(src, { outW = 640, outH = 480, angle = 0, persp = 0, fill = 0.6,
   return { data: out, width: outW, height: outH, luminance: true };
 }
 
-const rndText = (n, al) => Array.from({ length: n }, () => al[Math.floor(Math.random() * al.length)]).join('');
+// Deterministic PRNG: every run (local or CI) tests the SAME inputs, so a
+// failure is reproducible instead of a 1-in-20 flake that hides a real bug.
+let seed = 0x5eed;
+const prand = () => ((seed = (Math.imul(seed, 1103515245) + 12345) >>> 0) / 0x100000000);
+const reseed = (n) => { seed = n >>> 0; };
+const rbytes = (n) => Uint8Array.from({ length: n }, () => Math.floor(prand() * 256));
+const rndText = (n, al) => Array.from({ length: n }, () => al[Math.floor(prand() * al.length)]).join('');
 
 describe('reed-solomon', () => {
+  reseed(1);
   test('corrects up to ⌊ecc/2⌋ random byte errors, rejects beyond', () => {
     for (let t = 0; t < 1500; t++) {
-      const k = 1 + Math.floor(Math.random() * 120), e = [7, 10, 16, 22, 26, 30][t % 6];
-      const d = random(k), blk = new Uint8Array([...d, ...rsEncode(d, e)]), orig = blk.slice();
-      const ne = Math.floor(Math.random() * (Math.floor(e / 2) + 1));
-      const pos = new Set(); while (pos.size < ne) pos.add(Math.floor(Math.random() * blk.length));
-      for (const p of pos) blk[p] ^= 1 + Math.floor(Math.random() * 255);
+      const k = 1 + Math.floor(prand() * 120), e = [7, 10, 16, 22, 26, 30][t % 6];
+      const d = rbytes(k), blk = new Uint8Array([...d, ...rsEncode(d, e)]), orig = blk.slice();
+      const ne = Math.floor(prand() * (Math.floor(e / 2) + 1));
+      const pos = new Set(); while (pos.size < ne) pos.add(Math.floor(prand() * blk.length));
+      for (const p of pos) blk[p] ^= 1 + Math.floor(prand() * 255);
       assert.equal(rsDecode(blk, e), ne);
       assert.deepEqual(blk, orig);
     }
@@ -72,6 +79,7 @@ describe('reed-solomon', () => {
 });
 
 describe('QR self-consistency', () => {
+  reseed(2);
   test('matrix round-trip: every version 1–40, every ECC level, all modes', () => {
     for (let v = 1; v <= 40; v += 1) for (const ecl of 'LMQH') {
       // choose a text that lands in version v
@@ -83,7 +91,7 @@ describe('QR self-consistency', () => {
   });
 
   test('matrix survives burst damage within ECC budget', () => {
-    const t = 'MUR1:' + toB45(random(300));
+    const t = 'MUR1:' + toB45(rbytes(300));
     const q = encodeQR(t, { ecl: 'M' });
     const m = q.modules.map((r) => r.slice());
     // scribble a 5×5 square in the data area (bottom-right quadrant, away from function patterns)
@@ -95,7 +103,7 @@ describe('QR self-consistency', () => {
 
   test('camera-like frames: rotation, keystone, blur, noise, lighting, inverted, mirrored', () => {
     // Real pairing payload size: ~260 bytes of binary → ~390 base45 chars
-    const t = 'MUR1:' + toB45(random(260));
+    const t = 'MUR1:' + toB45(rbytes(260));
     const qr = encodeQR(t, { ecl: 'M' });
     const src = render(qr);
     const scenes = [
@@ -110,6 +118,26 @@ describe('QR self-consistency', () => {
       if (!r || r.text !== t) fails.push(JSON.stringify(sc));
     });
     assert.deepEqual(fails, [], `failed scenes (v${qr.version}): ${fails.join(' ')}`);
+  });
+
+  test('robustness sweep: 25 payloads each under tilt, 40° rotation, blur, blur+rotation', () => {
+    // Regressions this locks in (all found by CI with random payloads, Nov 2026):
+    //  • tilt: the bottom-right alignment estimate assumed a flat parallelogram and
+    //    missed by > the search radius (≈4% fail at 0.25, ≈98% at +0.3, one direction only)
+    //  • blur: thresholding shifts every edge by δ, breaking 1:1:3:1:1 (≈19% fail)
+    //  • the first blur fix broke ~40° rotation (≈45% fail) — hence BOTH finder tests
+    reseed(7);
+    const fails = [];
+    const scenes = [{ persp: 0.25 }, { persp: -0.25 }, { persp: 0.35 }, { persp: -0.35 }, { persp: 0.4 },
+      { angle: 0.7 }, { angle: -0.7 }, { blur: 1 }, { blur: 1, angle: 0.5 }];
+    for (const sc of scenes) {
+      for (let i = 0; i < 25; i++) {
+        const t = 'MUR1:' + toB45(rbytes(260));
+        const r = decodeQR(camera(render(encodeQR(t, { ecl: 'M' })), { ...sc, seed: i + 1 }));
+        if (!r || r.text !== t) fails.push(`${JSON.stringify(sc)} #${i}`);
+      }
+    }
+    assert.deepEqual(fails, []);
   });
 
   test('frames with no code return null quickly', () => {
@@ -137,7 +165,7 @@ describe('QR cross-validation with OpenCV', { skip: !haveCv && 'python3 + opencv
     const dir = mkdtempSync(join(tmpdir(), 'murmur-qr-'));
     const texts = [];
     for (let i = 0; i < 24; i++) {
-      const t = i % 3 === 0 ? 'MUR1:' + toB45(random(40 + i * 15)) : i % 3 === 1 ? rndText(20 + i * 10, 'abcxyz!?{}') : rndText(10 + i * 30, '0123456789');
+      const t = i % 3 === 0 ? 'MUR1:' + toB45(rbytes(40 + i * 15)) : i % 3 === 1 ? rndText(20 + i * 10, 'abcxyz!?{}') : rndText(10 + i * 30, '0123456789');
       const q = encodeQR(t, { ecl: 'LMQH'[i % 4] });
       writePgm(join(dir, `${i}.pgm`), render(q, { scale: 5 }));
       texts.push(t);
@@ -153,7 +181,7 @@ print(json.dumps(res))`, dir, String(texts.length)]).toString();
   test('our decoder reads codes made by OpenCV\'s encoder', () => {
     const dir = mkdtempSync(join(tmpdir(), 'murmur-qr-'));
     const texts = [];
-    for (let i = 0; i < 16; i++) texts.push(i % 2 ? 'MUR1:' + toB45(random(30 + i * 20)) : rndText(15 + i * 12, 'Hello world 123'));
+    for (let i = 0; i < 16; i++) texts.push(i % 2 ? 'MUR1:' + toB45(rbytes(30 + i * 20)) : rndText(15 + i * 12, 'Hello world 123'));
     writeFileSync(join(dir, 'texts.json'), JSON.stringify(texts));
     execFileSync('python3', ['-I', '-c', `
 import cv2, sys, json, os, numpy as np
