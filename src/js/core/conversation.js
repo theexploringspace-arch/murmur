@@ -16,7 +16,7 @@
 
 import { PeerLink } from './transport.js';
 import { SecureSession } from './session.js';
-import { createPairingCode, parsePairingCode, PairingError } from './pairing.js';
+import { createPairingCode, parsePairingCode, PairingError, MAX_AGE_S } from './pairing.js';
 import { sdpFingerprint } from './sdp.js';
 import { toB64u, fromB64u, random, toHex, equal } from './bytes.js';
 import { sha256 } from './crypto.js';
@@ -60,7 +60,8 @@ export class Conversation {
     this.#checkPeer(p, expectKey);
     this.peer = { publicRaw: p.publicRaw, name: p.name };
     await this.link.acceptAnswer(p.description);
-    return this.#secure(p.description.sdp);
+    // Both codes are scanned now: any delay from here on is the network, so fail fast.
+    return this.#secure(p.description.sdp, { failFast: true });
   }
 
   /** Joiner: returns the reply-code bytes to show; connection completes in the background (await .connected). */
@@ -73,7 +74,15 @@ export class Conversation {
     this.localSdp = await this.link.acceptOffer(p.description);
     const reply = await createPairingCode({ kind: 'answer', identity: this.me.identity, name: this.me.name, sdp: this.localSdp, offerBytes: p.bytes });
     this.state = 'waiting-connect';
-    this.connected = this.#secure(p.description.sdp);
+    // A PERSON has to scan our reply now; that can take minutes (focusing a
+    // camera, finding the button). Wait until the invite itself expires rather
+    // than a short network timeout, which used to misreport slow scanning as a
+    // Wi-Fi problem.
+    const untilExpiry = (p.created + MAX_AGE_S) * 1000 - Date.now();
+    this.connected = this.#secure(p.description.sdp, {
+      timeout: Math.max(60_000, untilExpiry),
+      timeoutMessage: `${p.name} didn't scan your reply before the invite expired. Ask them to show a new code.`,
+    });
     this.connected.catch(() => {});
     return { reply, peer: this.peer };
   }
@@ -83,7 +92,7 @@ export class Conversation {
       throw new PairingError('This code is from a different person than the contact you are reconnecting to.');
   }
 
-  async #secure(remoteSdp) {
+  async #secure(remoteSdp, openOpts = {}) {
     this.session = new SecureSession({
       role: this.role, identity: this.me.identity, peerIdentityRaw: this.peer.publicRaw,
       localFingerprint: sdpFingerprint(this.localSdp), remoteFingerprint: sdpFingerprint(remoteSdp),
@@ -96,7 +105,7 @@ export class Conversation {
     });
     this.session.onmessage = (m) => this.#onApp(m);
     this.session.onrekey = (epoch) => this.emit('rekey', epoch);
-    await this.link.opened();
+    await this.link.opened(openOpts);
     this.state = 'handshaking';
     await this.session.start();
     let t;

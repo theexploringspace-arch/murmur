@@ -9,7 +9,8 @@
 // (pairing.js), so there is no signaling server either.
 
 export const GATHER_TIMEOUT_MS = 4000;
-export const CONNECT_TIMEOUT_MS = 25000;
+export const CONNECT_TIMEOUT_MS = 30000;
+export const NETWORK_HELP = 'Both codes were scanned, but the phones could not open a direct link. Make sure both are on the SAME Wi-Fi or hotspot. Some Wi-Fi (hotels, cafés, some routers) blocks phones from talking to each other — a phone hotspot usually works.';
 const RTC_CONFIG = { iceServers: [], iceCandidatePoolSize: 0, bundlePolicy: 'max-bundle', rtcpMuxPolicy: 'require' };
 
 function gathered(pc) {
@@ -60,14 +61,23 @@ export class PeerLink {
   /** Offerer step 2. */
   async acceptAnswer(answerDesc) { await this.pc.setRemoteDescription(answerDesc); }
 
-  /** Resolves when the encrypted DTLS/SCTP channel is open. */
-  opened(timeout = CONNECT_TIMEOUT_MS) {
+  /**
+   * Resolves when the encrypted DTLS/SCTP channel is open.
+   * @param {{timeout?: number, timeoutMessage?: string, failFast?: boolean}} o
+   *   failFast: reject as soon as ICE reports 'failed'. Only safe once BOTH
+   *   descriptions are set (the inviter after scanning the reply). The joiner
+   *   must not fail fast: its checks start before the inviter has scanned and
+   *   can transiently fail, then recover when the inviter's checks arrive.
+   */
+  opened({ timeout = CONNECT_TIMEOUT_MS, timeoutMessage = NETWORK_HELP, failFast = false } = {}) {
     if (this.dc.readyState === 'open') return Promise.resolve();
     return new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error(
-        'Could not reach your friend\'s phone. Make sure you are both on the SAME Wi-Fi or hotspot, then try again.')), timeout);
-      this.dc.addEventListener('open', () => { clearTimeout(t); resolve(); }, { once: true });
-      this.dc.addEventListener('close', () => { clearTimeout(t); reject(new Error('Connection closed')); }, { once: true });
+      const done = (fn, arg) => { clearTimeout(t); this.pc.removeEventListener('iceconnectionstatechange', onIce); fn(arg); };
+      const t = setTimeout(() => done(reject, new Error(timeoutMessage)), timeout);
+      const onIce = () => { if (failFast && this.pc.iceConnectionState === 'failed') done(reject, new Error(NETWORK_HELP)); };
+      this.pc.addEventListener('iceconnectionstatechange', onIce);
+      this.dc.addEventListener('open', () => done(resolve), { once: true });
+      this.dc.addEventListener('close', () => done(reject, new Error('Connection closed')), { once: true });
     });
   }
 
