@@ -32,8 +32,20 @@ for (const f of walk(src).sort()) {
   files[r] = sha(readFileSync(f));
 }
 
-// Fingerprint = SHA-256 over the sorted "hash  path" list (like sha256sum output).
-const listing = Object.keys(files).sort().map((p) => `${files[p]}  ${p}`).join('\n') + '\n';
+// Host config files (Netlify/Cloudflare `_headers`) are consumed by the host and
+// may not be served publicly; precaching one would make the service worker's
+// install fail and silently disable offline mode. Copy them, never precache them.
+const HOST_CONFIG = new Set(['./_headers', './_redirects']);
+const precacheList = Object.keys(files).filter((p) => !HOST_CONFIG.has(p)).sort();
+const swTemplate = readFileSync(join(src, 'sw.template.js'), 'utf8');
+
+// Fingerprint = SHA-256 over the sorted "hash  path" list (like sha256sum output),
+// PLUS the service-worker template and its precache list — so any change to the
+// offline engine changes the fingerprint too (sw.js itself embeds the fingerprint,
+// so it can't be hashed directly without a cycle).
+const listing = Object.keys(files).sort().map((p) => `${files[p]}  ${p}`).join('\n') + '\n'
+  + `${sha(swTemplate)}  sw.template.js\n`
+  + `${sha(precacheList.join('\n'))}  sw-precache-list\n`;
 const fp = sha(listing);
 const fingerprint = fp.slice(0, 32).match(/.{4}/g).join('-');
 const info = { name: pkg.name, version: pkg.version, fingerprint, sha256: fp, files };
@@ -41,8 +53,9 @@ const infoJson = JSON.stringify(info, null, 2) + '\n';
 writeFileSync(join(out, 'build-info.json'), infoJson);
 writeFileSync(join(out, 'SHA256SUMS'), listing);
 
-const precache = { ...files, './build-info.json': sha(infoJson) };
-const sw = readFileSync(join(src, 'sw.template.js'), 'utf8')
+const precache = Object.fromEntries(precacheList.map((p) => [p, files[p]]));
+precache['./build-info.json'] = sha(infoJson);
+const sw = swTemplate
   .replace("'__VERSION__'", JSON.stringify(`${pkg.version}-${fp.slice(0, 12)}`))
   .replace('__PRECACHE__', JSON.stringify(precache, null, 2));
 writeFileSync(join(out, 'sw.js'), sw);
