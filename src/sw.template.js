@@ -14,8 +14,21 @@ const CACHE = `murmur-${VERSION}`;
 
 const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 
+// Tell open Murmur pages WHY an install failed, so it is never silent.
+async function reportInstallError(message) {
+  for (const c of await self.clients.matchAll({ includeUncontrolled: true, type: 'window' }))
+    c.postMessage({ type: 'murmur-offline-error', message });
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
+    try { await precache(); }
+    catch (e) { await reportInstallError(String(e.message || e)); throw e; } // install still fails — on purpose
+  })());
+});
+
+async function precache() {
+  {
     const cache = await caches.open(CACHE);
     for (const [path, want] of Object.entries(FILES)) {
       const res = await fetch(path, { cache: 'no-store', credentials: 'omit', redirect: 'error' });
@@ -25,8 +38,8 @@ self.addEventListener('install', (event) => {
       if (got !== want) throw new Error(`integrity check failed for ${path}`); // install aborts; old version stays
       await cache.put(path, res);
     }
-  })());
-});
+  }
+}
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
