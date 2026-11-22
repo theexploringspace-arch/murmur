@@ -50,11 +50,34 @@ export function binarize(lum, w, h) {
 }
 
 // ---------- 2. finder patterns ----------
-function ratioOk(c, total) {
-  if (total < 7) return false;
+/** Classic per-run 1:1:3:1:1 test (±50% per run). Tolerates the pixel
+ *  stair-stepping of strongly rotated codes; fails when blur biases edges. */
+function runsOk(c, total) {
   const mod = total / 7, v = mod * 0.5;
   return Math.abs(mod - c[0]) < v && Math.abs(mod - c[1]) < v && Math.abs(3 * mod - c[2]) < 3 * v
     && Math.abs(mod - c[3]) < v && Math.abs(mod - c[4]) < v;
+}
+
+/** Edge-to-similar-edge test. Blur + thresholding shift every dark/light
+ *  boundary by the same δ (dark runs grow, light runs shrink, or vice versa),
+ *  breaking the per-run test. Each dark+light pair sum is invariant to δ, so
+ *  we compare those to 2:4:4:2 modules. Tolerance tuned with the sweep in
+ *  test/unit/qr.test.mjs: 0.7 made no-code frames ~10× slower. */
+function pairsOk(c, total) {
+  const m = total / 7, tol = m * 0.5;
+  const pairs = [c[0] + c[1], c[1] + c[2], c[2] + c[3], c[3] + c[4]];
+  const want = [2, 4, 4, 2];
+  for (let i = 0; i < 4; i++) if (Math.abs(pairs[i] - want[i] * m) > tol) return false;
+  if (c[2] < m * 1.8 || c[2] < c[0] || c[2] < c[4]) return false; // centre must dominate
+  for (const x of c) if (x < m * 0.25 || x > m * 4) return false;
+  return true;
+}
+
+// A finder passes if EITHER test passes: each covers the other's blind spot
+// (rotation vs blur); format-info + Reed–Solomon still reject false finders.
+function ratioOk(c, total) {
+  if (total < 7) return false;
+  return runsOk(c, total) || pairsOk(c, total);
 }
 
 /** Walk from (cx,cy) along (dx,dy) measuring the 5 runs; returns center offset & total, or null. */
@@ -142,7 +165,7 @@ function orderedTriples(cands) {
     const t = [c[i], c[j], c[k]];
     const sizes = t.map((p) => p.size);
     const sz = Math.max(...sizes) / Math.min(...sizes);
-    if (sz > 1.6) continue;
+    if (sz > 2.2) continue; // steep tilts make the near finder up to ~2× the far one; RS verification rejects wrong triangles
     const d = [[dist(t[1], t[2]), 0], [dist(t[0], t[2]), 1], [dist(t[0], t[1]), 2]].sort((a, b) => b[0] - a[0]);
     const tl = t[d[0][1]];
     let [p, q] = t.filter((x) => x !== tl);
@@ -155,7 +178,11 @@ function orderedTriples(cands) {
     // Cross product decides which is top-right vs bottom-left (y grows downward).
     const cross = (p.x - tl.x) * (q.y - tl.y) - (p.y - tl.y) * (q.x - tl.x);
     if (cross < 0) [p, q] = [q, p];
-    const score = Math.abs(hyp - Math.SQRT2) + (legRatio - 1) + (sz - 1) - (t[0].count + t[1].count + t[2].count) * 0.01;
+    // Lower is better. Real finders are confirmed on many scan lines, while
+    // look-alikes in the data area show up on 2–3; tilt legitimately makes the
+    // three finders differ in size, so size mismatch is only weakly penalised.
+    const support = Math.min(t[0].count, 8) + Math.min(t[1].count, 8) + Math.min(t[2].count, 8);
+    const score = Math.abs(hyp - Math.SQRT2) + (legRatio - 1) + 0.3 * (sz - 1) - 0.05 * support;
     out.push({ tl, tr: p, bl: q, score });
   }
   return out.sort((a, b) => a.score - b.score).slice(0, 4);
@@ -240,16 +267,20 @@ function findAlignment(img, w, h, ex, ey, mod, radius, max = 1) {
 /** Distance from a finder centre, walking toward `to`, until we leave its outer dark ring
  *  (dark → light → dark → light). That distance is 3.5 modules regardless of rotation. */
 function runToEdge(img, w, h, from, to) {
+  // Returns the distance between the two dark→light transitions crossed when
+  // walking out from a finder centre (centre-run edge → outer-ring edge).
+  // Both edges shift by the same blur/threshold bias, so their distance is
+  // exactly 2 modules regardless of blur — unlike a raw edge position.
   const L = Math.hypot(to.x - from.x, to.y - from.y);
   const ux = (to.x - from.x) / L, uy = (to.y - from.y) / L;
-  let state = 0; // 0 centre-dark, 1 light ring, 2 outer dark
-  for (let t = 0; t < L / 2; t += 0.5) {
+  let state = 0, t1 = -1; // 0 centre-dark, 1 light ring, 2 outer dark
+  for (let t = 0; t < L / 2; t += 0.25) {
     const x = Math.floor(from.x + ux * t), y = Math.floor(from.y + uy * t);
     if (x < 0 || y < 0 || x >= w || y >= h) return null;
     const v = img[y * w + x];
-    if (state === 0 && !v) state = 1;
+    if (state === 0 && !v) { state = 1; t1 = t; }
     else if (state === 1 && v) state = 2;
-    else if (state === 2 && !v) return t;
+    else if (state === 2 && !v) return t - t1;
   }
   return null;
 }
@@ -258,10 +289,31 @@ function moduleSize(img, w, h, tri) {
   const { tl, tr, bl } = tri;
   const runs = [[tl, tr], [tr, tl], [tl, bl], [bl, tl]].map(([a, b]) => runToEdge(img, w, h, a, b)).filter((x) => x);
   if (!runs.length) return (tl.size + tr.size + bl.size) / 3;
-  return runs.reduce((a, b) => a + b, 0) / runs.length / 3.5;
+  return runs.reduce((a, b) => a + b, 0) / runs.length / 2;
 }
 
-function sampleGrid(img, w, h, tri, dim, useAlign = true) {
+/**
+ * Perspective-aware estimate of the image position of module (f, f) measured
+ * from the top-left finder centre, where f is a fraction of the TL→TR / TL→BL
+ * span (f = 1 → the corner that completes the parallelogram).
+ *
+ * Why: a plain parallelogram estimate assumes no perspective. Under a real
+ * tilt the far side is magnified, and the estimate can miss the bottom-right
+ * alignment pattern by more than the search radius. In a homography
+ * (X, Y, W) = H·(u, v, 1) every component is AFFINE in (u, v); only the final
+ * division by W is non-linear. The apparent module size at a point is ∝ 1/W,
+ * so each finder's size gives us its W. We then do the parallelogram
+ * arithmetic on (x·W, y·W, W) — where it is exact — and divide back.
+ */
+function projectiveEstimate(tri, f) {
+  const P = (pt) => { const W = 1 / pt.size; return [pt.x * W, pt.y * W, W]; };
+  const a = P(tri.tl), b = P(tri.tr), c = P(tri.bl);
+  const q = [0, 1, 2].map((i) => a[i] + f * (b[i] - a[i]) + f * (c[i] - a[i]));
+  if (!(q[2] > 0)) return null; // degenerate size estimates
+  return { x: q[0] / q[2], y: q[1] / q[2] };
+}
+
+function* sampleGrid(img, w, h, tri, dim, useAlign = true) {
   const { tl, tr, bl } = tri;
   const mod = tri.mod;
   const ver = (dim - 17) / 4;
@@ -269,24 +321,37 @@ function sampleGrid(img, w, h, tri, dim, useAlign = true) {
   const dst3 = [[tl.x, tl.y], [tr.x, tr.y], [bl.x, bl.y]];
   // Hypotheses for the 4th anchor: up to 3 alignment-pattern candidates, then the parallelogram corner.
   const hyps = [];
+  const corr = 1 - 3 / (dim - 7);                    // alignment centre sits 3 modules inside the corner
+  const proj = projectiveEstimate(tri, corr);        // perspective-aware (primary)
+  const para = { x: tl.x + corr * (tr.x - tl.x + bl.x - tl.x), y: tl.y + corr * (tr.y - tl.y + bl.y - tl.y) }; // flat fallback
   if (ver >= 2 && useAlign) {
-    const corr = 1 - 3 / (dim - 7);
-    const ex = tl.x + corr * (tr.x - tl.x + bl.x - tl.x);
-    const ey = tl.y + corr * (tr.y - tl.y + bl.y - tl.y);
     // perspective: the bottom-right module size extrapolates from the finders
-    const brMod = Math.max(mod * 0.6, Math.min(mod * 1.6, tr.size + bl.size - tl.size));
-    for (const f of findAlignment(img, w, h, ex, ey, brMod, mod * 12, 3)) hyps.push([[dim - 6.5, dim - 6.5], [f.x, f.y]]);
+    const brMod = Math.max(mod * 0.6, Math.min(mod * 1.8, tr.size + bl.size - tl.size));
+    const seen = [];
+    for (const est of [proj, para].filter(Boolean)) {
+      for (const f of findAlignment(img, w, h, est.x, est.y, brMod, mod * 12, 3)) {
+        if (seen.some((s) => Math.hypot(s.x - f.x, s.y - f.y) < mod)) continue;
+        seen.push(f); hyps.push([[dim - 6.5, dim - 6.5], [f.x, f.y]]);
+      }
+    }
   }
+  const corner = projectiveEstimate(tri, 1);
+  if (corner) hyps.push([[dim - 3.5, dim - 3.5], [corner.x, corner.y]]);
   hyps.push([[dim - 3.5, dim - 3.5], [tr.x + bl.x - tl.x, tr.y + bl.y - tl.y]]);
-  const grids = [];
-  for (const [s4, d4] of hyps) grids.push(...sampleWith(img, w, h, mod, ver, dim, useAlign, [...src3, s4], [...dst3, d4]));
-  return grids;
+  for (const [s4, d4] of hyps) yield* sampleWith(img, w, h, mod, ver, dim, useAlign, [...src3, s4], [...dst3, d4]);
 }
 
-function sampleWith(img, w, h, mod, ver, dim, useAlign, src, dst) {
+function* sampleWith(img, w, h, mod, ver, dim, useAlign, src, dst) {
   const H0 = homography(src, dst);
-  if (!H0) return [];
-  const Hs = [H0];
+  if (!H0) return;
+  const g0 = gridFrom(img, w, h, H0, dim);
+  if (!g0) return;
+  // Gate: format bits sit next to the finders, where even a rough H is
+  // accurate. If neither orientation reads as one of the 32 valid format
+  // codewords, this hypothesis can't be a QR symbol — skip the expensive
+  // alignment refinement (that refinement was ~90% of time on no-code frames).
+  if (!strictFormat(g0, dim) && !strictFormat(transpose(g0), dim)) return;
+  yield g0;
   // Refinement: predict every alignment pattern through H, find each one
   // locally, reject outliers (> 1.2 modules from prediction), and re-fit H by
   // least squares over all inliers. Reed–Solomon later tells us which grid is right.
@@ -304,22 +369,22 @@ function sampleWith(img, w, h, mod, ver, dim, useAlign, src, dst) {
       if (s2.length < 5) break;
       const H2 = homography(s2, d2);
       if (!H2) break;
-      H = H2; Hs.push(H2);
+      H = H2;
+      const g = gridFrom(img, w, h, H, dim);
+      if (g) yield g;
     }
   }
-  const grids = [];
-  for (const H of Hs.reverse()) {
-    const grid = Array.from({ length: dim }, () => new Uint8Array(dim));
-    let ok = true;
-    for (let y = 0; y < dim && ok; y++) for (let x = 0; x < dim; x++) {
-      const [px, py] = H(x + 0.5, y + 0.5);
-      const ix = Math.floor(px), iy = Math.floor(py);
-      if (ix < 0 || iy < 0 || ix >= w || iy >= h) { ok = false; break; }
-      grid[y][x] = img[iy * w + ix];
-    }
-    if (ok) grids.push(grid);
+}
+
+function gridFrom(img, w, h, H, dim) {
+  const grid = Array.from({ length: dim }, () => new Uint8Array(dim));
+  for (let y = 0; y < dim; y++) for (let x = 0; x < dim; x++) {
+    const [px, py] = H(x + 0.5, y + 0.5);
+    const ix = Math.floor(px), iy = Math.floor(py);
+    if (ix < 0 || iy < 0 || ix >= w || iy >= h) return null;
+    grid[y][x] = img[iy * w + ix];
   }
-  return grids;
+  return grid;
 }
 
 // ---------- 6/7. read matrix ----------
@@ -337,6 +402,25 @@ function readFormat(g, n) {
     }
   }
   return best && best.d <= 3 ? best : null;
+}
+
+/**
+ * Stricter format check used only as a cheap gate before expensive work.
+ * Accepting ≤3 bit errors on either copy matches ~56% of RANDOM 15-bit
+ * patterns (576 neighbours × 32 codewords / 32768), so it filters nothing.
+ * A real symbol stores the format twice; requiring both copies to agree on
+ * the same codeword (or one copy to be near-perfect, ≤1 error, for codes with
+ * one copy obscured) cuts random acceptance to a few percent.
+ */
+function strictFormat(g, n) {
+  const [a, b] = formatCoords(n);
+  const read = (coords) => { let bits = 0; coords.forEach(([x, y], i) => { if (g[y][x]) bits |= 1 << i; }); return bits; };
+  const A = read(a), B = read(b);
+  for (const f of ALL_FORMATS) {
+    const dA = popcount(f.bits ^ A), dB = popcount(f.bits ^ B);
+    if ((dA <= 3 && dB <= 3) || Math.min(dA, dB) <= 1) return true;
+  }
+  return false;
 }
 
 function readVersion(g, n) {
@@ -416,6 +500,7 @@ function parseSegments(data, ver) {
 
 const transpose = (g) => g.map((r, y) => r.map((_, x) => g[x][y]));
 
+
 function tryDecode(img, w, h) {
   const cands = findFinders(img, w, h);
   if (cands.length < 3) return null;
@@ -428,9 +513,7 @@ function tryDecode(img, w, h) {
       let d = dims[attempt];
       for (const useAlign of [true, false]) {
         for (let pass = 0; pass < 2; pass++) {
-          const grids = sampleGrid(img, w, h, tri, d, useAlign);
-          if (!grids.length) break;
-          for (const g of grids.flatMap((g0) => [g0, transpose(g0)])) {
+          for (const g0 of sampleGrid(img, w, h, tri, d, useAlign)) for (const g of [g0, transpose(g0)]) {
             try { return decodeMatrix(g); }
             catch (e) {
               const m = /version mismatch:(\d+)/.exec(e.message);
