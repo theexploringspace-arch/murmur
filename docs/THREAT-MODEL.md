@@ -38,6 +38,13 @@ Whoever controls the origin that served Murmur could publish modified JavaScript
   an attacker who also changes `sw.js`).
 - **Build fingerprint.** Settings shows a fingerprint of all files. Two people comparing fingerprints
   confirm they run identical code; it changes on any update.
+- **Host injection is refused, loudly.** Some hosts rewrite HTML (Netlify's free-plan badge adds a
+  same-origin `<script>` — which `script-src 'self'` and our Trusted Types policy *cannot* tell apart
+  from Murmur's own code). The integrity check catches the altered `index.html`, the install fails, and
+  the service worker posts `murmur-offline-error` so the app shows "Offline mode is OFF: the website
+  hosting Murmur altered ./index.html". Tested in `test/e2e/run.mjs` via `serve.mjs --imitate-host-injection`.
+  Residual risk: while *online and uninstalled*, the injected script still runs. Use a host that
+  serves files byte-for-byte (GitHub Pages, Cloudflare Pages).
 - **No dependencies, no build step** — the deployed files equal the audited source.
 
 If your adversary can compromise your hosting, a native app (or a pinned, locally-sideloaded copy)
