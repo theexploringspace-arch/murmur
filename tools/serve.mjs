@@ -41,6 +41,11 @@ const SECURITY_HEADERS = {
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');
+    // Behave like Cloudflare Pages (the strictest host we deploy to): explicit .../index.html
+    // is a 308 redirect to the directory. This keeps every e2e test honest about that host.
+    if (url.pathname.endsWith('/index.html')) {
+      res.writeHead(308, { ...SECURITY_HEADERS, Location: url.pathname.slice(0, -'index.html'.length) }).end(); return;
+    }
     let p = normalize(decodeURIComponent(url.pathname)).replace(/^([/\\])+/, '');
     if (p === '' || p.endsWith(sep)) p += 'index.html';
     const file = join(dir, p);
