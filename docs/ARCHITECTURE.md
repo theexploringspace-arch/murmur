@@ -98,6 +98,18 @@ Debugging discipline: establish expected vs. actual, find the **boundary** (pair
 ICE → DTLS → Murmur handshake → app message), test the smallest thing at that boundary, fix the
 root cause. The unit tests mirror those boundaries, so a failing layer usually has a failing test.
 
+### Lesson: two security policies
+On Cloudflare/Netlify the CSP arrives **twice**: as an HTTP header (`src/_headers`) and in a
+`<meta>` tag (`index.html`). The browser enforces **both**. Internet mode once worked in tests but
+failed on every real phone, because the relay origin was only added to the `<meta>` tag. The
+console said: *Connecting to 'wss://relay…' violates … "connect-src 'self' blob:"*. Fixes:
+- `build.test.mjs` fails if the two policies differ.
+- `tools/serve.mjs` now sends the `_headers` headers, so the browser tests enforce both.
+- `tools/relay-smoke.mjs` checks a deployed relay step by step: health, WebSocket, auth, ping, deposit, delivery.
+
+Debugging recipe that found it: the server worked (smoke test) but the app didn't, so the fault
+had to be in the browser. Open DevTools on a laptop, reproduce, and read the Console.
+
 ## Testing map
 
 | Layer | Test | Technique |

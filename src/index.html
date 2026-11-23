@@ -6,7 +6,7 @@
     Content Security Policy — the page may load NOTHING except its own files.
     • default-src 'none'         everything denied unless listed
     • script-src 'self'          no inline scripts, no eval, no third-party JS
-    • connect-src 'self' blob:   fetch only our own origin + in-memory attachments
+    • connect-src 'self' blob: + the relay   our own origin, in-memory attachments, and the internet-mode relay
     • img-src/media-src blob:    received images & the camera preview stay in memory
     • require-trusted-types-for  (Chromium) no string → HTML/script sinks at all
     WebRTC is not governed by CSP; the app configures it with zero ICE servers.

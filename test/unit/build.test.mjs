@@ -52,3 +52,16 @@ test('the build is reproducible: same source → same fingerprint', () => {
   const b = JSON.parse(readFileSync(join(out2, 'build-info.json'), 'utf8')).fingerprint;
   assert.equal(a, b);
 });
+
+test('the CSP header (_headers) and the <meta> CSP allow exactly the same things', () => {
+  // Browsers enforce BOTH. If one forgets an origin (e.g. the relay), that feature is
+  // silently blocked in production — this happened once, so it is now a test.
+  const parse = (csp) => Object.fromEntries(csp.split(';').map((d) => d.trim()).filter(Boolean)
+    .map((d) => { const [k, ...v] = d.split(/\s+/); return [k, v.sort().join(' ')]; }));
+  const meta = parse(/http-equiv="Content-Security-Policy" content="([^"]+)"/.exec(readFileSync(join(root, 'src/index.html'), 'utf8'))[1]);
+  const header = parse(/Content-Security-Policy:\s*(.+)/.exec(readFileSync(join(root, 'src/_headers'), 'utf8'))[1]);
+  delete header['frame-ancestors']; // only valid in a header; the meta tag can't carry it
+  assert.deepEqual(header, meta);
+  const relay = /RELAY_URL = '([^']+)'/.exec(readFileSync(join(root, 'src/js/config.js'), 'utf8'))[1];
+  for (const origin of [relay, relay.replace(/^https/, 'wss')]) assert.ok(meta['connect-src'].split(' ').includes(origin), `connect-src allows ${origin}`);
+});

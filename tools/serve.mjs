@@ -38,6 +38,18 @@ const SECURITY_HEADERS = {
   'Cache-Control': 'no-cache',
 };
 
+// Send the same headers the real host does (Cloudflare Pages reads dist/_headers), so the
+// browser tests enforce BOTH content-security policies — the header and the <meta> tag.
+// (A relay origin missing from _headers once blocked internet mode on every real phone.)
+try {
+  const hdr = await readFile(join(dir, '_headers'), 'utf8');
+  const block = hdr.split(/\n(?=\S)/).find((b) => b.trimStart().startsWith('/*')) || '';
+  for (const line of block.split('\n').slice(1)) {
+    const m = /^\s+([A-Za-z-]+):\s*(.+)$/.exec(line);
+    if (m) SECURITY_HEADERS[m[1]] = m[2].trim();
+  }
+} catch { /* no _headers: fine */ }
+
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://x');

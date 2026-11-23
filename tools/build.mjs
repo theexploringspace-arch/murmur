@@ -30,7 +30,7 @@ const PROD_RELAY = 'https://relay.princeisgenius.com';
 const relayArg = process.argv.indexOf('--relay');
 const relay = relayArg > 0 ? process.argv[relayArg + 1].replace(/\/$/, '') : null;
 const retarget = (r, buf) => {
-  if (!relay || !['./index.html', './js/config.js'].includes(r)) return buf;
+  if (!relay || !['./index.html', './js/config.js', './_headers'].includes(r)) return buf;
   const ws = relay.replace(/^http/, 'ws');
   return Buffer.from(buf.toString('utf8').replaceAll(PROD_RELAY, relay).replaceAll(PROD_RELAY.replace(/^https/, 'wss'), ws));
 };
