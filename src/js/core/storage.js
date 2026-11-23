@@ -58,3 +58,18 @@ export class IdbStore {
     });
   }
 }
+
+/**
+ * One vault "slot" inside a shared store. Slot B lives under the "b:" prefix; slot A is
+ * everything else (so installs from before slots existed are slot A unchanged).
+ * clear() only removes this slot's keys.
+ */
+export class SlotStore {
+  constructor(inner, prefix, exclude = []) { Object.assign(this, { inner, prefix, exclude }); }
+  #mine(k) { return typeof k === 'string' && k.startsWith(this.prefix) && !this.exclude.some((x) => k.startsWith(x)); }
+  get(k) { return this.inner.get(this.prefix + k); }
+  put(k, v) { return this.inner.put(this.prefix + k, v); }
+  delete(k) { return this.inner.delete(this.prefix + k); }
+  async keys() { return (await this.inner.keys()).filter((k) => this.#mine(k)).map((k) => k.slice(this.prefix.length)); }
+  async clear() { for (const k of (await this.inner.keys()).filter((k) => this.#mine(k))) await this.inner.delete(k); }
+}

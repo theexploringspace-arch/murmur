@@ -18,9 +18,11 @@ import { encodeQR } from './qr/encode.js';
 import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
+import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 
 const $app = document.getElementById('app');
 const store = new IdbStore();
+const SLOTS = slots(store); // a = real vault, b = duress decoy or placeholder (see core/duress.js)
 
 const TTL_OPTIONS = [[0, 'Off'], [30, '30 seconds'], [300, '5 minutes'], [3600, '1 hour'], [86400, '1 day']];
 const LOCK_OPTIONS = [[1, '1 minute'], [5, '5 minutes'], [15, '15 minutes'], [60, '1 hour']];
@@ -120,7 +122,11 @@ async function boot() {
     S.pendingInvite = location.href;
     history.replaceState(null, '', location.pathname + location.search);
   }
-  if (await Vault.exists(store)) go('unlock'); else go('welcome');
+  if (await anyVault(store)) {
+    go('unlock');
+    // Older installs have one slot; add the second (an unopenable placeholder) in the background.
+    ensureSlots(store).catch((e) => console.warn('slot setup:', e.message));
+  } else go('welcome');
 }
 
 async function openVault(vault) {
@@ -214,6 +220,7 @@ async function onRemoteMessage(cid, m) {
         if (toB64u(await sha256(bytes)) !== f.meta.sha) { toast(`File “${f.meta.name}” failed its integrity check`, 'error'); return; }
         await receivedFile(cid, { id: String(f.meta.id), ts: +f.meta.ts || Date.now(), ttl: Math.max(0, f.meta.ttl | 0) }, String(f.meta.name), String(f.meta.mime), bytes, fileExtra(f.meta));
         S.remote.send(cid, { t: 'ack', id: f.meta.id }).catch(() => {});
+        if (S.view === 'chat' && S.viewArgs[0] === cid) setStatusLine('');
       }
       break;
     }
@@ -493,11 +500,13 @@ VIEWS.create = () => {
       if (p1.value !== p2.value) { err.textContent = 'Passphrases don’t match.'; return; }
       btn.disabled = true; btn.textContent = 'Creating keys…';
       try {
-        const v = await Vault.create(store, p1.value);
+        const v = await Vault.create(SLOTS.a, p1.value);
         await v.putRecord('profile', { name: nm });
         await v.putRecord('settings', { autoLockMin: 5 });
         p1.value = p2.value = '';
+        S.slot = 'a';
         await openVault(v);
+        ensureSlots(store).catch((e) => console.warn('slot setup:', e.message));
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.textContent = 'Create my keys'; }
     },
   },
@@ -519,7 +528,8 @@ VIEWS.unlock = () => {
   return h('form.screen.narrow.center', {
     onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; btn.disabled = true; btn.textContent = 'Unlocking…';
-      try { const v = await Vault.unlock(store, p.value); p.value = ''; await openVault(v); }
+      // Real passphrase → real chats; duress passcode → the decoy. Nothing on screen says which.
+      try { const { vault: v, slot } = await unlockAny(store, p.value); p.value = ''; S.slot = slot; await openVault(v); }
       catch (ex) {
         btn.disabled = false; btn.textContent = 'Unlock'; p.value = ''; p.focus();
         if (ex instanceof VaultWipedError) { toast('Too many wrong passphrases. Everything was erased.', 'error', 8000); go('welcome'); return; }
@@ -803,7 +813,11 @@ function setStatusLine(t) {
   const el = document.getElementById('chatstatus');
   if (!el) return;
   el.textContent = t; el.hidden = !t;
-  clearTimeout(statusTimer); statusTimer = setTimeout(() => { el.hidden = true; }, 4000);
+  // Progress ("Sending… 40%") stays until the next update; only one-off notes fade.
+  // (It used to vanish after 4 s even mid-transfer, so a slow send looked like a failed one.)
+  clearTimeout(statusTimer);
+  if (t && !/…/.test(t)) statusTimer = setTimeout(() => { el.hidden = true; }, 4000);
+  else if (t) statusTimer = setTimeout(() => { el.hidden = true; }, 120_000); // safety net
 }
 
 const RISK_LABEL = { low: 'Looks normal', medium: 'Be careful', high: 'Danger — likely a scam', blocked: 'Blocked' };
@@ -1023,12 +1037,14 @@ function voiceButton(onClip, disabled) {
   btn.addEventListener('pointerdown', async (e) => {
     e.preventDefault(); if (rec || btn.disabled) return;
     held = true; cancelled = false;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); }
     catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); held = false; return; }
     if (!held) { stream.getTracks().forEach((t) => t.stop()); toast('Hold the button while you talk'); return; } // released during the permission prompt
     const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
     const chunks = [];
-    rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    // Speech needs ~32 kbit/s; browsers default to 128–192 (iPhone: a 2-min clip was 2.7 MB).
+    try { rec = new MediaRecorder(stream, { ...(type ? { mimeType: type } : {}), audioBitsPerSecond: 32000 }); }
+    catch { rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined); }
     rec.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data); };
     rec.onstop = () => {
       stream.getTracks().forEach((t) => t.stop());
@@ -1382,7 +1398,10 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
     if (f.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
     try {
       const prep = kind === 'voice' ? { file: f } : await prepareOutgoing(f);
-      if (prep.note) toast(prep.note, prep.warn ? 'error' : 'success');
+      // Nothing leaves the phone on a mis-tap: photos/files always, voice unless set to send on release.
+      const review = kind !== 'voice' || S.settings.voiceSend !== 'release';
+      if (review && !(await reviewBeforeSend(prep, kind))) return;
+      if (prep.note && !review) toast(prep.note, prep.warn ? 'error' : 'success');
       await onFile(prep.file, kind);
     } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
   };
@@ -1394,6 +1413,29 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
     voiceButton((clip) => sendFile(clip, 'voice'), disabled),
     h('button.icon.send', { type: 'submit', disabled, 'aria-label': 'Send', 'data-testid': 'send' }, icon('send')));
 }
+/** Show exactly what is about to be sent (the cleaned copy) and wait for an explicit Send. */
+async function reviewBeforeSend(prep, kind) {
+  const f = prep.file;
+  const url = URL.createObjectURL(f);
+  const type = f.type || '';
+  const preview = kind === 'voice' || type.startsWith('audio/')
+    ? h('audio', { controls: true, src: url, preload: 'metadata', 'data-testid': 'review-audio' })
+    : type.startsWith('image/') && /^image\/(jpeg|png|webp|gif)$/.test(type) ? h('img.review', { src: url, alt: f.name, 'data-testid': 'review-image' })
+    : type.startsWith('video/') ? h('video.review', { controls: true, playsinline: true, src: url, preload: 'metadata', 'data-testid': 'review-video' })
+    : h('p', icon('clip', 16), ` ${f.name}`);
+  try {
+    const choice = await modal({
+      title: kind === 'voice' ? 'Send this voice message?' : `Send ${type.startsWith('image/') ? 'this photo' : type.startsWith('video/') ? 'this video' : 'this file'}?`,
+      body: [preview,
+        h('p.hint', `${f.name} · ${fmtBytes(f.size)}`),
+        prep.note ? h(`p.${prep.warn ? 'warn' : 'ok'}`, icon(prep.warn ? 'alert' : 'shield', 14), ` ${prep.note}`) : null].filter(Boolean),
+      actions: [[kind === 'voice' ? 'Delete' : 'Cancel', 'cancel'], ['Send', 'send', 'primary']],
+    });
+    if (choice !== 'send' && kind === 'voice') toast('Voice message deleted');
+    return choice === 'send';
+  } finally { URL.revokeObjectURL(url); }
+}
+
 function liveBanner(key) {
   const s = S.liveShares.get(key);
   return s ? h('div.banner', { 'data-testid': 'live-banner' }, h('p', icon('pin', 14), ` Sharing your live location until ${fmtTime(s.until)}`),
@@ -1448,11 +1490,57 @@ async function deleteContact(id) {
   go('home');
 }
 
+// ---- duress passcode ----
+// In the REAL vault this sets up the decoy. In the DECOY the same screen appears and
+// "works" (it is saved in the decoy's own settings) but can never touch the real vault —
+// so someone poking around the decoy sees nothing unusual.
+function duressSection() {
+  const d = S.settings.duress || {};
+  const p1 = h('input', { type: 'password', placeholder: `Duress passcode (${MIN_PASSPHRASE}+ chars)`, autocomplete: 'off', 'data-testid': 'duress-pass' });
+  const p2 = h('input', { type: 'password', placeholder: 'Repeat it', autocomplete: 'off', 'data-testid': 'duress-pass2' });
+  const erase = h('input', { type: 'checkbox', checked: !!d.erase, 'data-testid': 'duress-erase' });
+  const btn = h('button.primary', { 'data-testid': 'duress-save' }, d.on ? 'Change duress passcode' : 'Set duress passcode');
+  const save = async (next) => { S.settings.duress = next; await S.vault.putRecord('settings', S.settings); };
+  btn.onclick = async () => {
+    if (p1.value.length < MIN_PASSPHRASE) { toast(`At least ${MIN_PASSPHRASE} characters`, 'error'); return; }
+    if (p1.value !== p2.value) { toast('The two passcodes don’t match', 'error'); return; }
+    if (erase.checked && !(await modal({ title: 'Erase real chats when it’s used?',
+      body: ['The moment anyone unlocks with the duress passcode, your real contacts, keys and messages are destroyed for good. Nobody — not even you — can bring them back.'],
+      actions: [['Cancel', 'no'], ['Yes, erase them', 'yes', 'danger']] }) === 'yes')) return;
+    btn.disabled = true; btn.textContent = 'Setting up…';
+    try {
+      if (S.slot === 'a') {
+        await setDuress(store, 'a', p1.value, { name: S.profile.name, eraseReal: erase.checked,
+          settings: { autoLockMin: S.settings.autoLockMin, internet: !!S.settings.internet } });
+      } else {
+        // Decoy: same checks, same wait, same result on screen; nothing real is touched.
+        if (await opensOther(store, 'b', p1.value) || await Vault.open(S.vault.store, p1.value)) throw new Error('The duress passcode must be different from your real passphrase');
+      }
+      await save({ on: true, erase: erase.checked });
+      p1.value = p2.value = '';
+      toast('Duress passcode set', 'success'); render();
+    } catch (e) { toast(e.message, 'error'); btn.disabled = false; btn.textContent = d.on ? 'Change duress passcode' : 'Set duress passcode'; }
+  };
+  const off = h('button', { 'data-testid': 'duress-off', onclick: async () => {
+    if (S.slot === 'a') await clearDuress(store, 'a');
+    await save({ on: false, erase: false });
+    toast('Duress passcode turned off'); render();
+  } }, 'Turn off');
+  return h('div.duress',
+    h('h2', 'Duress passcode'),
+    h('p.hint', 'For when someone forces you to unlock Murmur. Type this instead of your passphrase: Murmur opens normally, but shows a separate set of chats — never your real ones. Nothing on screen tells them apart.'),
+    h('p', { 'data-testid': 'duress-status' }, d.on ? (d.erase ? 'On — erases your real chats when used' : 'On') : 'Off'),
+    p1, p2,
+    h('label.toggle', erase, ' Also erase my real chats the moment it’s used'),
+    h('div.row', btn, d.on ? off : null),
+    h('p.hint', 'Tip: unlock once with the duress passcode and add a few ordinary contacts (family, a work group), so it looks lived-in. Choose something you can type calmly under pressure.'));
+}
+
 VIEWS.settings = () => {
   const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
   const lockSel = h('select', { 'aria-label': 'Auto-lock' }, LOCK_OPTIONS.map(([v, l]) => h('option', { value: v, selected: S.settings.autoLockMin === v }, l)));
   const wipeSel = h('select', { 'aria-label': 'Wipe after failed attempts' });
-  S.vault.getWipeAfter().then((n) => { for (const [v, l] of WIPE_OPTIONS) wipeSel.append(h('option', { value: v, selected: n === v }, l)); });
+  Vault.meta(SLOTS.a).then((m) => m?.wipeAfter ?? 10).then((n) => { for (const [v, l] of WIPE_OPTIONS) wipeSel.append(h('option', { value: v, selected: n === v }, l)); });
   const oldP = h('input', { type: 'password', placeholder: 'Current passphrase', autocomplete: 'current-password' });
   const newP = h('input', { type: 'password', placeholder: `New passphrase (${MIN_PASSPHRASE}+ chars)`, autocomplete: 'new-password' });
   const fp = h('code.small', { 'data-testid': 'build-fp' }, 'unavailable');
@@ -1473,14 +1561,28 @@ VIEWS.settings = () => {
       h('label', 'Auto-lock after inactivity'),
       h('div.row', lockSel, h('button', { onclick: async () => { S.settings.autoLockMin = +lockSel.value; await S.vault.putRecord('settings', S.settings); toast('Saved'); } }, 'Save')),
       h('label', 'Erase everything after wrong passphrases'),
-      h('div.row', wipeSel, h('button', { onclick: async () => { await S.vault.setWipeAfter(+wipeSel.value); toast('Saved'); } }, 'Save')),
+      h('div.row', wipeSel, h('button', { onclick: async () => { await Vault.setWipeAfterOn(SLOTS.a, +wipeSel.value); await Vault.setWipeAfterOn(SLOTS.b, +wipeSel.value); toast('Saved'); } }, 'Save')),
       h('p.hint', 'Slows down someone who grabs your phone. It can’t stop an attacker who copies the encrypted data first — a long passphrase is your real protection.'),
       h('label', 'Change passphrase'),
       oldP, newP,
       h('button', { onclick: async () => {
-        try { await S.vault.changePassphrase(oldP.value, newP.value); oldP.value = newP.value = ''; toast('Passphrase changed', 'success'); }
+        try {
+          if (await opensOther(store, S.slot, newP.value)) throw new Error('Pick a different passphrase');
+          await S.vault.changePassphrase(oldP.value, newP.value); oldP.value = newP.value = ''; toast('Passphrase changed', 'success'); }
         catch (e) { toast(e instanceof WrongPassphraseError ? 'Current passphrase is wrong' : e.message, 'error'); }
       } }, 'Change passphrase'),
+
+      duressSection(),
+
+      h('h2', 'Messages'),
+      h('label', { for: 'voice-send' }, 'Voice messages'),
+      h('select#voice-send', { 'data-testid': 'voice-send', onchange: async (e) => {
+        S.settings.voiceSend = e.target.value; await S.vault.putRecord('settings', S.settings);
+        toast(e.target.value === 'release' ? 'Voice messages send when you let go' : 'You’ll hear each voice message before it sends');
+      } },
+        h('option', { value: 'review', selected: S.settings.voiceSend !== 'release' }, 'Listen first, then tap Send'),
+        h('option', { value: 'release', selected: S.settings.voiceSend === 'release' }, 'Send as soon as I let go (walkie-talkie)')),
+      h('p.hint', 'Photos, videos and files always show a preview with a Send button, so a wrong tap never sends anything.'),
 
       h('h2', 'Internet mode'),
       h('p', { 'data-testid': 'internet-status' }, S.remote ? (S.relayOnline ? 'On — connected to the relay' : 'On — relay not reachable right now (messages wait safely on this phone)') : 'Off — nearby (same Wi-Fi) only'),

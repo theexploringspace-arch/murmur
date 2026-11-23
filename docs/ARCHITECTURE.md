@@ -129,7 +129,7 @@ had to be in the browser. Open DevTools on a laptop, reproduce, and read the Con
 | media privacy | `media.test.mjs` | real PIL/ffmpeg files with GPS, camera and comments; secrets gone, pixels identical (PIL), orientation kept, video still decodes (ffprobe), damaged files refused |
 | location & groups | `geo-groups.test.mjs` | known distances and bearings; coordinate validation; only the creator changes the roster; replayed rosters refused; removal; ID generator checked against the receiver's rules |
 | deployment | `sitecheck.test.mjs` | the live-site checker passes on an honest host and names the injected script on a tampering one |
-| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, walkie-talkie with fake mic, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal; **updates**: new build verified, announced with its fingerprint, applied on tap, data kept |
+| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, walkie-talkie with fake mic (review → delete sends nothing, review → send, then instant mode), photo preview where Cancel sends nothing, phone Save via share sheet, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal; **updates**: new build verified, announced with its fingerprint, applied on tap, data kept |
 
 ### Internet mode components
 ```
@@ -138,3 +138,15 @@ app.js ──► remote.js ──► ratchet.js (Double Ratchet)  ┐
               ▼                                        ┘
    relay: router.js (Worker) ──► inbox.js (one Durable Object per mailbox, SQLite)
 ```
+
+## Lesson: the outbox that rewrote itself
+
+The relay outbox used to be ONE encrypted vault record holding every queued envelope.
+Each `send()` re-encrypted and rewrote the whole queue, and so did each successful post.
+For a 2-minute voice clip (≈15 chunks of ~350 KB) that is ~75 MB of AES + IndexedDB work
+on a phone — minutes of "nothing happening". Now the queue is a tiny index
+(`remote/outbox2`) plus one record per envelope (`remote/ob/<seq>`): every byte is written
+once and deleted once. Bytes are written before the index points at them, and the index
+is updated before the bytes are deleted, so a crash can leave an orphan but never a
+dangling pointer. Older builds' single record is migrated on load.
+`test/unit/remote.test.mjs` measures bytes written; the old design does not finish it.

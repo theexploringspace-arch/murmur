@@ -63,27 +63,43 @@ export class Vault {
   }
 
   static async unlock(store, passphrase) {
+    const opened = await Vault.open(store, passphrase);
+    if (opened) return opened;
+    await Vault.noteFailure(store, () => Vault.wipe(store));
+  }
+
+  /** Try a passphrase WITHOUT touching the failure counter. → Vault, or null if wrong. */
+  static async open(store, passphrase) {
     const meta = await store.get(META);
     if (!meta) throw new Error('No vault');
-    const kek = await C.passphraseKey(passphrase, meta.salt, meta.iterations);
+    return Vault.openWithKek(store, meta, await C.passphraseKey(passphrase, meta.salt, meta.iterations));
+  }
+  /** Same, with a KEK derived elsewhere (lets callers derive several in parallel). */
+  static async openWithKek(store, meta, kek) {
     let dek;
     try {
       dek = await C.unwrapKey('raw', meta.wrappedDek, kek, meta.dekIv, AAD('dek'), C.AES_ALGO,
         ['encrypt', 'decrypt', 'unwrapKey']);
-    } catch {
-      const fails = ((await store.get(FAILS)) || 0) + 1;
-      if (meta.wipeAfter > 0 && fails >= meta.wipeAfter) {
-        await Vault.wipe(store);
-        throw new VaultWipedError();
-      }
-      await store.put(FAILS, fails);
-      throw new WrongPassphraseError(meta.wipeAfter > 0 ? meta.wipeAfter - fails : Infinity);
-    }
+    } catch { return null; }
     await store.put(FAILS, 0);
     const id = await store.get(IDENT);
     const privateKey = await C.unwrapKey('pkcs8', id.wrapped, dek, id.iv, AAD('identity'), C.ECDSA_ALGO, ['sign']);
     const publicKey = await C.importIdentityPublic(id.publicRaw);
     return new Vault(store, dek, { privateKey, publicKey, publicRaw: id.publicRaw });
+  }
+  static meta(store) { return store.get(META); }
+  /** The wrong-passphrase limit is plain metadata (needed before unlock), so it can be set without the key. */
+  static async setWipeAfterOn(store, n) { const m = await store.get(META); if (m) await store.put(META, { ...m, wipeAfter: n | 0 }); }
+  /** Count one wrong passphrase on `store`; past the limit run `wipe` and throw VaultWipedError. Always throws. */
+  static async noteFailure(store, wipe) {
+    const meta = await store.get(META);
+    const fails = ((await store.get(FAILS)) || 0) + 1;
+    if (meta.wipeAfter > 0 && fails >= meta.wipeAfter) {
+      await wipe();
+      throw new VaultWipedError();
+    }
+    await store.put(FAILS, fails);
+    throw new WrongPassphraseError(meta.wipeAfter > 0 ? meta.wipeAfter - fails : Infinity);
   }
 
   static async wipe(store) { await store.clear(); }

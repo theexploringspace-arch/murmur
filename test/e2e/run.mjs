@@ -141,9 +141,11 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
         return [...new Uint8Array(await (await c.convertToBlob({ type: 'image/png' })).arrayBuffer())];
       }));
       await A.page.setInputFiles(tid('file-input'), { name: 'pic.png', mimeType: 'image/png', buffer: png });
+      await A.page.click(tid('modal-send'));
       await B.page.waitForSelector(`${tid('msg-in')} img.attach`, { timeout: 15000 });
       const big = Buffer.alloc(300 * 1024); for (let i = 0; i < big.length; i++) big[i] = (i * 7919) & 255;
       await A.page.setInputFiles(tid('file-input'), { name: 'data.bin', mimeType: 'application/octet-stream', buffer: big });
+      await A.page.click(tid('modal-send'));
       await B.page.waitForFunction(() => [...document.querySelectorAll('button.file')].some((a) => a.textContent.includes('data.bin')), null, { timeout: 20000 });
       const sum = await B.page.evaluate(async () => {
         const a = [...document.querySelectorAll('button.file')].find((x) => x.textContent.includes('data.bin'));
@@ -424,6 +426,63 @@ test('updates: a new build is verified, announced with its fingerprint, and appl
   } finally { await browser.close(); srv.kill(); rmSync(abs, { recursive: true, force: true }); }
 });
 
+test('duress passcode: opens an empty decoy, real chats untouched; optional erase destroys them silently', { timeout: 240000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME });
+  const A = await profile(browser, 'alice-duress'), B = await profile(browser, 'bob-duress');
+  const REAL = 'correct horse battery staple', DURESS = 'grandma birthday cake';
+  const lockAndUnlock = async (pass) => {
+    await A.page.click(tid('lock'));
+    await A.page.fill(tid('unlock-pass'), pass); await A.page.click(tid('unlock'));
+  };
+  try {
+    await onboard(A, 'Alice', REAL); await onboard(B, 'Bob', 'another long passphrase');
+    await pairByText(A, B);
+    await A.page.click(tid('back'));
+    await A.page.waitForSelector(tid('contact-Bob'));
+
+    // Set it up from the real vault.
+    await A.page.click(tid('settings'));
+    assert.equal(await A.page.textContent(tid('duress-status')), 'Off');
+    await A.page.fill(tid('duress-pass'), REAL); await A.page.fill(tid('duress-pass2'), REAL);
+    await A.page.click(tid('duress-save'));
+    await A.page.waitForFunction(() => /different from your real passphrase/.test(document.body.textContent), null, { timeout: 20000 });
+    await A.page.fill(tid('duress-pass'), DURESS); await A.page.fill(tid('duress-pass2'), DURESS);
+    await A.page.click(tid('duress-save'));
+    await A.page.waitForFunction((s) => document.querySelector(s)?.textContent === 'On', tid('duress-status'), { timeout: 30000 });
+    await A.page.click(tid('back'));
+
+    // Forced to unlock: the duress passcode opens an ordinary, empty Murmur.
+    await lockAndUnlock(DURESS);
+    await A.page.waitForSelector(tid('invite'), { timeout: 30000 });
+    assert.equal(await A.page.$$eval(tid('contact-Bob'), (e) => e.length), 0, 'real contact hidden');
+    assert.match(await A.page.textContent('body'), /No contacts yet/);
+    await A.page.click(tid('settings'));
+    assert.equal(await A.page.textContent(tid('duress-status')), 'Off', 'the decoy looks like a phone with no duress passcode');
+    assert.equal(await A.page.inputValue('input[aria-label="Display name"]'), 'Alice', 'same name: nothing looks off');
+    await A.page.click(tid('back'));
+
+    // Back to the real passphrase: everything is still there.
+    await lockAndUnlock(REAL);
+    await A.page.waitForSelector(tid('contact-Bob'), { timeout: 30000 });
+
+    // Now with "erase real chats": one use of the duress passcode destroys them.
+    await A.page.click(tid('settings'));
+    await A.page.fill(tid('duress-pass'), DURESS); await A.page.fill(tid('duress-pass2'), DURESS);
+    await A.page.check(tid('duress-erase'));
+    await A.page.click(tid('duress-save'));
+    await A.page.click(tid('modal-yes'));
+    await A.page.waitForFunction((s) => /erases/.test(document.querySelector(s)?.textContent || ''), tid('duress-status'), { timeout: 30000 });
+    await A.page.click(tid('back'));
+    await lockAndUnlock(DURESS);
+    await A.page.waitForSelector(tid('invite'), { timeout: 30000 });
+    assert.equal(await A.page.evaluate(() => /eras|wip|delet|destroy/i.test([...document.querySelectorAll('.toast')].map((x) => x.textContent).join(' '))), false, 'no hint on screen that anything was erased');
+    await lockAndUnlock(REAL);
+    await A.page.waitForFunction(() => /Wrong passphrase/.test(document.body.textContent), null, { timeout: 30000 });
+    assert.equal(await A.page.$$eval(tid('contact-Bob'), (e) => e.length), 0);
+    for (const p of [A, B]) assert.deepEqual(p.errors, []);
+  } finally { await browser.close(); }
+});
+
 test('internet mode: invite link, stranger gating, scam warnings, offline queue, verification', { timeout: 240000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME });
   const C = await profile(browser, 'carol'), D = await profile(browser, 'dave');
@@ -474,6 +533,7 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
     // A disguised program sent as a "photo" is flagged and never displayed.
     const exe = Buffer.concat([Buffer.from('MZ'), Buffer.alloc(2000, 7)]);
     await C.page.setInputFiles(tid('file-input'), { name: 'holiday.jpg', mimeType: 'image/jpeg', buffer: exe });
+    await C.page.click(tid('modal-send'));
     await D.page.waitForSelector(`${tid('msg-in')} ${tid('file-warning')}`, { timeout: 20000 });
     assert.match(await D.page.textContent(`${tid('msg-in')} ${tid('file-warning')}`), /Disguised program|Pretends/);
     assert.equal(await D.page.$$eval(`${tid('msg-in')} img`, (x) => x.length), 0);
@@ -541,8 +601,14 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
 
     // --- photo privacy: GPS/camera data never leaves Carol's phone ---
     await P.Carol.page.click(tid('contact-Dave'));
+    // A wrong pick never sends: the photo is previewed (already cleaned) and Cancel stops it.
     await P.Carol.page.setInputFiles(tid('file-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
-    await P.Carol.page.waitForFunction(() => /Removed hidden location/.test(document.body.textContent), null, { timeout: 15000 });
+    await P.Carol.page.waitForSelector(tid('review-image'), { timeout: 15000 });
+    assert.match(await P.Carol.page.textContent('.modal'), /Removed hidden location/);
+    await P.Carol.page.click(tid('modal-cancel'));
+    assert.equal(await P.Carol.page.$$eval(tid('msg-out'), (e) => e.length), 0, 'cancelled photo was not sent');
+    await P.Carol.page.setInputFiles(tid('file-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await P.Carol.page.click(tid('modal-send'));
     await P.Dave.page.click(tid('contact-Carol'));
     await P.Dave.page.waitForSelector(`${tid('msg-in')} img.attach`, { timeout: 20000 });
     const got = await P.Dave.page.evaluate(async () => {
@@ -574,8 +640,12 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await P.Dave.page.click(`${tid('msg-in')} ${tid('how-far')}`);
     await P.Dave.page.waitForFunction(() => /km S of you|km SSE of you|km SSW of you/.test(document.querySelector('[data-testid="msg-in"] [data-testid="loc-relative"]')?.textContent || ''), null, { timeout: 15000 });
 
-    // --- walkie-talkie: hold to talk, release to send ---
+    // --- walkie-talkie: by default you hear the clip first; Delete sends nothing, Send sends it ---
     await holdButton(P.Carol.page, tid('voice'), 1600);
+    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
+    await P.Carol.page.click(tid('modal-cancel'));
+    await holdButton(P.Carol.page, tid('voice'), 1600);
+    await P.Carol.page.click(tid('modal-send'));
     await P.Dave.page.waitForSelector(tid('voice-clip'), { timeout: 30000 });
     const dur = await P.Dave.page.evaluate(() => new Promise((res) => {
       const a = document.querySelector('[data-testid="voice-clip"]');
@@ -584,6 +654,14 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
       setTimeout(() => res(-1), 8000);
     }));
     assert.ok(dur === Infinity || dur > 0.5, `voice clip has audio (duration ${dur})`); // Chrome reports Infinity for streamed WebM
+    assert.equal(await P.Dave.page.$$eval(tid('voice-clip'), (e) => e.length), 1, 'the deleted clip never arrived');
+    // Real walkie-talkie mode (Settings): sends the moment you let go, no question asked.
+    await P.Carol.page.click(tid('back')); await P.Carol.page.click(tid('settings'));
+    await P.Carol.page.selectOption(tid('voice-send'), 'release');
+    await P.Carol.page.click(tid('back')); await P.Carol.page.click(tid('contact-Dave'));
+    await holdButton(P.Carol.page, tid('voice'), 1600);
+    await P.Dave.page.waitForFunction((s) => document.querySelectorAll(s).length === 2, tid('voice-clip'), { timeout: 30000 });
+    assert.equal(await P.Carol.page.$('.modal'), null, 'no review step in walk-talkie mode');
 
     // --- SOS: Dave holds the button; Carol gets an alarm with his position ---
     await P.Dave.page.click(tid('back')); await P.Dave.page.click(tid('sos'));

@@ -110,3 +110,54 @@ test('the relay never sees names, identity keys or plaintext', async () => {
   for (const needle of ['TOP SECRET', 'Hiddenname', 'Secretname', 'hello']) assert.equal(all.indexOf(needle), -1, needle);
   assert.equal(all.indexOf(Buffer.from(bob.identity.publicRaw.slice(1, 24))), -1, 'Bob identity key not visible');
 });
+
+// A store that counts how many bytes the vault writes (stand-in for the phone's IndexedDB + AES work).
+class CountingStore extends MemoryStore {
+  written = 0;
+  async put(k, v) { this.written += v?.ct?.length || 0; return super.put(k, v); }
+}
+
+test('big files queue in LINEAR time: each chunk is written once, not the whole queue again (voice-clip slowness)', async () => {
+  const alice = await phone('Alice'), bob = await phone('Bob', new CountingStore());
+  alice.start(); await online(alice);
+  const inv = await alice.createInvite('https://m.example');
+  const aliceCid = await bob.acceptInvite((await bob.inspectInvite(inv.text)).inv, { t: 'hello', name: 'Bob' });
+  // Bob is offline: a 2-minute voice clip's worth (15 × 192 KB) piles up in his outbox.
+  const CHUNK = 'x'.repeat(256 * 1024); // ≈ one base64 chunk
+  bob.store.written = 0;
+  for (let i = 0; i < 15; i++) await bob.send(aliceCid, { t: 'chunk', id: 'f', i, d: CHUNK });
+  const payload = 15 * CHUNK.length;
+  // Old design rewrote the full queue per send: ~8× payload here (and quadratic). Now ≈ 1.4× (base64 envelope + ratchet state).
+  assert.ok(bob.store.written < 2 * payload, `queued ${payload} bytes but wrote ${bob.store.written}`);
+  bob.store.written = 0;
+  bob.start(); await online(bob);
+  await alice.next(() => alice.inbox.filter((x) => x.m.t === 'chunk').length === 15);
+  await bob.idle();
+  assert.equal(bob.outbox.length, 0);
+  assert.ok(bob.store.written < 0.1 * payload, `sending must not rewrite the queued bytes (wrote ${bob.store.written})`);
+  assert.deepEqual(alice.inbox.filter((x) => x.m.t === 'chunk').map((x) => x.m.i), [...Array(15).keys()], 'in order, none lost');
+  assert.deepEqual((await bob.store.keys()).filter((k) => k.includes('remote/ob/')), [], 'no envelope left behind');
+  alice.stop(); bob.stop();
+});
+
+test('an outbox written by an older build (one big record) is migrated and still delivered', async () => {
+  const alice = await phone('Alice'), bob = await phone('Bob');
+  alice.start(); await online(alice);
+  const inv = await alice.createInvite('https://m.example');
+  const aliceCid = await bob.acceptInvite((await bob.inspectInvite(inv.text)).inv, { t: 'hello', name: 'Bob' });
+  await bob.send(aliceCid, { t: 'msg', id: 'old', text: 'queued by the old version' });
+  // Rewrite Bob's queue the way older builds stored it, then "update" the app (reload from the store).
+  const v = bob.vault;
+  const legacy = [];
+  for (const o of bob.outbox) { legacy.push({ cid: o.cid, to: o.to, mid: o.mid, wire: await v.getRecord(`remote/ob/${o.seq}`) }); await v.deleteRecord(`remote/ob/${o.seq}`); }
+  await v.deleteRecord('remote/outbox2');
+  await v.putRecord('remote/outbox', legacy);
+  const bob2 = new Remote({ vault: v, identity: v.identity, relayUrl: relay.url, origin: ORIGIN, getName: () => 'Bob',
+    wsFactory: (u) => new WebSocket(u, { headers: { Origin: ORIGIN } }), fetchImpl: (u, o) => fetch(u, { ...o, headers: { ...o.headers, Origin: ORIGIN } }) });
+  await bob2.load();
+  assert.equal(bob2.outbox.length, 3, 'join + hello + msg migrated');
+  assert.equal(await v.getRecord('remote/outbox', null), null, 'old record removed');
+  bob2.start(); await online(bob2);
+  await alice.next(() => alice.inbox.some((x) => x.m.text === 'queued by the old version'));
+  alice.stop(); bob2.stop();
+});

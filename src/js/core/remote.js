@@ -50,16 +50,45 @@ export class Remote {
     this.addressBytes = await INV.inboxAddress(this.secret);
     this.address = toB64u(this.addressBytes);
     this.peers = await this.vault.getRecord('remote/peers', {});      // cid → {pub, inbox, ratchet}
-    this.outbox = await this.vault.getRecord('remote/outbox', []);    // [{to, wire, mid, cid}]
+    // Outbox: a small index (who, where, which message) + ONE vault record per envelope.
+    // Saving the whole queue as one record made every send rewrite every queued byte:
+    // a 2-minute voice clip (15 chunks) re-encrypted ~75 MB on the phone and took minutes.
+    const ob = await this.vault.getRecord('remote/outbox2', null);
+    this.outbox = ob?.items || []; this.obNext = ob?.next || 0;      // [{seq, cid, to, mid}]
+    const legacy = await this.vault.getRecord('remote/outbox', null);  // older builds: [{to, wire, mid, cid}]
+    if (legacy?.length) {
+      for (const o of legacy) await this.#enqueue({ cid: o.cid, to: o.to, mid: o.mid }, o.wire);
+      await this.vault.deleteRecord('remote/outbox');
+    }
     return this;
   }
   #savePeers() { return this.vault.putRecord('remote/peers', this.peers); }
   #saveRec() { return this.vault.putRecord('remote', this.rec); }
-  #saveOutbox() { return this.vault.putRecord('remote/outbox', this.outbox); }
+  #saveOutbox() { return this.vault.putRecord('remote/outbox2', { next: this.obNext, items: this.outbox }); }
+  /** Park one envelope: write its bytes first, then the index that points at them. */
+  async #enqueue(entry, wireB64) {
+    const seq = this.obNext++;
+    await this.vault.putRecord(`remote/ob/${seq}`, wireB64);
+    this.outbox.push({ seq, ...entry });
+    await this.#saveOutbox();
+  }
+  async #dequeue() {
+    const o = this.outbox.shift();
+    await this.#saveOutbox();                                  // index first: a crash here leaves an orphan, never a dangling pointer
+    await this.vault.deleteRecord(`remote/ob/${o.seq}`);
+  }
 
   has(cid) { return !!this.peers[cid]; }
   canSend(cid) { const p = this.peers[cid]; return !!p && Ratchet.fromJSON(p.ratchet).canSend; }
-  forget(cid) { return this.#serial(async () => { delete this.peers[cid]; this.outbox = this.outbox.filter((o) => o.cid !== cid); await this.#savePeers(); await this.#saveOutbox(); }); }
+  forget(cid) {
+    return this.#serial(async () => {
+      delete this.peers[cid];
+      const gone = this.outbox.filter((o) => o.cid === cid);
+      this.outbox = this.outbox.filter((o) => o.cid !== cid);
+      await this.#savePeers(); await this.#saveOutbox();
+      for (const o of gone) await this.vault.deleteRecord(`remote/ob/${o.seq}`);
+    });
+  }
 
   // ------------------------------------------------------------ connection
   start() {
@@ -135,12 +164,14 @@ export class Remote {
     return this.#serial(async () => {
       while (this.outbox.length) {
         const o = this.outbox[0];
-        try { await this.#post(o.to, fromB64u(o.wire)); }
+        const wire = await this.vault.getRecord(`remote/ob/${o.seq}`, null);
+        if (wire == null) { await this.#dequeue(); continue; } // bytes missing (wiped mid-write): nothing to send
+        try { await this.#post(o.to, fromB64u(wire)); }
         catch (e) {
           if (!e.permanent) return; // offline: keep it, retry on next connect
           this.emit('send-failed', o.cid, o.mid, e.message);
         }
-        this.outbox.shift(); await this.#saveOutbox();
+        await this.#dequeue();
         if (o.mid) this.emit('sent', o.cid, o.mid);
       }
     });
@@ -168,8 +199,7 @@ export class Remote {
       const day = dayOf(this.now());
       const env = concat(new Writer().u8(V).u8(KIND_MSG).u32(day).done(), await this.#tag(day, this.identity.publicRaw, fromB64u(p.pub)), wire);
       p.ratchet = r.toJSON(); await this.#savePeers();   // ratchet advanced: persist BEFORE the bytes leave
-      this.outbox.push({ cid, to: p.inbox, wire: toB64u(env), mid: appMsg.t === 'ack' ? null : appMsg.id || null });
-      await this.#saveOutbox();
+      await this.#enqueue({ cid, to: p.inbox, mid: appMsg.t === 'ack' ? null : appMsg.id || null }, toB64u(env));
     }).then(() => { if (this.online) this.flush(); });
   }
 
@@ -238,8 +268,7 @@ export class Remote {
       const cid = await contactId(peer.identityPub);
       this.peers[cid] = { pub: toB64u(peer.identityPub), inbox: toB64u(peer.inbox), ratchet: ratchet.toJSON() };
       await this.#savePeers();
-      this.outbox.push({ cid, to: toB64u(peer.inbox), wire: toB64u(join), mid: null });
-      await this.#saveOutbox();
+      await this.#enqueue({ cid, to: toB64u(peer.inbox), mid: null }, toB64u(join));
       return cid;
     }).then(async (cid) => { await this.send(cid, helloMsg); return cid; });
   }

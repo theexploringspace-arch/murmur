@@ -18,6 +18,7 @@ Honest about both halves: what Murmur defends, and where it can't.
 | A3 | Someone who relays/edits a *pasted* code | swap in their own connection? **No** — they can only offer *their own* identity | Edits break the signature. A whole substitute code carries a different key → a new contact, flagged if the name matches an existing one. Verify safety numbers when codes travel over other channels |
 | A4 | Thief with the phone, app locked | read data? **Only by guessing the passphrase** | All data is AES-GCM under a key derived with PBKDF2 (600k). A **strong passphrase** is the real protection; the wipe-after-N-attempts setting only stops on-device guessing, because an attacker who copies the browser profile can guess offline |
 | A5 | Thief with the phone, app **unlocked** | read what's on screen and in memory? **Yes** | Mitigations: auto-lock (default 5 min, also when backgrounded), history off by default, disappearing messages, panic wipe |
+| A5b | Someone **forcing you** to unlock ("open it and show me") | see your real chats? **No, if you use the duress passcode** | It opens a decoy vault (slot B) that looks like a normal Murmur. See "Duress passcode" below for exactly what it does and doesn't hide |
 | A6 | Later compromise of a device | decrypt earlier recorded traffic? **No** | Ephemeral ECDH per session + per-message hash ratchet; old keys are erased. Re-key every 100 msgs / 5 min limits exposure inside a long session |
 | A7 | Malicious message content | run code in the app? **Designed out** | No `innerHTML`; Trusted Types (Chromium) makes HTML/script sinks throw; strict CSP; `href`/`src` restricted to `blob:`; strict JSON field validation; size limits |
 | A8 | Malicious peer (valid contact) | crash/exhaust the app? **Bounded** | Frame ≤ 64 KiB, text ≤ 8000 chars, files ≤ 25 MiB, ≤ 4 concurrent incoming files, chunk order/size/hash enforced |
@@ -100,6 +101,39 @@ to a web app.
   2. The service worker refuses an altered copy, so offline mode stays off and the user is warned.
   3. `Cache-Control: no-transform` asks the CDN not to rewrite pages.
   4. `tools/site-check.mjs` proves the live site matches the build byte for byte.
+
+## Duress passcode — what it hides and what it can't
+
+**How it works.** Storage holds two vault slots on every install. Slot A is your real vault.
+Slot B is either your decoy or, if you never set one up, a placeholder locked with a random
+passphrase that was thrown away. Unlocking always derives both keys (equal work for real,
+duress and wrong passphrases). Real passphrase → slot A; duress passcode → slot B; anything
+else → one wrong attempt (shared counter; past the limit both slots are erased). Using the
+duress passcode never counts as a wrong attempt.
+
+**Hidden from someone looking at the screen:** which passcode you typed (same screens, same
+name, same timing); that a duress passcode exists (the decoy's own Settings shows it *off*);
+that the real chats were erased, if you chose that option (no message, no toast).
+
+**Hidden from someone inspecting raw storage:** whether a decoy is set up, and whether the
+erase option is on. Both cases produce the same record names (names are plaintext, so the
+erase flag lives *inside* the decoy's encrypted settings; a test found and fixed an earlier
+version that leaked it as a record name). Tested in `test/unit/duress.test.mjs`.
+
+**Not hidden:**
+- That Murmur *has* this feature. Every install has two slots, and this document says so.
+  Someone who knows can demand "the other passcode". Only the erase option defeats that,
+  because after one use there is nothing left to reveal.
+- A copy of the storage taken *before* you unlock. If the erase option is off, the real vault
+  is still in that copy, protected only by your passphrase's strength.
+- Contacts and the relay. Your real contacts' messages keep arriving at your real relay inbox,
+  where they wait unread. If the erase option is on, they expire there after 30 days.
+- Size. A real vault full of history is larger than a fresh decoy. Fill the decoy with ordinary
+  chats so it looks lived in.
+
+**Safety rails:** only the real vault can set or replace the duress passcode. Inside the decoy
+the same screen appears and "succeeds", but it can't touch slot A. The duress passcode must
+differ from the real passphrase, and changing either passphrase to match the other is refused.
 
 ## Known limitations (by design)
 

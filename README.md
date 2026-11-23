@@ -168,12 +168,13 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 | Feature | Nearby (no internet) | Far away (relay) | Notes |
 |---|---|---|---|
 | Text, receipts ✓✓, disappearing | ✅ | ✅ | |
-| Photos & videos | ✅ | ✅ (sent in 192 KiB chunks) | Hidden location/camera data removed before sending; only real images/videos are displayed |
-| Walkie-talkie | ✅ | ✅ | Hold the mic button, release to send (2 min max). Needs microphone permission |
+| Photos & videos | ✅ | ✅ (sent in 192 KiB chunks) | Hidden location/camera data removed before sending; you see the cleaned copy and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
+| Walkie-talkie | ✅ | ✅ | Hold the mic button and talk (2 min max, ~32 kbit/s speech quality). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
 | Location | ✅ | ✅ | Once, or live for 15 min / 1 h (updates every 30 s while Murmur is open). Shows distance & direction — no map server. "Map" opens your map app only after a warning |
 | SOS | ✅ | ✅ (queued if no signal) | Hold 1.5 s. Sends your message + GPS to chosen contacts. **Cannot call emergency services** |
 | Groups | ✅ | ✅ | Up to 20. The creator forwards text and location to members who aren't each other's contacts ("via group"); files go to your direct contacts in the group |
 | Scam protection | ✅ | ✅ | Links never open in one tap; lookalike/brand-fake domains, hidden destinations and disguised files are flagged |
+| Duress passcode | ✅ | ✅ | Settings → *Duress passcode*. Typed instead of your passphrase, it opens a separate, ordinary-looking Murmur (its own contacts) — never your real chats. Optional: silently erase the real chats when it's used |
 
 ### Checking a deployment
 - `node tools/site-check.mjs https://murmur.princeisgenius.com` — fetches every file like a phone would and proves it's **byte-for-byte the tested build** (catches CDN/host injection), and checks the security headers.
