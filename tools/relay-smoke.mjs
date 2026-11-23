@@ -66,6 +66,7 @@ if (t.status !== 200) fail(`/v1/turn answered ${t.status} — is the latest rela
 const tj = await t.json();
 const urls = tj.iceServers.flatMap((x) => [].concat(x.urls));
 console.log(`   → ${tj.turn ? 'TURN ON' : 'TURN OFF (STUN only)'}: ${urls.join(', ')}`);
+if (!tj.turn) console.log(`   → why: ${tj.reason || 'unknown (relay is an older version — redeploy it)'}`);
 if (!tj.turn) console.log('   ! Calls work on the same Wi-Fi and between most home networks, but phones on mobile data often\n     can\'t reach each other directly, and "Hide my IP" can\'t be honoured. Set TURN_KEY_ID and\n     TURN_KEY_API_TOKEN (see README → "Calls: switch on the TURN relay").');
 if (urls.some((u) => /:53(\?|$)/.test(u))) fail('port 53 URLs should have been filtered out');
 

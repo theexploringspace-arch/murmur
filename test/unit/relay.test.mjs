@@ -123,5 +123,13 @@ test('calls: /v1/turn mints short-lived credentials server-side, filters port 53
   } finally { r2.server.close(); }
   // Not configured (or Cloudflare down): STUN only, and the app knows it.
   const plain = await (await fetch(`${relay.url}/v1/turn`, { headers: { Origin: ORIGIN } })).json();
-  assert.deepEqual(plain, { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }], turn: false });
+  assert.deepEqual(plain, { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }], turn: false, reason: 'not set up (missing TURN_KEY_ID and TURN_KEY_API_TOKEN)' });
+  // A wrong token: the reason says so, and never echoes the token.
+  const r3 = await startRelay({ port: 0, origins: [ORIGIN], env: { TURN_KEY_ID: 'k', TURN_KEY_API_TOKEN: 'wrong-token', fetch: async () => new Response('no', { status: 401 }) } });
+  try {
+    const bad = await (await fetch(`${r3.url}/v1/turn`, { headers: { Origin: ORIGIN } })).json();
+    assert.equal(bad.turn, false);
+    assert.match(bad.reason, /refused the key \(HTTP 401\)/);
+    assert.ok(!JSON.stringify(bad).includes('wrong-token'));
+  } finally { r3.server.close(); }
 });

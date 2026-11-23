@@ -24,7 +24,8 @@ async function turn(request, env, origin) {
   const json = (o, status = 200) => new Response(JSON.stringify(o), { status, headers: cors(env, origin, { 'Content-Type': 'application/json' }) });
   if (!allowed(env, origin)) return new Response('origin not allowed', { status: 403, headers: cors(env, origin) });
   if (request.method !== 'GET') return new Response('method not allowed', { status: 405, headers: cors(env, origin) });
-  if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return json({ iceServers: STUN_ONLY, turn: false });
+  // `reason` says why TURN is off (never includes the key or token), so setup mistakes are visible.
+  if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) return json({ iceServers: STUN_ONLY, turn: false, reason: `not set up (missing ${[!env.TURN_KEY_ID && 'TURN_KEY_ID', !env.TURN_KEY_API_TOKEN && 'TURN_KEY_API_TOKEN'].filter(Boolean).join(' and ')})` });
   // Each credential lets someone use bandwidth we pay for past the free tier: limit per address.
   if (env.TURN_LIMIT) {
     const { success } = await env.TURN_LIMIT.limit({ key: request.headers.get('CF-Connecting-IP') || 'unknown' });
@@ -36,14 +37,14 @@ async function turn(request, env, origin) {
       headers: { Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ ttl: TURN_TTL }),
     });
-    if (!r.ok) throw new Error(`TURN API ${r.status}`);
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? `Cloudflare refused the key (HTTP ${r.status}): check TURN_KEY_ID and TURN_KEY_API_TOKEN` : r.status === 404 ? 'Cloudflare doesn’t know this TURN_KEY_ID (HTTP 404)' : `Cloudflare TURN API answered HTTP ${r.status}`);
     const { iceServers } = await r.json();
     // Browsers block port 53; without trickle ICE those URLs only add a timeout.
     const clean = [].concat(iceServers || []).map((s) => ({ ...s, urls: [].concat(s.urls).filter((u) => !/:53(\?|$)/.test(u)) })).filter((s) => s.urls.length);
     if (!clean.some((s) => s.urls.some((u) => u.startsWith('turn')))) throw new Error('no TURN servers returned');
     return json({ iceServers: clean, turn: true, ttl: TURN_TTL });
-  } catch {
-    return json({ iceServers: STUN_ONLY, turn: false }); // calls still work where a direct path exists
+  } catch (e) {
+    return json({ iceServers: STUN_ONLY, turn: false, reason: String(e.message || e).slice(0, 200) }); // calls still work where a direct path exists
   }
 }
 
