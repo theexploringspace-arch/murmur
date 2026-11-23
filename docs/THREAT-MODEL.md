@@ -50,6 +50,35 @@ Whoever controls the origin that served Murmur could publish modified JavaScript
 If your adversary can compromise your hosting, a native app (or a pinned, locally-sideloaded copy)
 is the better choice.
 
+
+## Internet mode (relay) — added threats
+
+| Adversary | Can | Cannot |
+|---|---|---|
+| **Relay operator / Cloudflare** | See IP addresses, when you're online, your inbox address, envelope sizes (padded) and timing. Drop, delay or reorder envelopes. Refuse service. | Read messages, names or files. Forge or inject messages (AES-GCM, with the AD bound to both identities). Replay them (ratchet counters and single-use skipped keys). Read a mailbox without its secret. |
+| **Network attacker** (no internet mode) | Everything the relay operator can, if TLS is broken | Same as the relay operator |
+| **Whoever relays the invite link** (SMS, WhatsApp…) | Swap the invite for their own and become "Alice" to Bob | Stay hidden if Bob compares safety numbers on a call. Remote contacts are labelled **not verified** until he does. |
+| **Someone who gets hold of a used invite** | Nothing. The prekey was deleted on first use, and Alice's app drops the join. | — |
+| **Someone who gets hold of an unused invite** (posted publicly) | Join first | Send links or files that open without Alice's approval. They arrive as a **request**, with links and files locked until she taps Accept. |
+| **Stolen, unlocked phone later** | Read messages in the vault (if history is on) | Decrypt past relay traffic captured earlier (forward secrecy) |
+
+Metadata is the honest limit. A relay can't hide **that** two devices exchange
+messages, or when. Rotating routing tags and padding reduce what can be
+inferred, but only a mix network or Tor could hide it. That isn't available
+to a web app.
+
+## Scam protection (safety.js) — scope and limits
+- **Catches:**
+  - links that run code (`javascript:` and similar)
+  - lookalike letters from other alphabets and digit swaps (`paypa1`)
+  - brand names on domains that don't belong to the brand
+  - `user@host` tricks, raw IP addresses, shorteners, `.zip`/`.mov` domains
+  - programs disguised as photos (checked by content, not name), double extensions, hidden right-to-left characters in file names
+  - Office files with macros
+  - names that imitate an existing contact
+- **Doesn't catch:** a brand-new phishing site with an ordinary name, or social engineering in plain text. That's why links are **never one-tap**: the real destination is always shown first, with a reminder never to type passwords after following a link.
+- **No cloud lookups (e.g. Safe Browsing).** They would tell a third party what people share.
+
 ## Known limitations (by design)
 
 - **Proximity required**: both devices on the same LAN at the same time. No store-and-forward, no mesh.

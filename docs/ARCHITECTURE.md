@@ -109,4 +109,17 @@ root cause. The unit tests mirror those boundaries, so a failing layer usually h
 | session | `core.test.mjs` | impostor, channel-binding mismatch, tamper, replay, gap, off-curve key, re-key under load, key erasure |
 | QR | `qr.test.mjs` | RS fuzzing; all 40 versions × 4 ECC; camera distortions; OpenCV both ways |
 | build output | `build.test.mjs` | every precached file exists with its hash; host config never precached; fingerprint covers the offline engine; reproducible |
-| whole app | `e2e/run.mjs` | two Chromium profiles; network guard; offline; CSP/TT; fake camera |
+| double ratchet | `ratchet.test.mjs` | ping-pong across DH steps; out-of-order/lost; replay; tamper leaves state intact; forward secrecy; persistence; DoS gap |
+| remote invites | `invite.test.mjs` | join reveals nothing to the relay; altered/expired/own invites; swapped invite detectable; binding to invite |
+| relay | `relay.test.mjs` | the real Worker code on a Node runtime shim: offline delivery, ack-delete, owner-only read, Origin checks, limits, 30-day alarm, opaque storage |
+| internet mode | `remote.test.mjs` | two phones over the relay with real vaults: offline writer, offline reader, relock, reused invite, live bootstrap, no plaintext at the relay |
+| scam protection | `safety.test.mjs` | blocked schemes, homographs (punycode), brand lookalikes, hidden destinations, file sniffing, disguised programs, lookalike names |
+| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification |
+
+### Internet mode components
+```
+app.js ──► remote.js ──► ratchet.js (Double Ratchet)  ┐
+              │  └────► invite.js (links, joins)       ├─ crypto.js (WebCrypto only)
+              ▼                                        ┘
+   relay: router.js (Worker) ──► inbox.js (one Durable Object per mailbox, SQLite)
+```

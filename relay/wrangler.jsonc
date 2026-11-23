@@ -1,0 +1,13 @@
+{
+  // Murmur relay — deploy with: npx wrangler deploy   (from this folder)
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "murmur-relay",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "routes": [{ "pattern": "relay.princeisgenius.com", "custom_domain": true }],
+  "vars": { "ALLOWED_ORIGINS": "https://murmur.princeisgenius.com" },
+  "durable_objects": { "bindings": [{ "name": "INBOX", "class_name": "Inbox" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Inbox"] }],
+  "observability": { "enabled": false }
+}

@@ -144,3 +144,27 @@ code.safety { display: block; font-size: 1.15rem; letter-spacing: 0.06em; word-s
 .modal p { color: var(--fg2); }
 .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* ---- internet mode, verification & scam protection ---- */
+.pair-links { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; padding: 0 1.1rem; margin-top: 0.6rem; }
+.pair-links button { justify-content: center; }
+.cstate[data-kind="internet"] { color: var(--accent); }
+.cstate[data-kind="queued"] { color: var(--warn); }
+.pill[data-kind="internet"] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, transparent); }
+.pill[data-kind="queued"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
+.banner { margin: 0.6rem 1rem 0; padding: 0.75rem 0.9rem; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--line); font-size: 0.9rem; line-height: 1.4; }
+.banner p { margin: 0 0 0.5rem; }
+.banner.warn { background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+p.warn { color: var(--warn); font-size: 0.9rem; line-height: 1.4; }
+p.ok { color: var(--ok); font-weight: 600; }
+button.inlink { display: inline; background: none; border: none; padding: 0; min-height: 0; font: inherit; text-decoration: underline dotted; text-underline-offset: 3px; color: var(--accent); word-break: break-all; cursor: pointer; }
+button.inlink.risk-medium { color: var(--warn); }
+button.inlink.risk-high, button.inlink.risk-blocked { color: var(--danger); text-decoration: underline wavy; }
+.linkhost { font-size: 1.35rem; font-weight: 700; word-break: break-all; margin: 0.2rem 0 0.4rem; }
+.risk { font-weight: 700; margin: 0.3rem 0; }
+.risk.risk-low { color: var(--ok); } .risk.risk-medium { color: var(--warn); } .risk.risk-high, .risk.risk-blocked { color: var(--danger); }
+button.file { background: none; border: 1px dashed var(--line); padding: 0.4rem 0.6rem; font-size: 0.88rem; min-height: 0; }
+.filewarn { margin: 0.3rem 0; font-size: 0.8rem; line-height: 1.35; }
+.filewarn.danger { color: var(--danger); } .filewarn.warn { color: var(--warn); }
+.reconnect.compact { padding-top: 0.4rem; padding-bottom: 0.4rem; }
+.reconnect.compact p { font-size: 0.85rem; margin: 0 0 0.3rem; }

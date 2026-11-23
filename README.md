@@ -43,7 +43,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 48 unit tests: crypto, protocol, attacks, QR codec, build output
+npm test            # 83 unit tests: crypto, protocol, attacks, QR codec, build output
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -120,6 +120,35 @@ one to tell Alice's phone where Bob's phone is. Contacts are remembered, so a re
 recognises them (and refuses a code from a *different* key claiming to be them).
 
 ---
+
+## Internet mode: friends who are far away
+
+Nearby phones talk directly over the same Wi‑Fi or hotspot, with no server involved. For friends
+somewhere else, Murmur uses a small relay that **can't read anything**:
+
+- Messages are encrypted on the phone with the **Double Ratchet** (the design Signal uses).
+- The relay stores only unreadable data. It **deletes each message once delivered**, and anything unclaimed **after 30 days**.
+- If you write while offline, the message is encrypted immediately, waits on your phone, and sends itself when you're back online.
+- **Invite by link:** send it by text, WhatsApp or email. It works once and expires after 7 days. Remote contacts show **not verified** until you compare safety numbers on a call.
+- **Scam protection** runs on the phone:
+  - links are never one-tap, and lookalike and fake-brand domains are flagged
+  - files are checked by their real contents, and disguised programs are caught
+  - names imitating your contacts are flagged
+  - strangers who use your invite arrive as a **request**, with links and files locked
+
+### Deploy the relay (Cloudflare, free plan)
+The relay code is in `relay/`. It runs on Workers with Durable Objects (SQLite).
+1. dash.cloudflare.com → **Workers & Pages** → **Create application** → **Workers** → **Import a repository** → pick this repo.
+2. **Project name:** `murmur-relay`. It must match `name` in `relay/wrangler.jsonc`.
+3. **Root directory** (advanced): `relay` · **Build command:** *(empty)* · **Deploy command:** `npx wrangler deploy`
+4. Deploy. `wrangler.jsonc` attaches **relay.princeisgenius.com** as a custom domain and only accepts requests from `https://murmur.princeisgenius.com`.
+5. Check it: `curl.exe -s https://relay.princeisgenius.com/v1/health` → `ok`
+
+To use another domain, change `routes` and `ALLOWED_ORIGINS` in `relay/wrangler.jsonc`, and `RELAY_URL` in
+`src/js/config.js` together with the relay origin in the CSP in `src/index.html`.
+
+Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhost:8080`, then
+`node tools/build.mjs --relay http://127.0.0.1:8787` and `npm run serve`.
 
 ## Project layout
 

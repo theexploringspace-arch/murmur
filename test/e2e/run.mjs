@@ -25,7 +25,11 @@ const CHROME = process.env.CHROME_PATH || (existsSync('/usr/bin/google-chrome') 
 const PORT = 8765 + Math.floor(Math.random() * 500);
 const ORIGIN = `http://localhost:${PORT}`;
 
-execFileSync(process.execPath, [join(root, 'tools/build.mjs')], { stdio: 'inherit' });
+// Local relay (same code as production, Node runtime shim) — the app is built to use it.
+const { startRelay } = await import('../../relay/node/server.mjs');
+const relay = await startRelay({ port: 0, origins: [ORIGIN] });
+const RELAY = relay.url; // http://127.0.0.1:<port>
+execFileSync(process.execPath, [join(root, 'tools/build.mjs'), '--relay', RELAY], { stdio: 'inherit' });
 const server = spawn(process.execPath, [join(root, 'tools/serve.mjs'), '--port', String(PORT)], { stdio: 'pipe' });
 await new Promise((r) => server.stdout.once('data', r));
 
@@ -38,13 +42,14 @@ async function profile(browser, name) {
   await ctx.route('**/*', (route) => {
     const u = route.request().url();
     if (strict && !u.startsWith('blob:') && !u.startsWith('data:')) { strictHits.push(`${name}: ${u}`); return route.abort(); }
-    if (u.startsWith(ORIGIN) || u.startsWith('blob:') || u.startsWith('data:')) return route.continue();
+    if (u.startsWith(ORIGIN) || u.startsWith(RELAY) || u.startsWith('blob:') || u.startsWith('data:')) return route.continue();
     leaks.push(`${name}: ${u}`); return route.abort();
   });
   const page = await ctx.newPage();
   const errors = [];
   page.on('pageerror', (e) => errors.push(`${name} pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error' && !/Camera|getUserMedia|NotFoundError|Requested device not found/i.test(m.text())) errors.push(`${name} console: ${m.text()}`); });
+  // Browser-generated network notices (a WebSocket that can't connect while offline) are expected, not app errors.
+  page.on('console', (m) => { if (m.type() === 'error' && !/Camera|getUserMedia|NotFoundError|Requested device not found|WebSocket connection to .* failed/i.test(m.text())) errors.push(`${name} console: ${m.text()}`); });
   await page.addInitScript(() => {
     window.__csp = [];
     document.addEventListener('securitypolicyviolation', (e) => window.__csp.push(`${e.violatedDirective} ${e.blockedURI}`));
@@ -139,10 +144,10 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await B.page.waitForSelector(`${tid('msg-in')} img.attach`, { timeout: 15000 });
       const big = Buffer.alloc(300 * 1024); for (let i = 0; i < big.length; i++) big[i] = (i * 7919) & 255;
       await A.page.setInputFiles(tid('file-input'), { name: 'data.bin', mimeType: 'application/octet-stream', buffer: big });
-      await B.page.waitForFunction(() => [...document.querySelectorAll('a.file')].some((a) => a.textContent.includes('data.bin')), null, { timeout: 20000 });
+      await B.page.waitForFunction(() => [...document.querySelectorAll('button.file')].some((a) => a.textContent.includes('data.bin')), null, { timeout: 20000 });
       const sum = await B.page.evaluate(async () => {
-        const a = [...document.querySelectorAll('a.file')].find((x) => x.textContent.includes('data.bin'));
-        const b = new Uint8Array(await (await fetch(a.href)).arrayBuffer());
+        const a = [...document.querySelectorAll('button.file')].find((x) => x.textContent.includes('data.bin'));
+        const b = new Uint8Array(await (await fetch(a.dataset.blob)).arrayBuffer());
         let s = 0; for (const x of b) s = (s * 31 + x) >>> 0; return [b.length, s];
       });
       let s = 0; for (const x of big) s = (s * 31 + x) >>> 0;
@@ -197,9 +202,17 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await A.page.fill(tid('unlock-pass'), 'not the passphrase');
       await A.page.click(tid('unlock'));
       await A.page.waitForFunction(() => /tries left/.test(document.querySelector('.error')?.textContent || ''));
+      // Bob keeps writing while Alice is locked: it goes through the relay (set up
+      // automatically when they paired face to face) and waits for her.
+      await B.page.waitForSelector(`${tid('conn-state')}[data-kind="internet"]`, { timeout: 15000 });
+      await send(B, 'written while you were locked');
       await A.page.fill(tid('unlock-pass'), 'correct horse battery staple');
       await A.page.click(tid('unlock'));
       await A.page.waitForSelector(tid('contact-Bob'));
+      await A.page.click(tid('contact-Bob'));
+      await A.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"] .text')].some((e) => e.textContent === 'written while you were locked'), null, { timeout: 15000 });
+      await B.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"]')].at(-1)?.querySelector('.status')?.textContent === '✓✓', null, { timeout: 15000 });
+      await A.page.click(tid('back'));
     });
 
     await t.test('fully offline: app reloads from service worker and reconnects', async () => {
@@ -228,7 +241,9 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await B.page.click(tid('back'));
       assert.equal(await B.page.$$eval('[data-testid^="contact-"]', (x) => x.length), 1, 'known contact recognised, not duplicated');
       strict = false;
-      assert.deepEqual(strictHits, [], 'app made zero HTTP requests while reconnecting and chatting');
+      // The relay may be *tried* (internet mode retries in the background); the app itself
+      // must be served entirely from the phone, and nearby chat must not need any server.
+      assert.deepEqual(strictHits.filter((u) => !u.includes(RELAY)), [], 'app made zero HTTP requests to its host while reconnecting and chatting');
     });
 
     await t.test('panic wipe erases everything', async () => {
@@ -300,7 +315,8 @@ with open(sys.argv[2], 'wb') as f:
     await A.page.click(tid('scan-reply'));
     for (const p of [A, B]) await p.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`, { timeout: 30000 });
     await send(A, 'scanned, not pasted');
-    await B.page.waitForFunction(() => document.querySelector('[data-testid="msg-in"] .text')?.textContent === 'scanned, not pasted');
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="msg-in"] .text')?.textContent === 'scanned, not pasted', null, { timeout: 15000 })
+      .catch(async (e) => { console.error('B log:', await B.page.$eval('[data-testid="log"]', (x) => x.textContent).catch(() => '?'), 'B view:', await B.page.textContent('body')); throw e; });
     assert.deepEqual(leaks, []);
   } finally { await bA.close(); await bB.close(); }
 });
@@ -326,7 +342,7 @@ test('slow human scan: reply scanned 45 s later still connects (was a false "can
     await A.page.fill(tid('paste-reply'), reply);
     await A.page.click(tid('paste-reply-go'));
     for (const p of [A, B]) await p.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`, { timeout: 30000 });
-    assert.equal(await A.page.$eval(tid('conn-state'), (e) => e.textContent), 'connected');
+    assert.match(await A.page.$eval(tid('conn-state'), (e) => e.textContent), /connected/);
     await send(A, 'worth the wait');
     await B.page.waitForFunction(() => document.querySelector('[data-testid="msg-in"] .text')?.textContent === 'worth the wait');
   } finally { await browser.close(); }
@@ -365,3 +381,82 @@ test('host injects a script into index.html: offline install is refused AND the 
 });
 
 process.on('exit', () => server.kill());
+
+test('internet mode: invite link, stranger gating, scam warnings, offline queue, verification', { timeout: 240000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME });
+  const C = await profile(browser, 'carol'), D = await profile(browser, 'dave');
+  try {
+    await onboard(C, 'Carol', 'correct horse battery staple');
+    await onboard(D, 'Dave', 'tr0ub4dor & 3 bananas');
+    await C.page.waitForFunction(() => /connected to the relay|Far away/.test(document.body.textContent));
+
+    // Carol makes an invite link and "texts" it to Dave.
+    await C.page.click(tid('link-invite'));
+    await C.page.waitForFunction((s) => /#i=/.test(document.querySelector(s)?.value || ''), tid('invite-link'));
+    const link = await C.page.$eval(tid('invite-link'), (e) => e.value);
+    assert.ok(link.startsWith(ORIGIN + '/#i='), link);
+    await C.page.click(tid('back'));
+
+    // Dave opens the link: unlock → invite preview → Join.
+    await D.page.goto('about:blank'); await D.page.goto(link); // a fresh load, like tapping the link in a text
+    await D.page.fill(tid('unlock-pass'), 'tr0ub4dor & 3 bananas'); await D.page.click(tid('unlock'));
+    assert.ok(!(await D.page.evaluate(() => location.hash)), 'invite removed from the address bar');
+    await D.page.waitForSelector(tid('join-invite'));
+    assert.match(await D.page.textContent('.big-instruction'), /Carol invites you/);
+    await D.page.click(tid('join-invite'));
+    await D.page.waitForSelector(tid('verify-banner'));
+    await send(D, 'Hi Carol! Pay the deposit here: paypa1.com/pay');
+
+    // Carol: Dave appears as a REQUEST. His link is visible but locked, and flagged as dangerous.
+    await C.page.waitForSelector(tid('contact-Dave'), { timeout: 20000 });
+    await C.page.click(tid('contact-Dave'));
+    await C.page.waitForSelector(tid('request-banner'));
+    await C.page.waitForSelector(`${tid('msg-in')} ${tid('link')}`, { timeout: 20000 });
+    assert.match(await C.page.getAttribute(`${tid('msg-in')} ${tid('link')}`, 'class'), /risk-high/);
+    await C.page.click(`${tid('msg-in')} ${tid('link')}`);
+    assert.match(await C.page.textContent('.modal'), /Accept this contact before opening/);
+    assert.equal(await C.page.$$eval('.modal button', (b) => b.map((x) => x.textContent).includes('Open anyway')), false);
+    await C.page.click(tid('modal-cancel'));
+    await C.page.click(tid('accept-request'));
+    await C.page.click(`${tid('msg-in')} ${tid('link')}`);
+    assert.equal(await C.page.textContent(tid('link-host')), 'paypa1.com');
+    assert.match(await C.page.textContent(tid('link-risk')), /Danger/);
+    assert.match(await C.page.textContent('.modal'), /Looks like Paypal, but it is NOT paypal\.com/);
+    await C.page.click(tid('modal-cancel'));
+
+    // Carol replies; Dave sees it and Carol gets ✓✓.
+    await send(C, 'Hi Dave — not clicking that 😄');
+    await D.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"] .text')].some((e) => e.textContent.startsWith('Hi Dave')), null, { timeout: 20000 });
+    await C.page.waitForFunction(() => document.querySelector('[data-testid="msg-out"] .status')?.textContent === '✓✓', null, { timeout: 20000 });
+
+    // A disguised program sent as a "photo" is flagged and never displayed.
+    const exe = Buffer.concat([Buffer.from('MZ'), Buffer.alloc(2000, 7)]);
+    await C.page.setInputFiles(tid('file-input'), { name: 'holiday.jpg', mimeType: 'image/jpeg', buffer: exe });
+    await D.page.waitForSelector(`${tid('msg-in')} ${tid('file-warning')}`, { timeout: 20000 });
+    assert.match(await D.page.textContent(`${tid('msg-in')} ${tid('file-warning')}`), /Disguised program|Pretends/);
+    assert.equal(await D.page.$$eval(`${tid('msg-in')} img`, (x) => x.length), 0);
+
+    // Dave loses internet, writes anyway: it waits on his phone, then delivers by itself.
+    await D.ctx.setOffline(true);
+    await send(D, 'typed with no signal');
+    await D.page.waitForSelector(`${tid('conn-state')}[data-kind="queued"]`, { timeout: 20000 }); // failed send → offline detected
+    assert.equal(await D.page.evaluate(() => [...document.querySelectorAll('[data-testid="msg-out"]')].at(-1).querySelector('.status').textContent), '○');
+    await D.ctx.setOffline(false);
+    await C.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"] .text')].some((e) => e.textContent === 'typed with no signal'), null, { timeout: 40000 });
+
+    // Verification after comparing numbers on a "call".
+    await D.page.click(tid('contact-info'));
+    await C.page.click(tid('contact-info'));
+    const sn = (p) => p.page.waitForFunction((s) => /^\d{5}( \d{5}){11}$/.test(document.querySelector(s)?.textContent || '') && document.querySelector(s).textContent, tid('safety-number')).then((x) => x.jsonValue());
+    assert.equal(await sn(C), await sn(D));
+    await D.page.click(tid('mark-verified'));
+    await D.page.waitForSelector(tid('verified'));
+    await D.page.click(tid('back'));
+    assert.equal(await D.page.$(tid('verify-banner')), null);
+
+    assert.deepEqual(leaks, []);
+    for (const p of [C, D]) assert.deepEqual(await p.page.evaluate(() => window.__csp), [], `${p.name} CSP`);
+  } finally { await browser.close(); }
+});
+
+process.on('exit', () => relay.server.close());

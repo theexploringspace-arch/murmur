@@ -23,13 +23,25 @@ const rel = (f) => './' + relative(src, f).split(sep).join('/');
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
+// --relay URL (tests/local dev only): point the app at another relay. Rewrites the
+// relay origin in config.js and in index.html's CSP before hashing, so the
+// integrity manifest still matches exactly what is served.
+const PROD_RELAY = 'https://relay.princeisgenius.com';
+const relayArg = process.argv.indexOf('--relay');
+const relay = relayArg > 0 ? process.argv[relayArg + 1].replace(/\/$/, '') : null;
+const retarget = (r, buf) => {
+  if (!relay || !['./index.html', './js/config.js'].includes(r)) return buf;
+  const ws = relay.replace(/^http/, 'ws');
+  return Buffer.from(buf.toString('utf8').replaceAll(PROD_RELAY, relay).replaceAll(PROD_RELAY.replace(/^https/, 'wss'), ws));
+};
 const files = {};
 for (const f of walk(src).sort()) {
   const r = rel(f);
   if (r === './sw.template.js' || /(^|\/)\./.test(r.slice(2))) continue; // skip dotfiles
   mkdirSync(dirname(join(out, r)), { recursive: true });
-  copyFileSync(f, join(out, r));
-  files[r] = sha(readFileSync(f));
+  const content = retarget(r, readFileSync(f));
+  writeFileSync(join(out, r), content);
+  files[r] = sha(content);
 }
 
 // Host config files (Netlify/Cloudflare `_headers`) are consumed by the host and

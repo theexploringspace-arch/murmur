@@ -162,3 +162,66 @@ record r = AES-GCM(DEK, iv, utf8(JSON), aad="murmur/v1/rec/<name>")     (AAD sto
 Unwrapped DEK and IDK are **non-extractable** `CryptoKey`s. A wrong passphrase is detected by the
 GCM tag on the DEK. An optional failure counter wipes the store after N failures (see threat model
 for why this is a speed bump, not a wall).
+
+## 8. Internet mode (relay) — `ratchet.js`, `invite.js`, `remote.js`, `relay/`
+
+Live sessions (§4–5) need both phones online at once. Internet mode adds an
+**asynchronous** channel through an untrusted relay, so a message can be
+written now and read days later.
+
+### 8.1 Mailboxes
+- Each phone has a random 32-byte **inbox secret** (vault record `remote`).
+- **Address** = `SHA-256("murmur/inbox/v1" ‖ 0x00 ‖ secret)`, sent to contacts.
+- Relay API (`relay/src/router.js`):
+  - `POST /v1/inbox/<address>`: deposit opaque bytes (≤ 1 MiB). Anyone with the address can do this.
+  - `GET /v1/inbox/<address>` (WebSocket): the owner sends `{"t":"auth","secret":…}`. The relay checks it against the address, then streams `id(16) ‖ data` frames and `{"t":"synced"}`. The client sends `{"t":"ack","ids":[…]}`, and the relay **deletes** those rows.
+  - `ping`/`pong` text frames are used for liveness.
+- Rows unclaimed for **30 days** are deleted by a Durable Object alarm.
+
+### 8.2 Invites (remote first contact)
+```
+invite = v=1 ‖ kind=3 ‖ created u32 ‖ expires u32 ‖ inviteId[16] ‖ lp8(name)
+         ‖ identityPub[65] ‖ prekeyPub[65] ‖ inbox[32] ‖ sig[64]
+sig    = ECDSA_identity("murmur/invite/v1" ‖ body)      expires = created + 7 days
+link   = <app origin>/#i=<base64url(invite)>             (fragment: never sent to any server)
+```
+The joiner (Bob) works out the shared key and builds the join message:
+```
+SK      = HKDF(ECDH(bobEph, alicePrekey), salt=H(invite), "murmur/x3dh/v1", 32)
+joinKey = HKDF(…, "murmur/join/key/v1", 44)                  (key ‖ iv, used once)
+join    = 1 ‖ 4 ‖ inviteId ‖ bobEphPub ‖ AES-GCM(joinKey, body, AAD = those 83 bytes)
+body    = lp8(name) ‖ identityPub ‖ inbox ‖ created ‖ ECDSA_bob("murmur/join/v1" ‖ H(invite) ‖ ephPub ‖ identityPub ‖ inbox ‖ name ‖ 0 ‖ created)
+```
+- **The prekey is single use.** Alice deletes it after the first valid join, so a replayed or leaked invite gets no answer.
+- **Swapping the invite isn't prevented by cryptography.** Someone who replaces the invite in transit gets a different identity key. Safety-number comparison catches this, which is why remote contacts start **unverified**.
+
+### 8.3 Double Ratchet
+This follows Signal's specification, using P-256 ECDH, HKDF-SHA-256, HMAC chain keys and AES-256-GCM.
+```
+KDF_RK(rk, dh) = HKDF(dh, salt=rk, "murmur/dr/rk/v1", 64) → (rk', ck)
+KDF_CK(ck)     = (HMAC(ck, 0x02), HMAC(ck, 0x01))         → (ck', mk)
+key ‖ iv       = HKDF(mk, 0³², "murmur/dr/mk/v1", 44)
+header         = 1 ‖ dhPub[65] ‖ pn u32 ‖ n u32
+wire           = header ‖ AES-GCM(key, iv, pad(plaintext), AAD = AD ‖ header)
+AD             = "murmur/dr/ad/v1" ‖ inviterIdentity ‖ joinerIdentity
+```
+- Skipped keys are kept for late or reordered messages: at most 1000 per chain and 2000 in total.
+- Decryption is **transactional**: the state only changes if authentication succeeds.
+- Ratchet state is stored in the vault (`remote/peers`). It is **saved before the message is posted**, and **acknowledged only after it is saved**.
+
+### 8.4 Envelope
+```
+envelope = 1 ‖ kind=5 ‖ day u32 ‖ tag[16] ‖ wire
+tag      = SHA-256("murmur/route/v1" ‖ 0 ‖ senderIdentity ‖ recipientIdentity ‖ day)[0..16]
+```
+The tag lets the recipient find the right ratchet without trying each contact. It changes every day, and the relay can't link it to identities it never sees.
+
+### 8.5 Face-to-face bootstrap
+When a live session (§4) connects:
+- If one side has no internet link yet, the inviter sends `r-invite` (an invite with a 15-minute lifetime) inside the **authenticated live session**. The answerer replies `r-join {join, first ratchet message}`.
+- Both sides check the identity in the bundle against the live peer's key, so the result is **verified**.
+- If one side lacks the link, it asks with `r-need`.
+- An existing link is never re-keyed this way, because that would strand messages already waiting on the relay.
+
+### 8.6 App messages over the relay
+These are the same JSON types as §6 (`hello`, `msg`, `ack`, `file`, `chunk`). Over the relay, file chunks are 192 KiB.

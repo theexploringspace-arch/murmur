@@ -13,6 +13,7 @@
 //   typing {on}
 //   file   {id, ts, name, mime, size, sha, chunks, ttl} then chunk {id, i, d}
 //   bye    {}                              — polite disconnect
+//   r-invite {b} / r-join {j, f}           — set up the internet (relay) link while face to face
 
 import { PeerLink } from './transport.js';
 import { SecureSession } from './session.js';
@@ -127,6 +128,9 @@ export class Conversation {
     return m;
   }
 
+  /** Internet-mode setup messages travel inside this authenticated session. */
+  sendControl(m) { return this.#send(m); }
+
   setTyping(on) { if (this.state === 'connected') this.session.sendMessage({ t: 'typing', on: !!on }).catch(() => {}); }
 
   /** @param {File|Blob} file @param {(sent:number,total:number)=>void} progress */
@@ -186,6 +190,7 @@ export class Conversation {
         break;
       }
       case 'bye': this.close('peer left'); break;
+      case 'r-invite': case 'r-join': case 'r-need': this.emit('control', m); break; // internet-mode setup (remote.js)
       default: break; // ignore unknown types (forward compatibility)
     }
   }
