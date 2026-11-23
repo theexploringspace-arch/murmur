@@ -81,3 +81,11 @@ Who could have written that message? What would Emma have to do to be sure it wa
 
 ### 11. Implement: per-member delivery details
 Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the message (`m.acks` already holds the ids).
+
+## Exercise 12 — calls and trust
+1. A call's media is encrypted with keys negotiated by DTLS. Why would the call be wide open to the
+   relay if the SDP (which carries the DTLS fingerprint) travelled unauthenticated? Find the line
+   in `core/call.js` that sends the SDP, and trace which encryption protects it.
+2. "Hide my IP" uses `iceTransportPolicy: 'relay'`. Why must the **answering** phone also use it?
+   (Hint: peer-reflexive candidates.) Find where the app fetches ICE servers before accepting.
+3. Threat-model it: what can Cloudflare TURN learn about a call, and what can't it?

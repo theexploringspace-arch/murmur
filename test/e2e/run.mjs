@@ -60,9 +60,13 @@ async function profile(browser, name) {
 
 const tid = (id) => `[data-testid="${id}"]`;
 
+/** The lock screen fills in a remembered username asynchronously; wait for it before typing. */
+const userReady = (page) => page.waitForSelector('[data-testid="unlock-form"][data-ready="1"]', { timeout: 15000 });
+
 async function onboard(p, name, pass) {
   await p.page.click(tid('get-started'));
   await p.page.fill(tid('name'), name);
+  await p.page.fill(tid('username'), `${name.toLowerCase().replace(/[^a-z0-9]/g, '')}_test`);
   await p.page.fill(tid('pass1'), pass);
   await p.page.fill(tid('pass2'), pass);
   await p.page.click(tid('create'));
@@ -201,14 +205,14 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await A.page.click(tid('lock'));
       await A.page.waitForSelector(tid('unlock-pass'));
       await B.page.waitForSelector(`${tid('conn-state')}[data-online="false"]`, { timeout: 10000 });
-      await A.page.fill(tid('unlock-pass'), 'not the passphrase');
+      await userReady(A.page); await A.page.fill(tid('unlock-pass'), 'not the passphrase');
       await A.page.click(tid('unlock'));
       await A.page.waitForFunction(() => /tries left/.test(document.querySelector('.error')?.textContent || ''));
       // Bob keeps writing while Alice is locked: it goes through the relay (set up
       // automatically when they paired face to face) and waits for her.
       await B.page.waitForSelector(`${tid('conn-state')}[data-kind="internet"]`, { timeout: 15000 });
       await send(B, 'written while you were locked');
-      await A.page.fill(tid('unlock-pass'), 'correct horse battery staple');
+      await userReady(A.page); await A.page.fill(tid('unlock-pass'), 'correct horse battery staple');
       await A.page.click(tid('unlock'));
       await A.page.waitForSelector(tid('contact-Bob'));
       await A.page.click(tid('contact-Bob'));
@@ -226,7 +230,7 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await B.page.waitForSelector(tid('unlock-pass'));
       assert.ok(await A.page.evaluate(() => !!navigator.serviceWorker.controller), 'served by service worker');
       for (const [p, pw] of [[A, 'correct horse battery staple'], [B, 'tr0ub4dor & 3 bananas']]) {
-        await p.page.fill(tid('unlock-pass'), pw); await p.page.click(tid('unlock'));
+        await userReady(p.page); await p.page.fill(tid('unlock-pass'), pw); await p.page.click(tid('unlock'));
         await p.page.waitForSelector(tid('contact-Alice') + ',' + tid('contact-Bob'));
       }
       // Chrome's emulated "offline" also kills loopback WebRTC, which real offline
@@ -375,7 +379,7 @@ test('host injects a script into index.html: offline install is refused AND the 
     assert.equal(await page.evaluate(async () => (await navigator.serviceWorker.getRegistration())?.active ?? null), null, 'no active service worker');
     // and Settings states the same reason after setup
     await page.click(tid('get-started'));
-    await page.fill(tid('name'), 'Eve'); await page.fill(tid('pass1'), 'correct horse battery staple'); await page.fill(tid('pass2'), 'correct horse battery staple');
+    await page.fill(tid('name'), 'Eve'); await page.fill(tid('username'), 'eve_test'); await page.fill(tid('pass1'), 'correct horse battery staple'); await page.fill(tid('pass2'), 'correct horse battery staple');
     await page.click(tid('create')); await page.waitForSelector(tid('settings'));
     await page.click(tid('settings'));
     assert.match(await page.$eval(tid('offline-status'), (e) => e.textContent), /altered \.\/index\.html/);
@@ -401,7 +405,7 @@ test('updates: a new build is verified, announced with its fingerprint, and appl
     await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 30000 });
     await page.click(tid('settings'));
     assert.equal(await page.textContent(tid('build-fp')), fpA);
-    assert.equal(await page.$(tid('update-banner')), null, 'no banner without an update');
+    assert.equal(await page.$$eval(tid('update-banner'), (e) => e.length), 0, 'no banner without an update');
 
     // The host publishes a new build (different relay → different files → new fingerprint).
     execFileSync(process.execPath, [join(root, 'tools/build.mjs'), '--relay', 'http://127.0.0.1:9', '--out', abs], { stdio: 'pipe' });
@@ -417,11 +421,11 @@ test('updates: a new build is verified, announced with its fingerprint, and appl
     // One tap: the verified build takes over and the page reloads into it.
     await Promise.all([page.waitForEvent('load', { timeout: 30000 }), page.click(tid('apply-update'))]);
     await page.waitForSelector(tid('unlock-pass'), { timeout: 30000 }); // vault survived; it's locked after a restart
-    await page.fill(tid('unlock-pass'), 'correct horse battery staple');
+    await userReady(page); await page.fill(tid('unlock-pass'), 'correct horse battery staple');
     await page.click(tid('unlock'));
     await page.click(tid('settings'));
     await page.waitForFunction(([s, fp]) => document.querySelector(s)?.textContent === fp, [tid('build-fp'), fpB], { timeout: 10000 });
-    assert.equal(await page.$(tid('update-banner')), null, 'banner gone once updated');
+    assert.equal(await page.$$eval(tid('update-banner'), (e) => e.length), 0, 'banner gone once updated');
     assert.match(await page.inputValue('input[aria-label="Display name"]'), /Uma/, 'profile kept across the update');
   } finally { await browser.close(); srv.kill(); rmSync(abs, { recursive: true, force: true }); }
 });
@@ -432,7 +436,7 @@ test('duress passcode: opens an empty decoy, real chats untouched; optional eras
   const REAL = 'correct horse battery staple', DURESS = 'grandma birthday cake';
   const lockAndUnlock = async (pass) => {
     await A.page.click(tid('lock'));
-    await A.page.fill(tid('unlock-pass'), pass); await A.page.click(tid('unlock'));
+    await userReady(A.page); await A.page.fill(tid('unlock-pass'), pass); await A.page.click(tid('unlock'));
   };
   try {
     await onboard(A, 'Alice', REAL); await onboard(B, 'Bob', 'another long passphrase');
@@ -477,10 +481,127 @@ test('duress passcode: opens an empty decoy, real chats untouched; optional eras
     await A.page.waitForSelector(tid('invite'), { timeout: 30000 });
     assert.equal(await A.page.evaluate(() => /eras|wip|delet|destroy/i.test([...document.querySelectorAll('.toast')].map((x) => x.textContent).join(' '))), false, 'no hint on screen that anything was erased');
     await lockAndUnlock(REAL);
-    await A.page.waitForFunction(() => /Wrong passphrase/.test(document.body.textContent), null, { timeout: 30000 });
+    await A.page.waitForFunction(() => /Wrong username or passphrase/.test(document.body.textContent), null, { timeout: 30000 });
     assert.equal(await A.page.$$eval(tid('contact-Bob'), (e) => e.length), 0);
     for (const p of [A, B]) assert.deepEqual(p.errors, []);
   } finally { await browser.close(); }
+});
+
+test('profile photo, @username login, edit & delete messages', { timeout: 240000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const A = await profile(browser, 'alice-prof'), B = await profile(browser, 'bob-prof');
+  const PASS = 'correct horse battery staple';
+  const bubbleMenu = async (p, text, dir = 'out') => {
+    const el = p.page.locator(`${tid(`msg-${dir}`)}:has-text("${text}")`).last();
+    await el.click({ button: 'right' });
+    await p.page.waitForSelector('.modal');
+  };
+  try {
+    await onboard(A, 'Alice', PASS); await onboard(B, 'Bob', 'another long passphrase');
+    await pairByText(A, B);
+
+    // --- profile photo + @username reach the contact ---
+    await A.page.click(tid('back')); await A.page.click(tid('settings'));
+    await A.page.setInputFiles(tid('pic-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await A.page.waitForFunction(() => /Profile photo updated/.test(document.body.textContent), null, { timeout: 15000 });
+    await B.page.click(tid('back'));
+    await B.page.waitForFunction(() => !!document.querySelector('[data-testid="contact-Alice"] [data-testid="avatar"] img'), null, { timeout: 20000 });
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="contact-Alice"] [data-testid="avatar"] img')?.naturalWidth > 0, null, { timeout: 10000 });
+    const pic = await B.page.$eval('[data-testid="contact-Alice"] [data-testid="avatar"] img', (i) => ({ w: i.naturalWidth, h: i.naturalHeight, blob: i.src.startsWith('blob:') }));
+    assert.deepEqual(pic, { w: 256, h: 256, blob: true }, 'a 256×256 photo (re-drawn: no metadata), shown from memory');
+    await B.page.click(tid('contact-Alice')); await B.page.click(tid('contact-info'));
+    assert.equal(await B.page.textContent(tid('contact-username')), '@alice_test');
+    await B.page.click(tid('back'));
+
+    // --- edit (both phones update, marked "edited") ---
+    await A.page.click(tid('back')); await A.page.click(tid('contact-Bob'));
+    await send(A, 'helo wrld');
+    await B.page.waitForFunction(() => /helo wrld/.test(document.querySelector('[data-testid="log"]')?.textContent || ''), null, { timeout: 15000 });
+    await bubbleMenu(A, 'helo wrld');
+    assert.match(await A.page.textContent('.modal'), /Edit \(1[45] min left\)/);
+    await A.page.click(tid('modal-edit'));
+    await A.page.fill(tid('edit-text'), 'hello world');
+    await A.page.click(tid('modal-save'));
+    await B.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /hello world/.test(m.textContent) && m.querySelector('[data-testid="edited"]')), null, { timeout: 15000 });
+    assert.equal(await A.page.$$eval(tid('edited'), (e) => e.length), 1);
+
+    // --- delete for everyone ---
+    await send(A, 'oops wrong chat');
+    await B.page.waitForFunction(() => /oops wrong chat/.test(document.querySelector('[data-testid="log"]').textContent), null, { timeout: 15000 });
+    await bubbleMenu(A, 'oops wrong chat');
+    await A.page.click(tid('modal-all'));
+    await A.page.click(tid('modal-true'));
+    await B.page.waitForFunction(() => /This message was deleted/.test(document.querySelector('[data-testid="log"]').textContent), null, { timeout: 15000 });
+    assert.equal(await B.page.evaluate(() => /oops wrong chat/.test(document.body.textContent)), false, 'gone from their phone');
+    assert.match(await A.page.textContent(tid('log')), /You deleted this message/);
+
+    // --- the receiver can only delete for themselves ---
+    await bubbleMenu(B, 'hello world', 'in');
+    assert.equal(await B.page.$$eval(tid('modal-all'), (e) => e.length), 0, 'no "delete for everyone" on someone else’s message');
+    assert.equal(await B.page.$$eval(tid('modal-edit'), (e) => e.length), 0);
+    await B.page.click(tid('modal-me'));
+    assert.equal(await B.page.evaluate(() => /hello world/.test(document.querySelector('[data-testid="log"]').textContent)), false);
+    assert.match(await A.page.textContent(tid('log')), /hello world/, 'still on the sender’s phone');
+
+    // --- username login: remembered and prefilled; a wrong one counts as a wrong attempt ---
+    await A.page.click(tid('back')); await A.page.click(tid('lock'));
+    await userReady(A.page);
+    assert.equal(await A.page.inputValue(tid('unlock-user')), 'alice_test');
+    await A.page.fill(tid('unlock-user'), 'mallory');
+    await A.page.fill(tid('unlock-pass'), PASS); await A.page.click(tid('unlock'));
+    await A.page.waitForFunction(() => /Wrong username or passphrase\. 9 tries left/.test(document.body.textContent), null, { timeout: 15000 });
+    await A.page.fill(tid('unlock-user'), '@Alice_Test');
+    await A.page.fill(tid('unlock-pass'), PASS); await A.page.click(tid('unlock'));
+    await A.page.waitForSelector(tid('contact-Bob'), { timeout: 30000 });
+    for (const p of [A, B]) assert.deepEqual(p.errors, []);
+  } catch (e) { console.error('DEBUG', A.errors, B.errors); throw e; } finally { await browser.close(); }
+});
+
+test('voice & video calls: ring, accept, media flows both ways, mute, hang up, decline, and call permissions', { timeout: 240000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--disable-features=WebRtcHideLocalIpsWithMdns', '--autoplay-policy=no-user-gesture-required'] });
+  const A = await profile(browser, 'alice-call'), B = await profile(browser, 'bob-call');
+  const state = (p, st) => p.page.waitForFunction((s) => document.querySelector('[data-testid="call-screen"]')?.dataset.state === s, st, { timeout: 30000 });
+  const gone = (p) => p.page.waitForFunction(() => !document.querySelector('[data-testid="call-screen"]'), null, { timeout: 15000 });
+  const logHas = (p, re) => p.page.waitForFunction((r) => new RegExp(r).test(document.querySelector('[data-testid="log"]')?.textContent || ''), re, { timeout: 15000 });
+  try {
+    await onboard(A, 'Alice', 'correct horse battery staple'); await onboard(B, 'Bob', 'another long passphrase');
+    await pairByText(A, B);
+    await A.page.waitForSelector(tid('call-video'));
+
+    // --- video call: ring → accept → connected, real media in both directions ---
+    await A.page.click(tid('call-video'));
+    await state(A, 'calling');
+    await state(B, 'ringing');
+    assert.match(await B.page.textContent(tid('call-screen')), /Alice[\s\S]*Incoming video call/);
+    await B.page.click(tid('call-accept'));
+    await state(A, 'connected'); await state(B, 'connected');
+    for (const p of [A, B]) {
+      await p.page.waitForFunction(() => { const v = document.querySelector('[data-testid="call-remote"]'); return v?.videoWidth > 0 && v.srcObject?.getAudioTracks().length === 1; }, null, { timeout: 20000 });
+    }
+    await A.page.click(tid('call-mute'));
+    assert.equal(await A.page.getAttribute(tid('call-mute'), 'aria-pressed'), 'true');
+    await A.page.waitForFunction(() => /0:0[1-9]/.test(document.querySelector('[data-testid="call-timer"]').textContent), null, { timeout: 10000 });
+    await A.page.click(tid('call-end'));
+    await gone(A); await gone(B);
+    await logHas(A, '↗ Video call · 0:0'); await logHas(B, '↙ Video call · 0:0');
+
+    // --- declined voice call ---
+    await A.page.click(tid('call-voice'));
+    await state(B, 'ringing');
+    await B.page.click(tid('call-decline'));
+    await gone(A); await gone(B);
+    await logHas(A, 'Voice call — declined');
+
+    // --- permissions: Bob turns video calls off → Alice's video button disappears (voice stays) ---
+    await B.page.click(tid('back')); await B.page.click(tid('settings'));
+    await B.page.uncheck(tid('allow-video'));
+    await A.page.waitForFunction(() => !document.querySelector('[data-testid="call-video"]') && !!document.querySelector('[data-testid="call-voice"]'), null, { timeout: 15000 });
+    // …and blocks Alice entirely → no call buttons at all
+    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice')); await B.page.click(tid('contact-info'));
+    await B.page.uncheck(tid('allow-calls-from'));
+    await A.page.waitForFunction(() => !document.querySelector('[data-testid="call-voice"]') && !document.querySelector('[data-testid="call-video"]'), null, { timeout: 15000 });
+    for (const p of [A, B]) assert.deepEqual(p.errors, []);
+  } catch (e) { console.error('DEBUG', A.errors, B.errors); throw e; } finally { await browser.close(); }
 });
 
 test('internet mode: invite link, stranger gating, scam warnings, offline queue, verification', { timeout: 240000 }, async () => {
@@ -500,7 +621,7 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
 
     // Dave opens the link: unlock → invite preview → Join.
     await D.page.goto('about:blank'); await D.page.goto(link); // a fresh load, like tapping the link in a text
-    await D.page.fill(tid('unlock-pass'), 'tr0ub4dor & 3 bananas'); await D.page.click(tid('unlock'));
+    await userReady(D.page); await D.page.fill(tid('unlock-pass'), 'tr0ub4dor & 3 bananas'); await D.page.click(tid('unlock'));
     assert.ok(!(await D.page.evaluate(() => location.hash)), 'invite removed from the address bar');
     await D.page.waitForSelector(tid('join-invite'));
     assert.match(await D.page.textContent('.big-instruction'), /Carol invites you/);
@@ -554,7 +675,7 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
     await D.page.click(tid('mark-verified'));
     await D.page.waitForSelector(tid('verified'));
     await D.page.click(tid('back'));
-    assert.equal(await D.page.$(tid('verify-banner')), null);
+    assert.equal(await D.page.$$eval(tid('verify-banner'), (e) => e.length), 0);
 
     assert.deepEqual(leaks, []);
     for (const p of [C, D]) assert.deepEqual(await p.page.evaluate(() => window.__csp), [], `${p.name} CSP`);
@@ -567,7 +688,7 @@ async function linkFriends(from, to, toPass) {
   const link = await from.page.$eval(tid('invite-link'), (e) => e.value);
   await from.page.click(tid('back'));
   await to.page.goto('about:blank'); await to.page.goto(link);
-  await to.page.fill(tid('unlock-pass'), toPass); await to.page.click(tid('unlock'));
+  await userReady(to.page); await to.page.fill(tid('unlock-pass'), toPass); await to.page.click(tid('unlock'));
   await to.page.waitForSelector(tid('join-invite')); await to.page.click(tid('join-invite'));
   await to.page.waitForSelector(tid('verify-banner'));
   await to.page.click(tid('back'));
@@ -633,6 +754,27 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     assert.deepEqual(await P.Dave.page.evaluate(() => window.__shared), { n: 1, name: 'photo-gps.jpg', type: 'image/jpeg', jpeg: true, secret: false },
       'phone save hands the cleaned photo, with its real image type, to the share sheet');
 
+    // --- speed: a big camera photo goes out at standard size (one relay message), original is one tap away ---
+    const bigB64 = await P.Carol.page.evaluate(async () => {
+      const c = document.createElement('canvas'); c.width = 4032; c.height = 3024; const g = c.getContext('2d');
+      const img = g.createImageData(c.width, c.height); for (let i = 0; i < img.data.length; i++) img.data[i] = (i * 2654435761) >>> 24;
+      g.putImageData(img, 0, 0);
+      const b = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.95));
+      const u = new Uint8Array(await b.arrayBuffer()); let s = ''; for (const x of u) s += String.fromCharCode(x); return btoa(s);
+    });
+    const big = Buffer.from(bigB64, 'base64');
+    await P.Carol.page.setInputFiles(tid('file-input'), { name: 'IMG_0001.jpg', mimeType: 'image/jpeg', buffer: big });
+    await P.Carol.page.waitForSelector(tid('review-image'), { timeout: 20000 });
+    assert.match(await P.Carol.page.textContent('.modal'), /Standard quality · 1600×1200/);
+    await P.Carol.page.check(tid('review-original'));
+    assert.match(await P.Carol.page.textContent('.modal'), /Original quality/);
+    await P.Carol.page.uncheck(tid('review-original'));
+    const sizeText = await P.Carol.page.textContent('.modal');
+    const kb = +(/IMG_0001\.jpg · ([\d.]+) (KB|MB)/.exec(sizeText) || [])[1] * (/· [\d.]+ MB/.test(sizeText) ? 1024 : 1);
+    assert.ok(kb > 0 && kb * 1024 < big.length / 3, `standard photo (${kb} KB) is far smaller than the original (${(big.length / 1024) | 0} KB)`);
+    await P.Carol.page.click(tid('modal-send'));
+    await P.Dave.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"] img')].some((i) => i.naturalWidth === 1600), null, { timeout: 30000 });
+
     // --- location: GPS position, distance and direction, no map server ---
     await P.Carol.page.click(tid('share-location'));
     await P.Carol.page.click(tid('modal-once'));
@@ -640,6 +782,14 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await P.Dave.page.click(`${tid('msg-in')} ${tid('how-far')}`);
     await P.Dave.page.waitForFunction(() => /km S of you|km SSE of you|km SSW of you/.test(document.querySelector('[data-testid="msg-in"] [data-testid="loc-relative"]')?.textContent || ''), null, { timeout: 15000 });
 
+    // --- a recorder that fails to start must not leave the mic button dead (iPhone regression) ---
+    await P.Carol.page.evaluate(() => {
+      const real = MediaRecorder.prototype.start; let once = true;
+      MediaRecorder.prototype.start = function (...a) { if (once) { once = false; throw new Error('NotSupportedError'); } return real.apply(this, a); };
+    });
+    await holdButton(P.Carol.page, tid('voice'), 800);
+    await P.Carol.page.waitForFunction(() => /Couldn’t start recording/.test(document.body.textContent), null, { timeout: 5000 });
+    assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0);
     // --- walkie-talkie: by default you hear the clip first; Delete sends nothing, Send sends it ---
     await holdButton(P.Carol.page, tid('voice'), 1600);
     await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
@@ -661,7 +811,25 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await P.Carol.page.click(tid('back')); await P.Carol.page.click(tid('contact-Dave'));
     await holdButton(P.Carol.page, tid('voice'), 1600);
     await P.Dave.page.waitForFunction((s) => document.querySelectorAll(s).length === 2, tid('voice-clip'), { timeout: 30000 });
-    assert.equal(await P.Carol.page.$('.modal'), null, 'no review step in walk-talkie mode');
+    assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0, 'no review step in walk-talkie mode');
+
+    // --- a video call between phones that are NOT nearby: every signal goes through the relay mailbox ---
+    assert.equal(await P.Carol.page.getAttribute(tid('conn-state'), 'data-online'), 'false', 'internet link, not a nearby one');
+    // This test relay has no TURN key, and "Hide my IP" is on by default: both phones must be ASKED, never silently exposed.
+    await P.Carol.page.click(tid('call-video'));
+    await P.Carol.page.waitForSelector('.modal', { timeout: 10000 });
+    assert.match(await P.Carol.page.textContent('.modal'), /IP address can’t be hidden/);
+    await P.Carol.page.click(tid('modal-true'));
+    await P.Dave.page.waitForFunction(() => document.querySelector('[data-testid="call-screen"]')?.dataset.state === 'ringing', null, { timeout: 20000 });
+    await P.Dave.page.click(tid('call-accept'));
+    await P.Dave.page.waitForSelector('.modal', { timeout: 10000 });
+    await P.Dave.page.click(tid('modal-true'));
+    for (const p of [P.Carol, P.Dave]) {
+      await p.page.waitForFunction(() => document.querySelector('[data-testid="call-screen"]')?.dataset.state === 'connected', null, { timeout: 30000 });
+      await p.page.waitForFunction(() => document.querySelector('[data-testid="call-remote"]')?.videoWidth > 0, null, { timeout: 20000 });
+    }
+    await P.Carol.page.click(tid('call-end'));
+    await P.Dave.page.waitForFunction(() => !document.querySelector('[data-testid="call-screen"]'), null, { timeout: 15000 });
 
     // --- SOS: Dave holds the button; Carol gets an alarm with his position ---
     await P.Dave.page.click(tid('back')); await P.Dave.page.click(tid('sos'));

@@ -95,3 +95,33 @@ test('the relay stores only opaque bytes: no plaintext metadata columns exist', 
   const cols = relay.env.INBOX.instance(b.addr).storage.sql.exec("SELECT name FROM pragma_table_info('m')").toArray().map((r) => r.name);
   assert.deepEqual(cols.sort(), ['at', 'data', 'id', 'size']);
 });
+
+test('calls: /v1/turn mints short-lived credentials server-side, filters port 53, rate-limits, and falls back to STUN', async () => {
+  const calls = [];
+  const fakeCf = async (url, opts) => {
+    calls.push({ url, auth: opts.headers.Authorization, body: JSON.parse(opts.body) });
+    return new Response(JSON.stringify({ iceServers: [
+      { urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.cloudflare.com:53'] },
+      { urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:53?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'], username: 'u1', credential: 'c1' },
+    ] }), { status: 200 });
+  };
+  let n = 0; const limiter = { limit: async () => ({ success: ++n <= 2 }) };
+  const r2 = await startRelay({ port: 0, origins: [ORIGIN], env: { TURN_KEY_ID: 'key123', TURN_KEY_API_TOKEN: 'secret-token', fetch: fakeCf, TURN_LIMIT: limiter } });
+  try {
+    const get = (origin = ORIGIN) => fetch(`${r2.url}/v1/turn`, { headers: { Origin: origin } });
+    const res = await get(); assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.turn, true);
+    assert.ok(!JSON.stringify(j).includes('secret-token'), 'the long-term key never reaches the phone');
+    assert.ok(!JSON.stringify(j.iceServers).includes(':53'), 'port 53 removed');
+    assert.deepEqual(j.iceServers[1].urls, ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp']);
+    assert.equal(j.iceServers[1].username, 'u1');
+    assert.deepEqual(calls[0], { url: 'https://rtc.live.cloudflare.com/v1/turn/keys/key123/credentials/generate-ice-servers', auth: 'Bearer secret-token', body: { ttl: 3600 } });
+    assert.equal((await get('https://evil.example')).status, 403, 'other sites can’t spend our TURN quota');
+    assert.equal((await get()).status, 200);
+    assert.equal((await get()).status, 429, 'rate limited');
+  } finally { r2.server.close(); }
+  // Not configured (or Cloudflare down): STUN only, and the app knows it.
+  const plain = await (await fetch(`${relay.url}/v1/turn`, { headers: { Origin: ORIGIN } })).json();
+  assert.deepEqual(plain, { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478'] }], turn: false });
+});

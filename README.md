@@ -51,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 99 unit tests: crypto, protocol, ratchet, relay, scam checks, media, groups, QR, build
+npm test            # 122 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -160,6 +160,21 @@ The relay code is in `relay/`. It runs on Workers with Durable Objects (SQLite).
 To use another domain, change `routes` and `ALLOWED_ORIGINS` in `relay/wrangler.jsonc`, and `RELAY_URL` in
 `src/js/config.js` together with the relay origin in the CSP in `src/index.html`.
 
+### Calls: switch on the TURN relay (recommended)
+Calls connect phone-to-phone. On the same Wi-Fi/hotspot that always works. Across the internet,
+two phones on **mobile data** often can't reach each other directly (carriers put them behind
+shared addresses), and **"Hide my IP address on calls"** needs a relay in the middle. Cloudflare's
+TURN service does both; the first 1,000 GB a month are free (≈ 2,000+ hours of video calls).
+1. Cloudflare dashboard → search **TURN** (it's under *Realtime*) → **Create** a TURN key. Copy the
+   **Token ID** and the **API token** (shown once).
+2. **Workers & Pages** → **murmur-relay** → **Settings** → **Variables and Secrets** → **Add**, type **Secret**:
+   `TURN_KEY_ID` = the Token ID, then `TURN_KEY_API_TOKEN` = the API token. Deploy.
+3. Check: `node tools/relay-smoke.mjs https://relay.princeisgenius.com` → step 7 says **TURN ON**.
+
+The key never leaves the relay: phones get credentials that expire after an hour, at most 20 per
+minute per IP address (`ratelimits` in `wrangler.jsonc`). Without TURN, calls still work nearby and on
+many networks, and Murmur *asks* before a call would reveal your IP — it never falls back silently.
+
 Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhost:8080`, then
 `node tools/build.mjs --relay http://127.0.0.1:8787` and `npm run serve`.
 
@@ -168,8 +183,13 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 | Feature | Nearby (no internet) | Far away (relay) | Notes |
 |---|---|---|---|
 | Text, receipts ✓✓, disappearing | ✅ | ✅ | |
-| Photos & videos | ✅ | ✅ (sent in 192 KiB chunks) | Hidden location/camera data removed before sending; you see the cleaned copy and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
-| Walkie-talkie | ✅ | ✅ | Hold the mic button and talk (2 min max, ~32 kbit/s speech quality). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
+| Photos & videos | ✅ | ✅ (512 KiB chunks) | Photos go at **standard size** (longest side 1600 px, ~250–450 KB: usually one relay message) with an **Original quality** switch. Hidden location/camera data removed; you see exactly what will be sent and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
+| Walkie-talkie | ✅ | ✅ | Hold the mic button and talk (2 min max). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
+| Voice & video calls | ✅ | ✅ | Peer-to-peer, end-to-end encrypted (DTLS-SRTP keyed through the authenticated chat). Mute, camera off, flip camera. **Hide my IP** (default on) routes internet calls through TURN. Rings only while Murmur is open on their phone. One-to-one only |
+| Call permissions | ✅ | ✅ | Settings → *Calls*: allow voice / video. Contact info: block calls from one person. Their phone hides the buttons **and** yours refuses the call anyway |
+| Edit & delete | ✅ | ✅ | Long-press (or right-click) a message. Edit your text for **15 min**; **delete for everyone** within **1 hour**; delete for me any time. Receivers enforce the same rules and only accept changes from the real author |
+| Profile | ✅ | ✅ | Photo (256×256, re-drawn so no metadata), display name and **@username** — sent only to your contacts, encrypted. Strangers who used your invite link don't get your photo until you accept them |
+| Username login | — | — | Unlock with **username + passphrase** (username optionally remembered). The username is stored only as a salted hash on the phone; there is no account server, so it can't be used to log in on another phone |
 | Location | ✅ | ✅ | Once, or live for 15 min / 1 h (updates every 30 s while Murmur is open). Shows distance & direction — no map server. "Map" opens your map app only after a warning |
 | SOS | ✅ | ✅ (queued if no signal) | Hold 1.5 s. Sends your message + GPS to chosen contacts. **Cannot call emergency services** |
 | Groups | ✅ | ✅ | Up to 20. The creator forwards text and location to members who aren't each other's contacts ("via group"); files go to your direct contacts in the group |
@@ -178,7 +198,7 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 
 ### Checking a deployment
 - `node tools/site-check.mjs https://murmur.princeisgenius.com` — fetches every file like a phone would and proves it's **byte-for-byte the tested build** (catches CDN/host injection), and checks the security headers.
-- `node tools/relay-smoke.mjs https://relay.princeisgenius.com` — acts like a phone against the relay: health, WebSocket, mailbox login, keep-alive, delivery, deletion.
+- `node tools/relay-smoke.mjs https://relay.princeisgenius.com` — acts like a phone against the relay: health, WebSocket, mailbox login, keep-alive, delivery, deletion, and whether TURN (calls) is on.
 
 ## Project layout
 
@@ -231,6 +251,8 @@ murmur/
 | QR encoder ⇄ OpenCV in both directions; decoder under rotation, keystone, blur, noise | Phone cameras in poor light; very old phones' decode speed |
 | Two-browser pairing, chat, files, offline reload, zero HTTP during use (Chromium) | Phone hotspots that block multicast DNS (`.local` candidates) |
 | CSP + Trusted Types enforcement; data-at-rest is ciphertext | GitHub Pages workflow (action versions checked Nov 2026; not run from here) |
+| Calls in two browsers with fake camera/mic: nearby and via the relay, media both ways, mute, decline, permissions | Calls between two iPhones on mobile data (needs TURN switched on); earpiece vs. speaker can't be chosen by a web app on iPhone |
+| Edit/delete, profile photo, username login, duress passcode | Real iPhone voice recording after the recorder fix (WebKit bugs 301507/234784) |
 
 ## License
 

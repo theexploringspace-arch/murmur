@@ -27,7 +27,7 @@ import { random, toB64u } from './bytes.js';
 const ERASE = 'eraseOther';
 
 export function slots(inner) {
-  return { a: new SlotStore(inner, '', ['b:']), b: new SlotStore(inner, 'b:') };
+  return { a: new SlotStore(inner, '', ['b:', 'login']), b: new SlotStore(inner, 'b:') }; // 'login' is shared (profile.js)
 }
 
 export async function anyVault(inner) {
@@ -85,14 +85,14 @@ export async function unlockAny(inner, passphrase) {
  * Set (or replace) the duress passcode. Only from the REAL vault (slot A): from the decoy
  * this would overwrite your real chats, so it is refused (the app pretends instead).
  */
-export async function setDuress(inner, realSlot, passcode, { name, settings = {}, eraseReal = false, iterations } = {}) {
+export async function setDuress(inner, realSlot, passcode, { name, profile = {}, settings = {}, eraseReal = false, iterations } = {}) {
   if (realSlot !== 'a') throw new Error('Only the real vault can set a duress passcode');
   if (typeof passcode !== 'string' || passcode.length < MIN_PASSPHRASE) throw new Error(`The duress passcode must be at least ${MIN_PASSPHRASE} characters`);
   const s = slots(inner);
   if (await Vault.open(s.a, passcode)) throw new Error('The duress passcode must be different from your real passphrase');
   await s.b.clear();
   const d = await Vault.create(s.b, passcode, iterations ? { iterations } : {});
-  await d.putRecord('profile', { name: name || 'Me' });
+  await d.putRecord('profile', { ...profile, name: name || profile.name || 'Me' }); // same name, @username and photo: nothing looks off
   await d.putRecord('settings', { autoLockMin: 5, ...settings, ...(eraseReal ? { [ERASE]: true } : {}) });
   d.lock();
 }

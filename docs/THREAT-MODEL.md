@@ -135,6 +135,23 @@ version that leaked it as a record name). Tested in `test/unit/duress.test.mjs`.
 the same screen appears and "succeeds", but it can't touch slot A. The duress passcode must
 differ from the real passphrase, and changing either passphrase to match the other is refused.
 
+## Calls, profiles, edits — added threats
+
+| Threat | Outcome | Why |
+|---|---|---|
+| Relay or TURN operator listens to a call | **No** | Media is DTLS-SRTP between the phones; the DTLS fingerprints travel inside the ratchet-authenticated chat, so a middlebox can't substitute its own keys. TURN only forwards encrypted packets |
+| The person you call learns your IP address | **Not with "Hide my IP"** (default) | Internet calls use `iceTransportPolicy: 'relay'`: both phones talk only to Cloudflare TURN. If TURN is unavailable, Murmur asks first. Nearby calls are direct by design (same Wi-Fi) |
+| Cloudflare (TURN/STUN) learns who calls whom | **Partly** | It sees both phones' IP addresses, call times and data volume — not content, not names. Same trust boundary as the relay mailbox (A11-style metadata) |
+| A stranger rings you repeatedly | **No** | Calls from unaccepted invite-link contacts, blocked contacts, or disabled kinds are refused **by your phone** whatever their app shows |
+| Someone abuses our TURN endpoint to get free bandwidth | **Limited** | Origin allow-list, 1-hour credentials, 20 requests/min/IP; the long-term key stays a Worker secret. A determined attacker can still script requests from many IPs — watch Cloudflare's Realtime usage page |
+| A contact rewrites or deletes *your* messages on your phone | **No** | Edits/deletes are accepted only for messages *you received from that author*, only inside the time windows (15 min / 1 h + 5 min skew); a group admin can't change other members' messages |
+| "Delete for everyone" really erases | **Only on phones that follow the protocol** | A modified app, a screenshot, or a phone that was offline past the window keeps it. Same as every messenger |
+| Profile photo carries location | **No** | Re-drawn to 256×256 on a canvas (no metadata survives); receivers accept only small real JPEGs |
+| Username as a secret | **It isn't one** | It's shown to contacts and only adds a typing step. It is stored as a salted hash (or in clear if you tick "remember"). The passphrase is the protection |
+
+**Calls can't ring a closed app.** Without a push service (which would mean Apple/Google learn
+who contacts you), an incoming call only rings while Murmur is open on that phone.
+
 ## Known limitations (by design)
 
 - **Proximity required**: both devices on the same LAN at the same time. No store-and-forward, no mesh.

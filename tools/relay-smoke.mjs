@@ -59,5 +59,15 @@ step(6, 'acknowledge (deletes it from the relay)');
 ws.send(JSON.stringify({ t: 'ack', ids: [b64u(got.slice(0, 16))] }));
 await new Promise((res) => setTimeout(res, 500));
 ws.close();
+
+step(7, 'calls: ask for TURN credentials (GET /v1/turn)');
+const t = await fetch(`${RELAY}/v1/turn`, { headers: { Origin: ORIGIN } });
+if (t.status !== 200) fail(`/v1/turn answered ${t.status} — is the latest relay deployed?`);
+const tj = await t.json();
+const urls = tj.iceServers.flatMap((x) => [].concat(x.urls));
+console.log(`   → ${tj.turn ? 'TURN ON' : 'TURN OFF (STUN only)'}: ${urls.join(', ')}`);
+if (!tj.turn) console.log('   ! Calls work on the same Wi-Fi and between most home networks, but phones on mobile data often\n     can\'t reach each other directly, and "Hide my IP" can\'t be honoured. Set TURN_KEY_ID and\n     TURN_KEY_API_TOKEN (see README → "Calls: switch on the TURN relay").');
+if (urls.some((u) => /:53(\?|$)/.test(u))) fail('port 53 URLs should have been filtered out');
+
 console.log('\nALL GOOD: the relay works end to end.');
 process.exit(0);

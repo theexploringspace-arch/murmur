@@ -19,6 +19,9 @@ import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
+import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
+import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
+import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
 
 const $app = document.getElementById('app');
 const store = new IdbStore();
@@ -61,7 +64,8 @@ function linkState(id) {
   if (hasRemote(id)) return S.relayOnline ? ['via internet', 'internet'] : ['no internet · will send later', 'queued'];
   return ['not connected', 'none'];
 }
-const REMOTE_CHUNK = 192 * 1024;
+const REMOTE_CHUNK = 512 * 1024;      // raw bytes per relay chunk (≈700 KB envelope, under the relay's 1 MiB cap)
+const REMOTE_CHUNK_MIN = 192 * 1024;  // older senders used this; still accepted
 
 function go(view, ...args) {
   stopScanner();
@@ -99,7 +103,8 @@ async function persistHistory(id) {
   const c = S.contacts.get(id);
   if (!c) return;
   if (!c.keepHistory) { await S.vault.deleteRecord(`history/${id}`); return; }
-  const msgs = (S.chats.get(id) || []).filter((m) => m.text != null && !m.ttl).map(({ id: mid, dir, ts, text, status }) => ({ id: mid, dir, ts, text, status }));
+  const msgs = (S.chats.get(id) || []).filter((m) => (m.text != null || m.deleted) && !m.ttl && !m.system)
+    .map(({ id: mid, dir, ts, text, status, edited, deleted }) => ({ id: mid, dir, ts, text, status, edited, deleted }));
   await S.vault.putRecord(`history/${id}`, msgs.slice(-2000));
 }
 
@@ -130,9 +135,12 @@ async function boot() {
 }
 
 async function openVault(vault) {
-  S.vault = vault;
-  S.profile = await vault.getRecord('profile', { name: '' });
-  S.settings = { autoLockMin: 5, ...(await vault.getRecord('settings', {})) };
+  // Load everything the timers and views read BEFORE publishing S.vault: they treat
+  // "S.vault is set" as "the session is ready" (a tick in between used to crash).
+  const profile = { name: '', ...(await vault.getRecord('profile', {})) };
+  const settings = { autoLockMin: 5, ...(await vault.getRecord('settings', {})) };
+  S.lastActivity = Date.now();
+  S.profile = profile; S.settings = settings; S.vault = vault;
   S.contacts = new Map((await vault.getRecord('contacts', [])).map((c) => [c.id, c]));
   S.chats = new Map();
   S.myCid = await contactId(vault.identity.publicRaw);
@@ -152,7 +160,7 @@ async function startRemote() {
   const r = new Remote({ vault: S.vault, identity: S.vault.identity, relayUrl: RELAY_URL, origin: location.origin, getName: () => S.profile.name });
   await r.load();
   S.remote = r;
-  r.on('status', (v) => { S.relayOnline = v; rerenderIf('home'); rerenderIf('chat'); rerenderIf('settings'); })
+  r.on('status', (v) => { S.relayOnline = v; if (v) syncProfiles(); rerenderIf('home'); rerenderIf('chat'); rerenderIf('settings'); })
     .on('message', (cid, m) => onRemoteMessage(cid, m).catch((e) => console.warn(e)))
     .on('joined', (j) => onRemoteJoined(j).catch((e) => console.warn(e)))
     .on('sent', (cid, mid) => setMsgStatus(cid, mid, 'sent'))
@@ -199,7 +207,7 @@ async function onRemoteMessage(cid, m) {
       break;
     case 'ack': markDelivered(cid, String(m.id)); break;
     case 'file': {
-      if (!(m.size >= 0 && m.size <= MAX_FILE) || !(m.chunks >= 1 && m.chunks <= Math.ceil(MAX_FILE / REMOTE_CHUNK) + 1)) return;
+      if (!(m.size >= 0 && m.size <= MAX_FILE) || !(m.chunks >= 1 && m.chunks <= Math.ceil(MAX_FILE / REMOTE_CHUNK_MIN) + 1)) return;
       const key = `${cid}:${m.id}`;
       if ([...S.rfiles.keys()].filter((k) => k.startsWith(cid)).length >= 4) return;
       S.rfiles.set(key, { meta: m, parts: [], got: 0 });
@@ -210,6 +218,7 @@ async function onRemoteMessage(cid, m) {
       const key = `${cid}:${m.id}`; const f = S.rfiles.get(key);
       if (!f || m.i !== f.parts.length) return;
       const d = fromB64u(String(m.d)); f.got += d.length;
+      if (d.length > REMOTE_CHUNK) { S.rfiles.delete(key); return; }
       if (f.got > f.meta.size) { S.rfiles.delete(key); return; }
       f.parts.push(d);
       if (S.view === 'chat' && S.viewArgs[0] === cid) setStatusLine(`Receiving… ${Math.round((f.got / f.meta.size) * 100)}%`);
@@ -276,6 +285,8 @@ function lock(reason) {
   stopAllLiveShares();
   for (const conv of S.convs.values()) conv.close('locked');
   for (const msgs of S.chats.values()) for (const m of msgs) if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  for (const u of PIC_URLS.values()) URL.revokeObjectURL(u); PIC_URLS.clear();
+  endCall('locked');
   S.vault?.lock();
   Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
@@ -441,6 +452,7 @@ async function adoptConversation(conv) {
       if (S.vault) { rerenderIf('chat', () => S.viewArgs[0] === id); rerenderIf('home'); }
       if (why === 'peer left' || why === 'channel closed' || why === 'failed') toast(hasRemote(id) ? `${displayName(c)} left the Wi-Fi — messages now go via internet` : `${displayName(c)} disconnected`);
     });
+  syncProfiles([id]);
   // Set up the internet link through this face-to-face session (the inviter starts it).
   // Only when one side lacks it: re-keying an existing link would strand messages already on the relay.
   if (S.remote && !S.remote.has(id)) {
@@ -479,6 +491,8 @@ VIEWS.welcome = () => h('main.screen.center',
 
 VIEWS.create = () => {
   const name = h('input#name', { type: 'text', maxlength: 40, autocomplete: 'off', placeholder: 'e.g. Sam', 'data-testid': 'name', autofocus: true });
+  const user = h('input#user', { type: 'text', maxlength: 21, autocomplete: 'username', autocapitalize: 'none', spellcheck: false, placeholder: 'e.g. sam_k', 'data-testid': 'username' });
+  const remember = h('input', { type: 'checkbox', checked: true, 'data-testid': 'remember-user' });
   const p1 = h('input#p1', { type: 'password', autocomplete: 'new-password', placeholder: `At least ${MIN_PASSPHRASE} characters`, 'data-testid': 'pass1' });
   const p2 = h('input#p2', { type: 'password', autocomplete: 'new-password', placeholder: 'Type it again', 'data-testid': 'pass2' });
   const meter = h('div.meter', h('span'));
@@ -496,12 +510,14 @@ VIEWS.create = () => {
       e.preventDefault(); err.textContent = '';
       const nm = clampName(name.value);
       if (!nm) { err.textContent = 'Pick a display name.'; return; }
+      const uProblem = usernameProblem(user.value); if (uProblem) { err.textContent = uProblem; return; }
       if (p1.value.length < MIN_PASSPHRASE) { err.textContent = `Passphrase must be at least ${MIN_PASSPHRASE} characters.`; return; }
       if (p1.value !== p2.value) { err.textContent = 'Passphrases don’t match.'; return; }
       btn.disabled = true; btn.textContent = 'Creating keys…';
       try {
         const v = await Vault.create(SLOTS.a, p1.value);
-        await v.putRecord('profile', { name: nm });
+        await saveLogin(user.value, remember.checked);
+        await v.putRecord('profile', { name: nm, username: normalizeUsername(user.value), v: Date.now() });
         await v.putRecord('settings', { autoLockMin: 5 });
         p1.value = p2.value = '';
         S.slot = 'a';
@@ -512,7 +528,10 @@ VIEWS.create = () => {
   },
   h('h1', 'Set up this device'),
   h('label', { for: 'name' }, 'Your display name'), name,
-  h('small.hint', 'Shown to people you connect with. Not unique, not an account.'),
+  h('small.hint', 'Shown to people you connect with.'),
+  h('label', { for: 'user' }, 'Username'), user,
+  h('small.hint', 'You’ll type it with your passphrase to unlock. Your contacts see it as @username. It stays on this phone — there is no account server.'),
+  h('label.toggle', remember, ' Remember my username on this phone'),
   h('label', { for: 'p1' }, 'Passphrase'), p1, meter, meterLabel,
   h('label', { for: 'p2' }, 'Confirm passphrase'), p2,
   h('div.callout.warn', h('strong', 'There is no “forgot passphrase”. '),
@@ -522,27 +541,64 @@ VIEWS.create = () => {
 };
 
 VIEWS.unlock = () => {
-  const p = h('input#pass', { type: 'password', autocomplete: 'current-password', 'data-testid': 'unlock-pass', autofocus: true });
+  const user = h('input#user', { type: 'text', autocomplete: 'username', autocapitalize: 'none', spellcheck: false, 'data-testid': 'unlock-user' });
+  const p = h('input#pass', { type: 'password', autocomplete: 'current-password', 'data-testid': 'unlock-pass' });
   const err = h('p.error', { role: 'alert' });
   const btn = h('button.primary.big', { type: 'submit', 'data-testid': 'unlock' }, 'Unlock');
-  return h('form.screen.narrow.center', {
+  let login = null;
+  store.get(LOGIN_KEY).then((l) => {
+    login = l || null;
+    if (login?.user && !user.value) { user.value = login.user; p.focus(); } else user.focus();
+    userRow.hidden = !login; // accounts from before usernames: passphrase only, then choose one
+  }).catch(() => {}).finally(() => { form.dataset.ready = '1'; });
+  const userRow = h('div', { hidden: true }, h('label', { for: 'user' }, 'Username'), user);
+  const fail = (ex) => {
+    btn.disabled = false; btn.textContent = 'Unlock'; p.value = ''; p.focus();
+    if (ex instanceof VaultWipedError) { toast('Too many wrong attempts. Everything was erased.', 'error', 8000); go('welcome'); return; }
+    if (ex instanceof WrongPassphraseError) err.textContent = Number.isFinite(ex.attemptsLeft) ? `Wrong username or passphrase. ${ex.attemptsLeft} tries left before this device is wiped.` : 'Wrong username or passphrase.';
+    else err.textContent = ex.message;
+  };
+  const form = h('form.screen.narrow.center', { 'data-testid': 'unlock-form',
     onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; btn.disabled = true; btn.textContent = 'Unlocking…';
-      // Real passphrase → real chats; duress passcode → the decoy. Nothing on screen says which.
-      try { const { vault: v, slot } = await unlockAny(store, p.value); p.value = ''; S.slot = slot; await openVault(v); }
-      catch (ex) {
-        btn.disabled = false; btn.textContent = 'Unlock'; p.value = ''; p.focus();
-        if (ex instanceof VaultWipedError) { toast('Too many wrong passphrases. Everything was erased.', 'error', 8000); go('welcome'); return; }
-        if (ex instanceof WrongPassphraseError) err.textContent = Number.isFinite(ex.attemptsLeft) ? `Wrong passphrase. ${ex.attemptsLeft} tries left before this device is wiped.` : 'Wrong passphrase.';
-        else err.textContent = ex.message;
-      }
+      try {
+        // A wrong username counts exactly like a wrong passphrase.
+        if (login && !(await checkLogin(login, user.value))) await Vault.noteFailure(SLOTS.a, () => store.clear());
+        // Real passphrase → real chats; duress passcode → the decoy. Nothing on screen says which.
+        const { vault: v, slot } = await unlockAny(store, p.value); p.value = '';
+        S.slot = slot;
+        await openVault(v);
+        if (login && S.profile.username !== normalizeUsername(user.value)) await saveProfile({ username: normalizeUsername(user.value) });
+        if (!login) chooseUsername().catch(() => {});
+      } catch (ex) { fail(ex); }
     },
   },
   h('div.brand', h('div.logo', icon('lock', 40)), h('h1', 'Murmur is locked')),
   updateBanner(),
+  userRow,
   h('label', { for: 'pass' }, 'Passphrase'), p, err, btn,
   h('button.link', { type: 'button', onclick: panicWipe, 'data-testid': 'forgot' }, 'Forgot it? Erase this device and start over'));
+  return form;
 };
+
+/** Accounts made before usernames existed pick one once. */
+async function chooseUsername() {
+  for (;;) {
+    const inp = h('input', { type: 'text', autocapitalize: 'none', spellcheck: false, placeholder: 'e.g. sam_k', 'data-testid': 'choose-username' });
+    const rem = h('input', { type: 'checkbox', checked: true });
+    const v = await modal({ title: 'Choose a username',
+      body: [h('p', 'From now on you unlock Murmur with your username and passphrase. Contacts see it as @username.'), inp, h('label.toggle', rem, ' Remember it on this phone')],
+      actions: [['Save', 'save', 'primary']] });
+    if (v !== 'save') continue;
+    const problem = usernameProblem(inp.value);
+    if (problem) { toast(problem, 'error'); continue; }
+    await saveLogin(inp.value, rem.checked);
+    await saveProfile({ username: normalizeUsername(inp.value) });
+    toast(`You are @${normalizeUsername(inp.value)}`, 'success');
+    rerenderIf('settings');
+    return;
+  }
+}
 
 function header(title, { back, actions = [] } = {}) {
   return h('header.bar',
@@ -573,7 +629,7 @@ VIEWS.home = () => {
       : ' Both phones must be on the same Wi-Fi or hotspot. Internet mode is off (Settings).'),
     list.length
       ? h('ul.contacts', list.map((c) => h('li', h('button.contact', { onclick: () => { S.unread.delete(c.id); go('chat', c.id); }, 'data-testid': `contact-${displayName(c)}` },
-        h('span.avatar', { 'data-online': isOnline(c.id) }, displayName(c).slice(0, 1).toUpperCase()),
+        avatar(c, { online: isOnline(c.id) }),
         h('span.cname', displayName(c)),
         h('span.cstate', { 'data-kind': linkState(c.id)[1] }, c.request ? 'wants to chat' : linkState(c.id)[0]),
         S.unread.get(c.id) ? h('span.badge', String(S.unread.get(c.id))) : null))))
@@ -871,6 +927,9 @@ function richText(m, cid) {
 
 function bubble(m, key = S.viewArgs?.[0]) {
   if (m.system) return h('p.sysmsg', { 'data-mid': m.id }, m.text);
+  if (m.deleted) return h(`div.msg.${m.dir}.deleted`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
+    h('p.gone', { 'data-testid': 'deleted' }, icon('trash', 14), m.dir === 'out' ? ' You deleted this message' : ' This message was deleted'),
+    h('div.meta', fmtTime(m.ts)));
   const cid = m.from || key; // in groups, safety decisions use the actual sender
   const body = [];
   if (m.from && m.dir === 'in' && String(key).startsWith('g:')) body.push(h('div.sender', { 'data-testid': 'sender' }, memberName(S.groups.get(String(key).slice(2)), m.from)));
@@ -887,7 +946,7 @@ function bubble(m, key = S.viewArgs?.[0]) {
   }
   return h(`div.msg.${m.dir}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
     ...body,
-    h('div.meta', fmtTime(m.ts),
+    h('div.meta', fmtTime(m.ts), m.edited ? h('span.edited', { 'data-testid': 'edited' }, 'edited') : null,
       m.expiresAt ? h('span.ttl', icon('timer', 12), h('span', { 'data-expires': m.expiresAt })) : null,
       m.dir === 'out' ? h('span.status', { title: m.status || 'sent' }, groupStatus(m, key)) : null));
 }
@@ -918,6 +977,7 @@ VIEWS.chat = (id) => {
   const msgs = S.chats.get(id) || [];
   const log = h('div#log.log', { 'aria-live': 'polite', 'data-testid': 'log' },
     msgs.length ? msgs.map((m) => bubble(m, id)) : h('p.empty', online ? 'Say hi. Messages are end-to-end encrypted.' : 'Not connected.'));
+  messageActions(log, id);
   let typingSent = false, typingTimer = 0;
   const comp = composer({
     key: id, disabled: !online,
@@ -955,13 +1015,16 @@ VIEWS.chat = (id) => {
     header(displayName(c), {
       back: () => go('home'),
       actions: [h('span.pill', { 'data-online': live, 'data-kind': linkState(id)[1], 'data-testid': 'conn-state' }, linkState(id)[0]),
+        ...(online ? [
+          callButtons(c).voice ? h('button.icon', { onclick: () => startCall(id, false), 'aria-label': 'Voice call', 'data-testid': 'call-voice' }, icon('phone')) : null,
+          callButtons(c).video ? h('button.icon', { onclick: () => startCall(id, true), 'aria-label': 'Video call', 'data-testid': 'call-video' }, icon('video')) : null] : []),
         h('button.icon', { onclick: () => go('contact', id), 'aria-label': 'Contact info', 'data-testid': 'contact-info' }, icon('info'))],
     }),
     c.request ? h('div.banner.warn', { 'data-testid': 'request-banner' },
       h('p', h('strong', `${displayName(c)} joined using your invite link.`), ' Only accept if you sent the link to this person. Until then, their links and files are locked.'),
       c.lookalike ? h('p', icon('alert', 14), ` This name looks like your contact “${c.lookalike[0]}” — but it is a different key.`) : null,
       h('div.share',
-        h('button.primary', { 'data-testid': 'accept-request', onclick: async () => { c.request = false; await persistContacts(); render(); } }, 'Accept'),
+        h('button.primary', { 'data-testid': 'accept-request', onclick: async () => { c.request = false; await persistContacts(); syncProfiles([id]); render(); } }, 'Accept'),
         h('button.danger', { onclick: () => deleteContact(id) }, 'Delete'))) : null,
     !c.request && c.remote && !c.verified ? h('div.banner', { 'data-testid': 'verify-banner' },
       h('p', icon('shield', 14), ' Not verified yet. Call them and compare safety numbers to be sure nobody swapped the invite.'),
@@ -1010,52 +1073,85 @@ async function receivedFile(cid, base, name, mime, bytes, extra = {}) {
 }
 
 // ---- photos & videos: remove hidden location/camera data before sending ----
+// Photos are sent at "standard" quality by default: longest side 1600 px, JPEG. A 12-MP iPhone
+// photo (2–4 MB HEIC/JPEG) becomes ~250–450 KB — usually ONE relay message instead of a dozen,
+// and re-drawing drops every byte of hidden metadata. "Original quality" stays one tap away.
+const PHOTO_MAX_SIDE = 1600, PHOTO_QUALITY = 0.82, PHOTO_KEEP_UNDER = 350 * 1024;
+
+async function redrawAsJpeg(file, maxSide) {
+  const bmp = await createImageBitmap(file); // applies the photo's rotation
+  const k = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+  const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, cv.width, cv.height); // transparent PNG → white, not black
+  g.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close?.();
+  const blob = await new Promise((res) => cv.toBlob(res, 'image/jpeg', PHOTO_QUALITY));
+  if (!blob) throw new Error('could not encode');
+  return { file: new File([blob], file.name.replace(/\.[a-z0-9]+$/i, '') + '.jpg', { type: 'image/jpeg' }), w: cv.width, h: cv.height };
+}
+
+/** → { file, note, warn?, original?: { file, note, warn? } } — `original` is offered as "Original quality". */
 async function prepareOutgoing(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const real = inspectFile(file.name, file.type, bytes).realType;
-  if (real === 'image/heic') {
-    // HEIC can't be cleaned byte-by-byte here: re-draw it as a JPEG (drops all metadata).
+  const cleanOriginal = () => {
+    if (real === 'image/heic') return { file, note: 'Original HEIC can’t be cleaned here — it may contain your location', warn: true };
+    if (!/^(image|video)\//.test(real)) return { file, note: null };
+    const r = stripMetadata(bytes); // throws MediaError on damaged files: better to refuse than half-clean
+    if (!r.stripped) return { file, note: null };
+    return { file: new File([r.bytes], file.name, { type: file.type || real }), note: r.removed.length ? 'Removed hidden location & camera info' : null };
+  };
+  if (/^image\/(jpeg|png|webp|heic)$/.test(real)) {
     try {
-      const bmp = await createImageBitmap(file);
-      const cv = document.createElement('canvas'); cv.width = bmp.width; cv.height = bmp.height;
-      cv.getContext('2d').drawImage(bmp, 0, 0);
-      const blob = await new Promise((r) => cv.toBlob(r, 'image/jpeg', 0.92));
-      return { file: new File([blob], file.name.replace(/\.hei[cf]$/i, '') + '.jpg', { type: 'image/jpeg' }), note: 'Converted to JPEG and removed hidden location & camera info' };
-    } catch { return { file, note: 'Couldn’t remove hidden info from this HEIC photo', warn: true }; }
+      const small = await redrawAsJpeg(file, PHOTO_MAX_SIDE);
+      if (real === 'image/heic' || small.file.size < bytes.length * 0.8 || bytes.length > PHOTO_KEEP_UNDER) {
+        return { file: small.file, note: 'Removed hidden location & camera info',
+          quality: `Standard quality · ${small.w}×${small.h}`, original: real === 'image/heic' ? null : cleanOriginal() };
+      }
+    } catch { /* browser can't decode it: fall back to byte-level cleaning */ }
   }
-  if (!/^(image|video)\//.test(real)) return { file, note: null };
-  const r = stripMetadata(bytes); // throws MediaError on damaged files: better to refuse than half-clean
-  if (!r.stripped) return { file, note: null };
-  return { file: new File([r.bytes], file.name, { type: file.type || real }), note: r.removed.length ? 'Removed hidden location & camera info' : null };
+  return cleanOriginal();
 }
 
 // ---- walkie-talkie: press and hold to talk, release to send ----
 function voiceButton(onClip, disabled) {
   const btn = h('button.icon.mic', { type: 'button', disabled, 'aria-label': 'Hold to talk', 'data-testid': 'voice', title: 'Hold to talk' }, icon('mic'));
-  let rec = null, stream = null, held = false, cancelled = false, started = 0, timer = 0;
-  const stop = () => { clearTimeout(timer); if (rec && rec.state !== 'inactive') rec.stop(); };
+  let rec = null, stream = null, held = false, cancelled = false, started = 0, timer = 0, busy = false;
+  // Every way out (stop, cancel, error, exception) goes through here, so the button can never get stuck.
+  const reset = () => {
+    clearTimeout(timer); stream?.getTracks().forEach((t) => t.stop());
+    rec = null; stream = null; busy = false; btn.classList.remove('rec');
+  };
+  const stop = () => { clearTimeout(timer); if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch { reset(); } } };
   btn.addEventListener('pointerdown', async (e) => {
-    e.preventDefault(); if (rec || btn.disabled) return;
-    held = true; cancelled = false;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } }); }
-    catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); held = false; return; }
-    if (!held) { stream.getTracks().forEach((t) => t.stop()); toast('Hold the button while you talk'); return; } // released during the permission prompt
-    const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
-    const chunks = [];
-    // Speech needs ~32 kbit/s; browsers default to 128–192 (iPhone: a 2-min clip was 2.7 MB).
-    try { rec = new MediaRecorder(stream, { ...(type ? { mimeType: type } : {}), audioBitsPerSecond: 32000 }); }
-    catch { rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined); }
-    rec.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data); };
-    rec.onstop = () => {
-      stream.getTracks().forEach((t) => t.stop());
-      const mime = (rec.mimeType || type || 'audio/webm').split(';')[0];
-      const dur = Date.now() - started; rec = null; btn.classList.remove('rec'); setStatusLine('');
-      if (!cancelled && dur > 500) onClip(new File(chunks, `voice-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm'}`, { type: mime }), dur);
-      else if (!cancelled) toast('Too short — hold the button while you talk');
-    };
-    started = Date.now(); rec.start(250); btn.classList.add('rec');
-    setStatusLine('● Recording… release to send · slide away to cancel');
-    timer = setTimeout(stop, 120_000); // 2 minutes max
+    e.preventDefault(); if (busy || btn.disabled) return;
+    busy = true; held = true; cancelled = false;
+    try {
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+      catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); reset(); return; }
+      if (!held) { toast('Hold the button while you talk'); reset(); return; } // released during the permission prompt
+      const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
+      const chunks = [];
+      // Deliberately NO bitrate option and NO timeslice: WebKit ignores bitrates, and Safari 26 emits
+      // EMPTY chunks for short timeslices (WebKit bug 301507). One blob at stop() works everywhere.
+      const r = rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+      r.ondataavailable = (ev) => { if (ev.data?.size) chunks.push(ev.data); };
+      r.onerror = (ev) => { toast(`Recording failed: ${ev.error?.message || 'unknown error'}`, 'error', 6000); cancelled = true; };
+      r.onstop = () => {
+        const mime = (r.mimeType || type || 'audio/webm').split(';')[0];
+        const dur = Date.now() - started; const bytes = chunks.reduce((n, c) => n + c.size, 0);
+        reset(); setStatusLine('');
+        if (cancelled) return;
+        if (dur <= 500) { toast('Too short — hold the button while you talk'); return; }
+        if (!bytes) { toast('Your phone gave Murmur no sound. Close other apps using the microphone and try again.', 'error', 7000); return; }
+        onClip(new File(chunks, `voice-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm'}`, { type: mime }), dur);
+      };
+      started = Date.now(); r.start(); btn.classList.add('rec');
+      setStatusLine('● Recording… release to finish · slide away to cancel');
+      timer = setTimeout(stop, 120_000); // 2 minutes max
+      if (!held) stop(); // finger already lifted while we were starting
+    } catch (err) {
+      toast(`Couldn’t start recording: ${err.message}`, 'error', 6000); reset(); setStatusLine('');
+    }
   });
   btn.addEventListener('pointerup', () => { held = false; stop(); });
   for (const ev of ['pointerleave', 'pointercancel']) btn.addEventListener(ev, () => { if (rec) { cancelled = true; setStatusLine('Cancelled'); } held = false; stop(); });
@@ -1231,6 +1327,9 @@ async function onAppMessage(cid, m) {
       forwardIfAdmin(g, m, cid);
       break;
     }
+    case 'edit': case 'del': applyEditOrDelete(cid, m); break;
+    case 'profile': await onProfile(cid, m); break;
+    case 'call': onCallSignal(cid, m); break;
     case 'gleave': {
       const g = S.groups.get(m.gid);
       if (!isMember(g, cid)) return;
@@ -1241,6 +1340,333 @@ async function onAppMessage(cid, m) {
     }
     default: break;
   }
+}
+
+// ---- profile: photo, username, call permissions (see core/profile.js) ----
+/** Round avatar: their photo (only real JPEGs ever get here), else their initial. */
+// Images only ever come from in-memory blob: URLs (the DOM helper refuses anything else).
+const PIC_URLS = new Map(); // b64 → blob URL, so re-renders don't create new ones
+function picUrl(b64) {
+  if (!b64) return null;
+  let u = PIC_URLS.get(b64);
+  if (!u) {
+    if (PIC_URLS.size > 200) { for (const x of PIC_URLS.values()) URL.revokeObjectURL(x); PIC_URLS.clear(); }
+    u = URL.createObjectURL(new Blob([fromB64u(b64)], { type: 'image/jpeg' })); PIC_URLS.set(b64, u);
+  }
+  return u;
+}
+function avatar(c, { size = 'md', online } = {}) {
+  const pic = c && !c.request && c.pic;
+  return h(`span.avatar.${size}`, { 'data-online': online, 'data-testid': 'avatar' },
+    pic ? h('img', { src: picUrl(pic), alt: '' }) : displayName(c || {}).slice(0, 1).toUpperCase());
+}
+const myPicUrl = () => picUrl(S.profile.pic);
+
+/** Any change to what contacts should know about me. */
+async function saveProfile(patch = {}) {
+  Object.assign(S.profile, patch, { v: Math.max(Date.now(), (S.profile.v || 0) + 1) });
+  await S.vault.putRecord('profile', S.profile);
+  syncProfiles();
+}
+/** Tell contacts (each their own version) whatever changed since they last heard. */
+let syncing = Promise.resolve();
+function syncProfiles(only) {
+  syncing = syncing.then(async () => {
+    if (!S.vault) return;
+    let dirty = false;
+    for (const c of S.contacts.values()) {
+      if (only && !only.includes(c.id)) continue;
+      if (c.request || !canChat(c.id)) continue; // strangers don't get my photo; unreachable ones get it later
+      const msg = profileFor(S.profile, S.settings, c);
+      const sig = JSON.stringify(msg);
+      if (c.profileSent === sig) continue;
+      try { await deliver(c.id, msg); c.profileSent = sig; dirty = true; } catch { /* retried on next connect */ }
+    }
+    if (dirty) await persistContacts();
+  }).catch((e) => console.warn('profile sync:', e.message));
+  return syncing;
+}
+async function onProfile(cid, m) {
+  const c = S.contacts.get(cid); const p = readProfile(m);
+  if (!c || !p || p.v < (c.profileV || 0)) return;
+  Object.assign(c, { name: p.name, username: p.user, pic: p.pic, calls: p.calls, profileV: p.v });
+  await persistContacts();
+  rerenderIf('home'); rerenderIf('chat', () => S.viewArgs[0] === cid); rerenderIf('contact', () => S.viewArgs[0] === cid);
+}
+/** Square-crop and shrink a picked photo to a ≤36 KB JPEG (drops all metadata). */
+async function makeProfilePic(file) {
+  const bmp = await createImageBitmap(file);
+  const side = Math.min(bmp.width, bmp.height), N = 256;
+  const cv = document.createElement('canvas'); cv.width = cv.height = N;
+  const g = cv.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, N, N);
+  g.drawImage(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side, 0, 0, N, N); bmp.close?.();
+  for (const q of [0.8, 0.65, 0.5, 0.35]) {
+    const b = await new Promise((res) => cv.toBlob(res, 'image/jpeg', q));
+    if (b && b.size <= MAX_PIC) return toB64u(new Uint8Array(await b.arrayBuffer()));
+  }
+  throw new Error('Couldn’t make that photo small enough');
+}
+/** Username on the lock screen: checked against the shared salted hash (both vault slots). */
+async function saveLogin(username, remember) {
+  await store.put(LOGIN_KEY, await makeLogin(username, remember));
+}
+
+// ---- voice & video calls (engine: core/call.js) ----
+// One call at a time. Signals ride the normal encrypted channel (deliver()). Incoming calls
+// ring only while Murmur is open on that phone — a web app can't wake a locked phone.
+let ICE_CACHE = null;
+async function iceConfig(cid) {
+  const nearby = isOnline(cid);
+  let servers = { iceServers: [], turn: false };
+  if (S.remote && navigator.onLine !== false) {
+    if (ICE_CACHE && ICE_CACHE.until > Date.now()) servers = ICE_CACHE;
+    else {
+      try {
+        const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 4000);
+        const j = await (await fetch(`${RELAY_URL}/v1/turn`, { signal: ctl.signal, cache: 'no-store' })).json();
+        clearTimeout(t);
+        if (Array.isArray(j.iceServers)) servers = ICE_CACHE = { iceServers: j.iceServers, turn: !!j.turn, until: Date.now() + 45 * 60_000 };
+      } catch { /* offline or relay unreachable: nearby/direct only */ }
+    }
+  }
+  const hide = S.settings.calls?.hideIp !== false;
+  // Nearby (same Wi-Fi/hotspot) is always direct — there may be no internet to relay through.
+  return { iceServers: servers.iceServers, relayOnly: hide && servers.turn && !nearby, cantHide: hide && !servers.turn && !nearby };
+}
+/** "Hide my IP" is on but no relay is available: never fall back to direct silently. */
+async function okToGoDirect(ice) {
+  if (!ice.cantHide) return true;
+  return (await modal({ title: 'Your IP address can’t be hidden right now',
+    body: ['The call relay isn’t available, so this call would connect directly — the other person’s phone could learn your IP address (roughly where you are, and your internet provider).',
+      'The call itself is still end-to-end encrypted.'],
+    actions: [['Cancel', false], ['Call anyway', true, 'primary']] })) === true;
+}
+
+const callMsg = (cid, text) => addMessage(cid, { id: newId(), dir: 'in', ts: Date.now(), text, system: true });
+function callLogText(call, { reason, duration }) {
+  const what = call.video ? 'Video call' : 'Voice call';
+  if (duration) return `${call.outgoing ? '↗' : '↙'} ${what} · ${formatDuration(duration)}`;
+  return {
+    'no answer': `↗ ${what} — no answer`, cancelled: `↗ ${what} — cancelled`, missed: `↙ Missed ${what.toLowerCase()}`,
+    declined: call.outgoing ? `↗ ${what} — declined` : `↙ ${what} — declined`, busy: `↗ ${what} — they were on another call`,
+    unavailable: `↗ ${what} — they don’t accept ${call.video ? 'video' : 'voice'} calls from you`, 'no permission': `${what} — microphone/camera access is off`,
+    'could not connect': `${what} — couldn’t connect`, locked: `${what} — ended (Murmur locked)`,
+  }[reason] || `${what} — ${reason}`;
+}
+
+async function startCall(cid, video) {
+  const c = S.contacts.get(cid);
+  if (S.call) { toast('You’re already in a call', 'error'); return; }
+  if (!c || !canChat(cid)) { toast('Not reachable right now', 'error'); return; }
+  if (!callButtons(c)[video ? 'video' : 'voice']) { toast(`${displayName(c)} doesn’t accept ${video ? 'video' : 'voice'} calls`, 'error'); return; }
+  const ice = await iceConfig(cid);
+  if (!(await okToGoDirect(ice))) return;
+  const call = new Call({ id: newId(), peer: cid, outgoing: true, video, ice, send: (sig) => deliver(cid, sig) });
+  showCall(call);
+  call.start();
+}
+
+function onCallSignal(cid, m) {
+  const sig = readSignal(m); if (!sig) return;
+  const c = S.contacts.get(cid);
+  if (sig.k !== 'offer') { if (S.call?.id === sig.id && S.call.peer === cid) S.call.onSignal(sig); return; }
+  // Both called each other at the same moment: the one with the smaller id keeps its call.
+  if (S.call && S.call.peer === cid && S.call.outgoing && S.call.state === 'calling') {
+    if (S.myCid < cid) return; // ours wins; theirs will be dropped by them
+    S.call.yielded = true; S.call.hangup();
+  }
+  const verdict = callDecision({ settings: S.settings, contact: c, video: sig.video, busy: !!S.call });
+  if (verdict !== 'ring') {
+    deliver(cid, { t: 'call', id: sig.id, k: verdict }).catch(() => {});
+    if (verdict === 'busy' && c) callMsg(cid, `↙ Missed ${sig.video ? 'video' : 'voice'} call (you were on another call)`);
+    return;
+  }
+  const call = new Call({ id: sig.id, peer: cid, outgoing: false, video: sig.video, send: (s2) => deliver(cid, s2) });
+  call.offer = sig.sdp;
+  showCall(call);
+}
+
+// --- ringing sound (Web Audio; unlocked by the first tap, as phones require) ---
+let AUDIO = null;
+addEventListener('pointerdown', () => { try { AUDIO ||= new AudioContext(); AUDIO.resume?.(); } catch { /* no audio */ } }, { passive: true });
+function ring(outgoing) {
+  if (!AUDIO) return () => {};
+  let stop = false; const notes = outgoing ? [[440, 0.4, 2.6]] : [[880, 0.25, 0.15], [660, 0.25, 1.6]];
+  const play = () => {
+    if (stop) return; let t = AUDIO.currentTime; let total = 0;
+    for (const [f, d, gap] of notes) {
+      const o = AUDIO.createOscillator(), g = AUDIO.createGain();
+      o.frequency.value = f; g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(outgoing ? 0.05 : 0.2, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+      o.connect(g).connect(AUDIO.destination); o.start(t); o.stop(t + d); t += d + gap; total += d + gap;
+    }
+    if (!outgoing) navigator.vibrate?.([300, 200, 300]);
+    timer = setTimeout(play, total * 1000);
+  };
+  let timer = 0; play();
+  return () => { stop = true; clearTimeout(timer); };
+}
+
+function endCall(reason) { S.call?.hangup?.(reason); }
+
+/** The full-screen call UI. Lives outside the view tree, so moving around the app doesn't end the call. */
+function showCall(call) {
+  S.call = call;
+  const c = S.contacts.get(call.peer);
+  const remoteV = h('video.remote', { autoplay: true, playsinline: true, 'data-testid': 'call-remote' });
+  const localV = h('video.local', { autoplay: true, playsinline: true, muted: true, 'data-testid': 'call-local' });
+  localV.muted = true; // muted must be a property for autoplay rules
+  const status = h('p.callstatus', { 'data-testid': 'call-status' });
+  const timer = h('p.calltimer', { 'data-testid': 'call-timer' });
+  const btn = (name, label, testid, onclick, cls = '') => h(`button.callbtn${cls}`, { type: 'button', 'aria-label': label, 'data-testid': testid, onclick }, icon(name, 26), h('span', label));
+  const mute = btn('mic', 'Mute', 'call-mute', () => call.setMuted(!call.muted));
+  const cam = call.video ? btn('video', 'Camera', 'call-camera', () => call.setCameraOff(!call.cameraOff)) : null;
+  const flip = call.video ? btn('flip', 'Flip', 'call-flip', () => call.flipCamera().catch((e) => toast(e.message, 'error'))) : null;
+  const hang = btn('hangup', 'End', 'call-end', () => call.hangup(), '.end');
+  const accept = btn(call.video ? 'video' : 'phone', 'Accept', 'call-accept', async () => {
+    stopRing();
+    const ice = await iceConfig(call.peer); // the answering phone hides its IP too
+    if (!(await okToGoDirect(ice))) { call.decline(); return; }
+    call.ice = ice; call.accept(call.offer); render2();
+  }, '.accept');
+  const decline = btn('hangup', 'Decline', 'call-decline', () => call.decline(), '.end');
+  const controls = h('div.callcontrols');
+  const el = h('div.callscreen', { role: 'dialog', 'aria-label': 'Call', 'data-testid': 'call-screen', 'data-video': call.video },
+    remoteV,
+    h('div.callwho', avatar(c, { size: 'xl' }), h('h2', displayName(c || {})), status, timer),
+    localV, controls);
+  let stopRing = ring(call.outgoing);
+  const label = { calling: 'Calling…', ringing: call.video ? 'Incoming video call' : 'Incoming voice call', connecting: 'Connecting…', reconnecting: 'Reconnecting…', connected: '' };
+  const render2 = () => {
+    el.dataset.state = call.state;
+    status.textContent = label[call.state] ?? '';
+    mute.classList.toggle('on', call.muted); mute.setAttribute('aria-pressed', call.muted); mute.firstChild.replaceWith(icon(call.muted ? 'micoff' : 'mic', 26));
+    if (cam) { cam.classList.toggle('on', call.cameraOff); cam.setAttribute('aria-pressed', call.cameraOff); cam.firstChild.replaceWith(icon(call.cameraOff ? 'videooff' : 'video', 26)); }
+    clear(controls).append(...(call.state === 'ringing' ? [decline, accept] : [mute, cam, flip, hang].filter(Boolean)));
+  };
+  const tick = setInterval(() => {
+    if (call.connectedAt) timer.textContent = formatDuration(Date.now() - call.connectedAt);
+    S.lastActivity = Date.now(); // a call is activity: don't auto-lock mid-call
+  }, 1000);
+  call.on('state', (st) => { if (st !== 'calling' && st !== 'ringing') stopRing(); render2(); })
+    .on('controls', render2)
+    .on('local', (st) => { localV.srcObject = st; localV.hidden = !call.video; })
+    .on('remote', (st) => { if (remoteV.srcObject !== st) remoteV.srcObject = st; remoteV.play?.().catch(() => {}); })
+    .on('end', (info) => {
+      stopRing(); clearInterval(tick); el.remove();
+      if (S.call === call) S.call = null;
+      if (!call.yielded && S.vault && S.contacts.has(call.peer)) callMsg(call.peer, callLogText(call, info));
+      if (['no permission', 'could not connect', 'connection lost'].includes(info.reason)) toast(callLogText(call, info), 'error', 6000);
+    });
+  localV.hidden = true;
+  render2();
+  document.body.append(el);
+}
+
+// ---- edit & delete ----
+// Your own messages can be edited for 15 minutes and deleted for everyone for 1 hour.
+// "Delete for me" works on anything, any time. Receivers enforce the same rules: only the
+// AUTHOR can change a message (checked against who actually sent it, also in groups), only
+// text can be edited, and only inside the window (with 5 min of clock-skew grace).
+const canDeleteAll = (m) => canDeleteForEveryone(m);
+
+function findMsg(key, mid) { return (S.chats.get(key) || []).find((x) => x.id === mid); }
+function redrawBubble(key, m) {
+  const el = document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`);
+  if (el && isOpenChat(key)) el.replaceWith(bubble(m, key));
+  persistHistory(key).catch(() => {});
+}
+function wipeContent(m) {
+  if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  for (const k of ['text', 'file', 'loc', 'sos']) delete m[k];
+  m.deleted = true; delete m.edited;
+}
+
+/** Long-press (phones) or right-click (computers) on a bubble opens its actions. */
+function messageActions(log, key) {
+  let timer = 0, sx = 0, sy = 0;
+  const open = (target) => {
+    const el = target.closest?.('[data-mid]'); if (!el) return;
+    const m = findMsg(key, el.dataset.mid); if (!m || m.system) return;
+    navigator.vibrate?.(15);
+    messageMenu(key, m);
+  };
+  log.addEventListener('contextmenu', (e) => { if (e.target.closest('[data-mid]')) { e.preventDefault(); open(e.target); } });
+  log.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || e.target.closest('button, a, audio, video, input')) return;
+    sx = e.clientX; sy = e.clientY; clearTimeout(timer);
+    timer = setTimeout(() => open(e.target), 500);
+  });
+  for (const ev of ['pointerup', 'pointercancel', 'scroll']) log.addEventListener(ev, () => clearTimeout(timer), { passive: true });
+  log.addEventListener('pointermove', (e) => { if (Math.hypot(e.clientX - sx, e.clientY - sy) > 10) clearTimeout(timer); }, { passive: true });
+}
+
+async function messageMenu(key, m) {
+  const left = (ms) => { const min = minutesLeft(m, ms); return min > 1 ? `${min} min left` : 'less than a minute left'; };
+  const actions = [['Cancel', false]];
+  if (m.text != null && !m.deleted) actions.push(['Copy', 'copy']);
+  if (canEdit(m)) actions.push([`Edit (${left(EDIT_WINDOW)})`, 'edit']);
+  actions.push(['Delete for me', 'me']);
+  if (canDeleteAll(m)) actions.push([`Delete for everyone (${left(DELETE_WINDOW)})`, 'all', 'danger']);
+  const choice = await modal({ title: m.dir === 'out' ? 'Your message' : 'Message',
+    body: [m.text != null ? h('p.quote', m.text.length > 200 ? `${m.text.slice(0, 200)}…` : m.text) : h('p.hint', m.deleted ? 'Deleted message' : m.file ? m.file.name : m.loc ? 'Location' : 'Message'),
+      m.dir === 'out' && !canDeleteAll(m) && !m.deleted ? h('p.hint', 'Too late to delete this for everyone (1-hour limit) — you can still remove it from this phone.') : null].filter(Boolean),
+    actions });
+  try {
+    if (choice === 'copy') { await navigator.clipboard.writeText(m.text); toast('Copied'); }
+    else if (choice === 'edit') await editMessage(key, m);
+    else if (choice === 'me') deleteForMe(key, m);
+    else if (choice === 'all') await deleteForEveryone(key, m);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+/** Send to whoever got the original: the contact, or every group member. */
+async function sendChange(key, change) {
+  if (key.startsWith('g:')) {
+    const g = S.groups.get(key.slice(2)); if (!g) throw new Error('Group not found');
+    const r = await fanOut(g, { ...change, gid: g.id });
+    if (r.failed.length) toast(`Couldn’t reach ${r.failed.join(', ')} yet`, 'error');
+  } else await deliver(key, change);
+}
+
+async function editMessage(key, m) {
+  const ta = h('textarea.edit', { rows: 3, maxlength: MAX_TEXT, 'data-testid': 'edit-text' }, m.text);
+  const v = await modal({ title: 'Edit message', body: [ta, h('p.hint', 'Everyone sees it marked “edited”.')], actions: [['Cancel', false], ['Save', 'save', 'primary']] });
+  const text = ta.value.trim();
+  if (v !== 'save' || !text || text === m.text) return;
+  if (!canEdit(m)) throw new Error('The 15-minute edit window has passed');
+  await sendChange(key, { t: 'edit', ref: m.id, text, ts: Date.now() });
+  m.text = text; m.edited = true; redrawBubble(key, m);
+}
+function deleteForMe(key, m) {
+  const list = S.chats.get(key) || [];
+  const i = list.indexOf(m); if (i >= 0) list.splice(i, 1);
+  if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`)?.remove();
+  persistHistory(key).catch(() => {});
+}
+async function deleteForEveryone(key, m) {
+  if (!canDeleteAll(m)) throw new Error('The 1-hour window has passed');
+  const ok = await modal({ title: 'Delete for everyone?', body: ['It disappears from their phone too. They’ll see “This message was deleted”.'], actions: [['Cancel', false], ['Delete', true, 'danger']] });
+  if (!ok) return;
+  await sendChange(key, { t: 'del', ref: m.id, ts: Date.now() });
+  wipeContent(m); redrawBubble(key, m);
+}
+
+/** Incoming edit/delete: only the author, only inside the window. */
+function applyEditOrDelete(cid, m) {
+  if (typeof m.ref !== 'string' || !m.ref || m.ref.length > 32) return;
+  let key = cid, author = cid;
+  if (m.gid) {
+    const g = S.groups.get(m.gid);
+    if (!isMember(g, cid) || !(author = groupOrigin(g, cid, m))) return;
+    key = `g:${m.gid}`; forwardIfAdmin(g, m, cid);
+  }
+  const t = findMsg(key, m.ref);
+  const verdict = acceptChange(t, m, author, key.startsWith('g:'));
+  if (verdict === 'edit') { t.text = m.text; t.edited = true; }
+  else if (verdict === 'del') wipeContent(t);
+  else return;
+  redrawBubble(key, t);
 }
 
 // ---- groups ----
@@ -1323,6 +1749,7 @@ VIEWS.group = (gid) => {
   const msgs = S.chats.get(key) || [];
   const active = !g.removed;
   const log = h('div#log.log', { 'aria-live': 'polite', 'data-testid': 'log' }, msgs.length ? msgs.map((m) => bubble(m, key)) : h('p.empty', 'Messages here go to everyone in the group, each one end-to-end encrypted.'));
+  messageActions(log, key);
   const comp = composer({
     key, disabled: !active,
     placeholder: active ? `Message ${g.name}` : 'You are no longer in this group',
@@ -1415,25 +1842,39 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
 }
 /** Show exactly what is about to be sent (the cleaned copy) and wait for an explicit Send. */
 async function reviewBeforeSend(prep, kind) {
-  const f = prep.file;
-  const url = URL.createObjectURL(f);
-  const type = f.type || '';
-  const preview = kind === 'voice' || type.startsWith('audio/')
-    ? h('audio', { controls: true, src: url, preload: 'metadata', 'data-testid': 'review-audio' })
-    : type.startsWith('image/') && /^image\/(jpeg|png|webp|gif)$/.test(type) ? h('img.review', { src: url, alt: f.name, 'data-testid': 'review-image' })
-    : type.startsWith('video/') ? h('video.review', { controls: true, playsinline: true, src: url, preload: 'metadata', 'data-testid': 'review-video' })
-    : h('p', icon('clip', 16), ` ${f.name}`);
+  let cur = prep;
+  const isImg = (t) => /^image\/(jpeg|png|webp|gif)$/.test(t);
+  const box = h('div.review-preview');
+  const info = h('p.hint'); const note = h('p');
+  let url = null;
+  const show = () => {
+    const f = cur.file, type = f.type || '';
+    if (url) URL.revokeObjectURL(url);
+    url = URL.createObjectURL(f);
+    clear(box).append(kind === 'voice' || type.startsWith('audio/')
+      ? h('audio', { controls: true, src: url, preload: 'metadata', 'data-testid': 'review-audio' })
+      : isImg(type) ? h('img.review', { src: url, alt: f.name, 'data-testid': 'review-image' })
+      : type.startsWith('video/') ? h('video.review', { controls: true, playsinline: true, src: url, preload: 'metadata', 'data-testid': 'review-video' })
+      : h('p', icon('clip', 16), ` ${f.name}`));
+    info.textContent = `${f.name} · ${fmtBytes(f.size)}${cur.quality ? ` · ${cur.quality}` : ''}`;
+    clear(note); note.className = cur.warn ? 'warn' : 'ok';
+    if (cur.note) note.append(icon(cur.warn ? 'alert' : 'shield', 14), ` ${cur.note}`);
+  };
+  const hd = prep.original && h('label.toggle', h('input', { type: 'checkbox', 'data-testid': 'review-original', onchange: (e) => {
+    cur = e.target.checked ? { ...prep.original, quality: 'Original quality — bigger, slower to send' } : prep; show();
+  } }), ' Send original quality');
+  show();
   try {
+    const t = (cur.file.type || '');
     const choice = await modal({
-      title: kind === 'voice' ? 'Send this voice message?' : `Send ${type.startsWith('image/') ? 'this photo' : type.startsWith('video/') ? 'this video' : 'this file'}?`,
-      body: [preview,
-        h('p.hint', `${f.name} · ${fmtBytes(f.size)}`),
-        prep.note ? h(`p.${prep.warn ? 'warn' : 'ok'}`, icon(prep.warn ? 'alert' : 'shield', 14), ` ${prep.note}`) : null].filter(Boolean),
+      title: kind === 'voice' ? 'Send this voice message?' : `Send ${t.startsWith('image/') ? 'this photo' : t.startsWith('video/') ? 'this video' : 'this file'}?`,
+      body: [box, info, note, hd].filter(Boolean),
       actions: [[kind === 'voice' ? 'Delete' : 'Cancel', 'cancel'], ['Send', 'send', 'primary']],
     });
     if (choice !== 'send' && kind === 'voice') toast('Voice message deleted');
+    if (choice === 'send') prep.file = cur.file; // what you saw is what is sent
     return choice === 'send';
-  } finally { URL.revokeObjectURL(url); }
+  } finally { if (url) URL.revokeObjectURL(url); }
 }
 
 function liveBanner(key) {
@@ -1460,6 +1901,13 @@ VIEWS.contact = (id) => {
   return h('div.screen.full',
     header(displayName(c), { back: () => go('chat', id) }),
     h('div.panel',
+      h('div.who', avatar(c, { size: 'xl' }), h('div', h('strong', c.name), c.username ? h('p.handle', { 'data-testid': 'contact-username' }, `@${c.username}`) : null)),
+      h('h2', 'Calls'),
+      h('label.toggle', h('input', { type: 'checkbox', checked: !c.noCalls, 'data-testid': 'allow-calls-from', onchange: async (e) => {
+        c.noCalls = !e.target.checked; await persistContacts(); syncProfiles([id]);
+        toast(c.noCalls ? `${displayName(c)} can no longer call you` : `${displayName(c)} can call you again`);
+      } }), ` Allow ${displayName(c)} to call me`),
+      h('p.hint', c.calls && !c.calls.voice && !c.calls.video ? `${displayName(c)} doesn’t accept calls right now.` : ''),
       h('h2', 'Safety number'),
       h('p', 'Compare these digits with ', h('strong', c.name), '’s screen — in person or on a voice call. If they match, nobody is intercepting you.'),
       sn,
@@ -1511,7 +1959,8 @@ function duressSection() {
     try {
       if (S.slot === 'a') {
         await setDuress(store, 'a', p1.value, { name: S.profile.name, eraseReal: erase.checked,
-          settings: { autoLockMin: S.settings.autoLockMin, internet: !!S.settings.internet } });
+          profile: { username: S.profile.username, pic: S.profile.pic || null, v: Date.now() },
+          settings: { autoLockMin: S.settings.autoLockMin, internet: !!S.settings.internet, calls: S.settings.calls } });
       } else {
         // Decoy: same checks, same wait, same result on screen; nothing real is touched.
         if (await opensOther(store, 'b', p1.value) || await Vault.open(S.vault.store, p1.value)) throw new Error('The duress passcode must be different from your real passphrase');
@@ -1536,6 +1985,46 @@ function duressSection() {
     h('p.hint', 'Tip: unlock once with the duress passcode and add a few ordinary contacts (family, a work group), so it looks lived-in. Choose something you can type calmly under pressure.'));
 }
 
+function profileEditor(nameIn) {
+  const picIn = h('input', { type: 'file', accept: 'image/*', hidden: true, 'data-testid': 'pic-input', onchange: async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    try { await saveProfile({ pic: await makeProfilePic(f) }); toast('Profile photo updated', 'success'); render(); }
+    catch (ex) { toast(ex.message, 'error'); }
+  } });
+  const userIn = h('input', { type: 'text', value: S.profile.username || '', maxlength: 21, autocapitalize: 'none', spellcheck: false, 'aria-label': 'Username', 'data-testid': 'settings-username' });
+  return h('div.profile',
+    h('div.me', h('button.avatar.lg.me', { type: 'button', onclick: () => picIn.click(), 'aria-label': 'Change profile photo', 'data-testid': 'pic-button' },
+      myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase(), h('span.cam', icon('camera', 14))),
+      h('div',
+        h('button.link', { type: 'button', onclick: () => picIn.click() }, myPicUrl() ? 'Change photo' : 'Add a photo'),
+        myPicUrl() ? h('button.link', { type: 'button', 'data-testid': 'pic-remove', onclick: async () => { await saveProfile({ pic: null }); render(); } }, 'Remove') : null,
+        h('p.hint', 'Only your contacts see it — sent end-to-end encrypted, never uploaded anywhere.'))),
+    picIn,
+    h('label', 'Display name'),
+    h('div.row', nameIn, h('button', { onclick: async () => { const n = clampName(nameIn.value); if (!n) return; await saveProfile({ name: n }); toast('Name saved'); } }, 'Save')),
+    h('label', 'Username'),
+    h('div.row', userIn, h('button', { 'data-testid': 'save-username', onclick: async () => {
+      const problem = usernameProblem(userIn.value); if (problem) { toast(problem, 'error'); return; }
+      const remembered = !!(await store.get(LOGIN_KEY))?.user;
+      await saveLogin(userIn.value, remembered);
+      await saveProfile({ username: normalizeUsername(userIn.value) });
+      toast(`Username saved — unlock with @${normalizeUsername(userIn.value)} from now on`, 'success');
+    } }, 'Save')),
+    h('label.toggle', h('input', { type: 'checkbox', 'data-testid': 'remember-toggle', onchange: async (e) => {
+      const rec = await store.get(LOGIN_KEY); if (!rec) return;
+      if (e.target.checked) await store.put(LOGIN_KEY, { ...rec, user: S.profile.username }); else { const { user: _u, ...rest } = rec; await store.put(LOGIN_KEY, rest); }
+      toast(e.target.checked ? 'Username remembered on this phone' : 'You’ll type your username each time');
+    } }, ), ' Remember my username on this phone'));
+}
+function callToggle(kind, label) {
+  return h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.calls?.[kind] !== false, 'data-testid': `allow-${kind}`, onchange: async (e) => {
+    S.settings.calls = { ...(S.settings.calls || {}), [kind]: e.target.checked };
+    await S.vault.putRecord('settings', S.settings);
+    await saveProfile(); // tells contacts to show/hide the button
+    toast(`${kind === 'voice' ? 'Voice' : 'Video'} calls ${e.target.checked ? 'allowed' : 'turned off'}`);
+  } }), ` ${label}`);
+}
+
 VIEWS.settings = () => {
   const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
   const lockSel = h('select', { 'aria-label': 'Auto-lock' }, LOCK_OPTIONS.map(([v, l]) => h('option', { value: v, selected: S.settings.autoLockMin === v }, l)));
@@ -1554,8 +2043,17 @@ VIEWS.settings = () => {
     header('Settings', { back: () => go('home') }),
     h('div.panel',
       h('h2', 'You'),
-      h('div.row', nameIn, h('button', { onclick: async () => { const n = clampName(nameIn.value); if (!n) return; S.profile.name = n; await S.vault.putRecord('profile', S.profile); toast('Name saved'); } }, 'Save')),
+      profileEditor(nameIn),
       h('p.hint', 'Identity key: ', myId),
+
+      h('h2', 'Calls'),
+      callToggle('voice', 'Allow voice calls'),
+      callToggle('video', 'Allow video calls'),
+      h('p.hint', 'When off, your contacts don’t see the call button, and calls are refused even if someone tries. You can also block calls from one person in their contact info.'),
+      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.calls?.hideIp !== false, 'data-testid': 'hide-ip', onchange: async (e) => {
+        S.settings.calls = { ...(S.settings.calls || {}), hideIp: e.target.checked }; await S.vault.putRecord('settings', S.settings);
+      } }), ' Hide my IP address on internet calls'),
+      h('p.hint', 'On: calls go through the encrypted relay, so the other person never learns your IP address (slightly more delay). Off: a direct connection when possible. Calls are end-to-end encrypted either way. Nearby calls without internet are always direct.'),
 
       h('h2', 'Security'),
       h('label', 'Auto-lock after inactivity'),

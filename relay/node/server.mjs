@@ -6,8 +6,8 @@ import { makeInbox, ADDRESS_RE } from '../src/inbox.js';
 import { FakeNamespace, hibernatable } from './runtime.mjs';
 import { acceptUpgrade } from './ws-lite.mjs';
 
-export function startRelay({ port = 8787, host = '127.0.0.1', origins = [] } = {}) {
-  const env = { ALLOWED_ORIGINS: origins.join(',') };
+export function startRelay({ port = 8787, host = '127.0.0.1', origins = [], env: extra = {} } = {}) {
+  const env = { ALLOWED_ORIGINS: origins.join(','), ...extra };
   const Inbox = makeInbox(class { constructor() {} });
   env.INBOX = new FakeNamespace(Inbox, env);
   const server = createServer(async (req, res) => {

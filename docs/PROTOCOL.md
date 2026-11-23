@@ -252,3 +252,33 @@ Group delivery is **pairwise fan-out**: each copy is encrypted separately over t
 | HEIC (in the browser) | re-drawn to JPEG, which drops everything | pixels |
 
 A damaged file throws `MediaError` and isn't sent: it's never half-cleaned.
+
+## 11. Edits, profiles and calls (app messages, live or relay)
+
+Same transport as §9. Unknown fields are ignored.
+
+| Type | Fields | Receiver checks (`edits.js`, `profile.js`, `call.js`) |
+|---|---|---|
+| `edit` | `ref, text ≤ 8000, ts, [gid], [fwd]` | `ref` is a message **we received** from that sender (in groups: from the real author, never the forwarder). Text messages only; not deleted; age ≤ 15 min + 5 min clock grace. Shown "edited" |
+| `del` | `ref, ts, [gid], [fwd]` | same author rule; age ≤ 60 min + 5 min grace. Content wiped (files' blob URLs revoked); "This message was deleted" remains |
+| `profile` | `v, name ≤ 60, [user], [pic], calls{voice,video}` | `v` must not go backwards; `user` matches `^[a-z0-9][a-z0-9_.]{2,19}$`; `pic` is base64url of a **JPEG** (magic bytes checked) ≤ 36 KB (fits one 64 KiB nearby frame); bidi-override characters stripped from `name`. Each contact gets its own version (`calls` is false for a blocked contact); re-sent when it changes or when the contact becomes reachable; never sent to unaccepted invite-link contacts |
+| `call` | `id(16–32 hex), k ∈ {offer, answer, end, decline, busy, unavailable}, [sdp], [video]` | `sdp` starts with `v=0`, ≤ 40 000 chars. An `offer` rings only if `callDecision()` says so (receiver's settings + per-contact block + not a stranger + not busy); otherwise answered `unavailable`/`busy` |
+
+**Calls.** Non-trickle ICE: each side gathers for ≤ 3 s, then sends one SDP. The SDP's DTLS
+fingerprint is authenticated by the ratchet, so the media (DTLS-SRTP) is end-to-end between the
+two phones even through TURN. ICE servers come from `GET /v1/turn` on the relay
+(`{ iceServers, turn }`): Cloudflare STUN always, TURN credentials (TTL 1 h, port-53 URLs removed)
+when the relay holds a TURN key. "Hide my IP" sets `iceTransportPolicy: 'relay'` on internet
+calls (never nearby). If TURN is unavailable the person is asked before a direct call. Glare (both
+call at once): the phone with the smaller contact id keeps its call. Ring timeout 45 s; a dropped
+connection gets 10 s to recover.
+
+**Relay chunks** are now 512 KiB of file bytes per message (≈ 700 KB envelope, under the relay's
+1 MiB limit); receivers still accept 192 KiB chunks from older senders.
+
+## 12. Local login and the second vault slot
+
+`login` (shared store key, outside both vault slots): `{ salt, h = SHA-256(salt ‖ username) , [user] }`.
+`user` (plain) exists only if "remember my username" is on. A wrong username counts as one wrong
+attempt on the shared counter, exactly like a wrong passphrase. Slot B (`b:` keys) is the duress
+decoy or an unopenable placeholder — see THREAT-MODEL "Duress passcode".

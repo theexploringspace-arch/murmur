@@ -212,3 +212,42 @@ button.file .save { margin-left: 0.6rem; padding: 0.1rem 0.55rem; border-radius:
 .modal img.review, .modal video.review { display: block; max-width: 100%; max-height: 50vh; margin: 0.4rem auto 0.6rem; border-radius: var(--r); object-fit: contain; background: #000; }
 .modal audio { width: 100%; margin: 0.4rem 0 0.6rem; }
 .modal p.ok { font-weight: 500; font-size: 0.9rem; }
+
+/* ---- avatars & profile ---- */
+.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+.avatar.lg { width: 72px; height: 72px; font-size: 1.6rem; }
+.avatar.xl { width: 96px; height: 96px; font-size: 2.2rem; }
+button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
+.avatar .cam { position: absolute; right: -2px; bottom: -2px; background: var(--accent); color: var(--accent-ink); border-radius: 50%; width: 26px; height: 26px; display: grid; place-items: center; border: 2px solid var(--bg2); }
+.profile .me { display: flex; gap: 1rem; align-items: center; margin-bottom: 0.6rem; }
+.profile .me .hint { margin: 0.3rem 0 0; }
+.who { display: flex; gap: 1rem; align-items: center; margin: 0.4rem 0 0.8rem; }
+.who strong { font-size: 1.2rem; }
+.handle { color: var(--fg2); margin: 0.15rem 0 0; }
+
+/* ---- edit & delete ---- */
+.msg { -webkit-touch-callout: none; }
+.msg .edited { margin-left: 0.4rem; font-style: italic; opacity: 0.8; }
+.msg.deleted .gone { font-style: italic; color: var(--fg2); margin: 0; display: flex; gap: 0.35rem; align-items: center; }
+.modal .quote { border-left: 3px solid var(--accent); padding: 0.2rem 0.6rem; color: var(--fg2); white-space: pre-wrap; word-break: break-word; }
+.modal textarea.edit { width: 100%; box-sizing: border-box; font: inherit; }
+
+/* ---- calls ---- */
+.callscreen { position: fixed; inset: 0; z-index: 60; background: #05070a; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: space-between;
+  padding: calc(var(--safe-t) + 2.5rem) 1rem calc(var(--safe-b) + 1.5rem); box-sizing: border-box; }
+.callscreen video.remote { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+.callscreen[data-video="false"] video.remote { width: 1px; height: 1px; opacity: 0; } /* voice: plays audio, shows nothing */
+.callscreen[data-video="true"][data-state="connected"] .callwho .avatar,
+.callscreen[data-video="true"][data-state="connected"] .callwho h2 { display: none; }
+.callwho { position: relative; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.4rem; text-shadow: 0 1px 4px #000; }
+.callwho h2 { color: #fff; font-size: 1.5rem; text-transform: none; letter-spacing: 0; margin: 0.6rem 0 0; }
+.callstatus, .calltimer { margin: 0; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+.callscreen video.local { position: absolute; right: 1rem; top: calc(var(--safe-t) + 1rem); width: 28vw; max-width: 160px; aspect-ratio: 3/4; object-fit: cover; border-radius: 12px; border: 2px solid #ffffff55; transform: scaleX(-1); background: #111; }
+.callcontrols { position: relative; display: flex; gap: 1.1rem; flex-wrap: wrap; justify-content: center; }
+.callbtn { display: flex; flex-direction: column; align-items: center; gap: 0.35rem; background: none; border: 0; color: #fff; font-size: 0.75rem; padding: 0; }
+.callbtn svg { width: 64px; height: 64px; padding: 19px; box-sizing: border-box; border-radius: 50%; background: #ffffff26; backdrop-filter: blur(8px); }
+.callbtn.on svg { background: #fff; color: #000; }
+.callbtn.end svg { background: #ef4444; transform: none; }
+.callbtn.accept svg { background: #22c55e; }
+.callscreen[data-state="ringing"] .callbtn.accept svg { animation: pulse 1.2s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 14px #22c55e33; } }

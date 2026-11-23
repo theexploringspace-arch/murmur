@@ -150,3 +150,21 @@ once and deleted once. Bytes are written before the index points at them, and th
 is updated before the bytes are deleted, so a crash can leave an orphan but never a
 dangling pointer. Older builds' single record is migrated on load.
 `test/unit/remote.test.mjs` measures bytes written; the old design does not finish it.
+
+## Lesson: two races found by running the suite twice
+
+1. **The half-open session.** `openVault()` set `S.vault` before `S.settings` was loaded. The
+   auto-lock timer treats `S.vault` as "ready" and read `S.settings.autoLockMin` → crash, only when
+   the timer ticked inside that gap. Fix: load everything, *then* publish `S.vault`.
+2. **The lock screen that wasn't ready.** The remembered username loads asynchronously; the test
+   (and a fast thumb) could submit first. The form now marks `data-ready` once it has loaded.
+
+Rule of thumb: whatever other code uses as a "ready" flag must be assigned **last**.
+
+## New modules (Nov 2026)
+| Module | Pure? | Tests |
+|---|---|---|
+| `core/edits.js` — edit/delete windows, author checks | yes | `test/unit/edits.test.mjs` |
+| `core/profile.js` — username rules, login hash, profile validation, per-contact call flags | yes | `test/unit/profile.test.mjs` |
+| `core/call.js` — WebRTC call engine + signal validation + `callDecision()` | engine needs a browser | `test/unit/call.test.mjs` + e2e "voice & video calls" and the relay call in "phase 1" |
+| `relay/src/router.js` `/v1/turn` | — | `test/unit/relay.test.mjs` (fake Cloudflare API, port-53 filter, Origin check, rate limit, STUN fallback) |
