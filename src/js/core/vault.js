@@ -20,11 +20,21 @@ import { utf8, fromUtf8, random } from './bytes.js';
 const META = 'vault/meta';
 const IDENT = 'vault/identity';
 const FAILS = 'vault/fails';
+const UNTIL = 'vault/until'; // no unlock attempts before this time (ms)
+
+// Wrong tries 1–4 are free; then the phone makes you wait, longer each time — like an iPhone
+// lock screen. This stops someone holding your phone from guessing, WITHOUT letting a prankster
+// destroy your data. Erasing after N tries is opt-in (wipeAfter; default 0 = never).
+export const LOCKOUT_STEPS = [0, 0, 0, 0, 30e3, 60e3, 5 * 60e3, 15 * 60e3, 60 * 60e3]; // index = fails - 1
+export const lockoutFor = (fails) => (fails <= 0 ? 0 : LOCKOUT_STEPS[Math.min(fails, LOCKOUT_STEPS.length) - 1] ?? 60 * 60e3);
 const REC = (n) => `rec/${n}`;
 const AAD = (n) => utf8(`murmur/v1/${n}`);
 
 export class WrongPassphraseError extends Error {
-  constructor(left) { super('Wrong passphrase'); this.name = 'WrongPassphraseError'; this.attemptsLeft = left; }
+  constructor(left, waitMs = 0) { super('Wrong passphrase'); this.name = 'WrongPassphraseError'; this.attemptsLeft = left; this.waitMs = waitMs; }
+}
+export class LockedOutError extends Error {
+  constructor(waitMs) { super('Too many wrong tries — wait before trying again'); this.name = 'LockedOutError'; this.waitMs = waitMs; }
 }
 export class VaultWipedError extends Error {
   constructor() { super('Too many failed attempts — vault wiped'); this.name = 'VaultWipedError'; }
@@ -39,7 +49,9 @@ export class Vault {
 
   static async exists(store) { return !!(await store.get(META)); }
 
-  static async create(store, passphrase, { iterations = C.PBKDF2_ITERATIONS, wipeAfter = 10 } = {}) {
+  static clock = () => Date.now(); // tests move time forward
+
+  static async create(store, passphrase, { iterations = C.PBKDF2_ITERATIONS, wipeAfter = 0 } = {}) {
     if (typeof passphrase !== 'string' || passphrase.length < MIN_PASSPHRASE)
       throw new Error(`Passphrase must be at least ${MIN_PASSPHRASE} characters`);
     if (await Vault.exists(store)) throw new Error('Vault already exists');
@@ -56,13 +68,14 @@ export class Vault {
     const publicRaw = await C.exportPublic(ident.publicKey);
 
     await store.put(IDENT, { iv: idIv, wrapped: wrappedId, publicRaw });
-    await store.put(FAILS, 0);
+    await store.put(FAILS, 0); await store.put(UNTIL, 0);
     await store.put(META, { v: 1, salt, iterations, dekIv, wrappedDek, wipeAfter });
     // Re-open through the normal path so the in-memory keys are non-extractable.
     return Vault.unlock(store, passphrase);
   }
 
   static async unlock(store, passphrase) {
+    await Vault.checkLockout(store);
     const opened = await Vault.open(store, passphrase);
     if (opened) return opened;
     await Vault.noteFailure(store, () => Vault.wipe(store));
@@ -81,7 +94,7 @@ export class Vault {
       dek = await C.unwrapKey('raw', meta.wrappedDek, kek, meta.dekIv, AAD('dek'), C.AES_ALGO,
         ['encrypt', 'decrypt', 'unwrapKey']);
     } catch { return null; }
-    await store.put(FAILS, 0);
+    await store.put(FAILS, 0); await store.put(UNTIL, 0);
     const id = await store.get(IDENT);
     const privateKey = await C.unwrapKey('pkcs8', id.wrapped, dek, id.iv, AAD('identity'), C.ECDSA_ALGO, ['sign']);
     const publicKey = await C.importIdentityPublic(id.publicRaw);
@@ -90,7 +103,12 @@ export class Vault {
   static meta(store) { return store.get(META); }
   /** The wrong-passphrase limit is plain metadata (needed before unlock), so it can be set without the key. */
   static async setWipeAfterOn(store, n) { const m = await store.get(META); if (m) await store.put(META, { ...m, wipeAfter: n | 0 }); }
-  /** Count one wrong passphrase on `store`; past the limit run `wipe` and throw VaultWipedError. Always throws. */
+  /** Refuse any attempt while a lockout is running (checked BEFORE any key derivation). */
+  static async checkLockout(store) {
+    const until = (await store.get(UNTIL)) || 0, now = Vault.clock();
+    if (until > now) throw new LockedOutError(until - now);
+  }
+  /** Count one wrong passphrase on `store`; start a lockout; past an opt-in limit run `wipe`. Always throws. */
   static async noteFailure(store, wipe) {
     const meta = await store.get(META);
     const fails = ((await store.get(FAILS)) || 0) + 1;
@@ -98,8 +116,10 @@ export class Vault {
       await wipe();
       throw new VaultWipedError();
     }
+    const wait = lockoutFor(fails);
     await store.put(FAILS, fails);
-    throw new WrongPassphraseError(meta.wipeAfter > 0 ? meta.wipeAfter - fails : Infinity);
+    await store.put(UNTIL, wait ? Vault.clock() + wait : 0);
+    throw new WrongPassphraseError(meta.wipeAfter > 0 ? meta.wipeAfter - fails : Infinity, wait);
   }
 
   static async wipe(store) { await store.clear(); }

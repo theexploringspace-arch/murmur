@@ -207,7 +207,7 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       await B.page.waitForSelector(`${tid('conn-state')}[data-online="false"]`, { timeout: 10000 });
       await userReady(A.page); await A.page.fill(tid('unlock-pass'), 'not the passphrase');
       await A.page.click(tid('unlock'));
-      await A.page.waitForFunction(() => /tries left/.test(document.querySelector('.error')?.textContent || ''));
+      await A.page.waitForFunction(() => /Wrong username or passphrase/.test(document.querySelector('.error')?.textContent || ''));
       // Bob keeps writing while Alice is locked: it goes through the relay (set up
       // automatically when they paired face to face) and waits for her.
       await B.page.waitForSelector(`${tid('conn-state')}[data-kind="internet"]`, { timeout: 15000 });
@@ -483,6 +483,16 @@ test('duress passcode: opens an empty decoy, real chats untouched; optional eras
     await lockAndUnlock(REAL);
     await A.page.waitForFunction(() => /Wrong username or passphrase/.test(document.body.textContent), null, { timeout: 30000 });
     assert.equal(await A.page.$$eval(tid('contact-Bob'), (e) => e.length), 0);
+
+    // Wrong tries make you WAIT (nothing is erased by default), and the wait survives a reload.
+    for (let i = 0; i < 4; i++) {
+      await userReady(A.page); await A.page.fill(tid('unlock-pass'), `wrong guess number ${i}`); await A.page.click(tid('unlock'));
+      await A.page.waitForFunction(() => !document.querySelector('[data-testid="unlock"]').textContent.startsWith('Unlocking'), null, { timeout: 30000 });
+    }
+    await A.page.waitForFunction(() => /Try again in (2\d|30) seconds/.test(document.querySelector('[data-testid="unlock"]').textContent), null, { timeout: 10000 });
+    assert.equal(await A.page.$eval(tid('unlock'), (b) => b.disabled), true);
+    await A.page.reload();
+    await A.page.waitForFunction(() => /Try again in/.test(document.querySelector('[data-testid="unlock"]')?.textContent || ''), null, { timeout: 15000 });
     for (const p of [A, B]) assert.deepEqual(p.errors, []);
   } finally { await browser.close(); }
 });
@@ -543,18 +553,130 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     assert.equal(await B.page.evaluate(() => /hello world/.test(document.querySelector('[data-testid="log"]').textContent)), false);
     assert.match(await A.page.textContent(tid('log')), /hello world/, 'still on the sender’s phone');
 
+    // --- media, links and docs: one screen per contact, opened from the photo at the top of the chat ---
+    await A.page.setInputFiles(tid('file-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await A.page.click(tid('modal-send'));
+    await A.page.setInputFiles(tid('file-input'), { name: 'notes.txt', mimeType: 'text/plain', buffer: Buffer.from('meeting at 6') });
+    await A.page.click(tid('modal-send'));
+    await send(A, 'directions: https://example.org/map?x=1');
+    await B.page.waitForFunction(() => document.querySelectorAll('[data-testid="msg-in"]').length >= 4, null, { timeout: 20000 });
+    await A.page.click(tid('chat-title'));
+    assert.match(await A.page.textContent(tid('open-shared')), /Media, links and docs\s*3/);
+    await A.page.click(tid('open-shared'));
+    assert.deepEqual(await A.page.$$eval('.tabs button', (b) => b.map((x) => x.textContent)), ['Media 1', 'Docs 1', 'Links 1']);
+    await A.page.click('[data-testid="shared-media"] .thumb');
+    await A.page.waitForFunction(() => document.querySelector('[data-testid="viewer-image"]')?.naturalWidth > 0, null, { timeout: 10000 });
+    await A.page.click(tid('modal-false'));
+    await A.page.click(tid('tab-docs'));
+    assert.match(await A.page.textContent(tid('shared-docs')), /notes\.txt/);
+    await A.page.click(tid('tab-links'));
+    assert.match(await A.page.textContent(tid('shared-links')), /example\.org\/map/);
+    await A.page.click(tid('back')); await A.page.click(tid('back'));
+
     // --- username login: remembered and prefilled; a wrong one counts as a wrong attempt ---
     await A.page.click(tid('back')); await A.page.click(tid('lock'));
     await userReady(A.page);
     assert.equal(await A.page.inputValue(tid('unlock-user')), 'alice_test');
     await A.page.fill(tid('unlock-user'), 'mallory');
     await A.page.fill(tid('unlock-pass'), PASS); await A.page.click(tid('unlock'));
-    await A.page.waitForFunction(() => /Wrong username or passphrase\. 9 tries left/.test(document.body.textContent), null, { timeout: 15000 });
+    await A.page.waitForFunction(() => document.querySelector('.error')?.textContent === 'Wrong username or passphrase.', null, { timeout: 15000 });
     await A.page.fill(tid('unlock-user'), '@Alice_Test');
     await A.page.fill(tid('unlock-pass'), PASS); await A.page.click(tid('unlock'));
     await A.page.waitForSelector(tid('contact-Bob'), { timeout: 30000 });
+
+    // --- history is on by default now, and it keeps PHOTOS and files, not just text ---
+    await A.page.click(tid('contact-Bob'));
+    await A.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"] img.attach')].some((i) => i.naturalWidth > 0), null, { timeout: 20000 });
+    assert.match(await A.page.textContent(tid('log')), /notes\.txt[\s\S]*directions/);
     for (const p of [A, B]) assert.deepEqual(p.errors, []);
   } catch (e) { console.error('DEBUG', A.errors, B.errors); throw e; } finally { await browser.close(); }
+});
+
+test('a new phone: backup file, online login (username + passphrase) and move-to-phone — chats come along, messaging keeps working', { timeout: 300000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const PASS = 'correct horse battery staple';
+  const A = await profile(browser, 'alice-old'), B = await profile(browser, 'bob-move');
+  const P = [A, B];
+  const logHas = (p, t) => p.page.waitForFunction((x) => (document.querySelector('[data-testid="log"]')?.textContent || '').includes(x), t, { timeout: 30000 });
+  const openBob = async (p) => { await p.page.waitForSelector(tid('contact-Bob'), { timeout: 30000 }); await p.page.click(tid('contact-Bob')); };
+  try {
+    await onboard(A, 'Alice', PASS); await onboard(B, 'Bob', 'another long passphrase');
+    await pairByText(A, B);
+    await B.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
+    await send(A, 'before backup');
+    await logHas(B, 'before backup');
+
+    // --- 1. backup file ---
+    await A.page.click(tid('back')); await A.page.click(tid('settings'));
+    await A.page.click(tid('backup-file'));
+    await A.page.fill(tid('confirm-pass'), PASS);
+    const [dl] = await Promise.all([A.page.waitForEvent('download', { timeout: 60000 }), A.page.click(tid('modal-ok'))]);
+    assert.match(dl.suggestedFilename(), /^murmur-backup-\d{4}-\d\d-\d\d\.murmur$/);
+    const file = join(mkdtempSync(join(tmpdir(), 'murmur-bk-')), dl.suggestedFilename());
+    await dl.saveAs(file); // downloads vanish with the browser profile, and this "phone" is about to be lost
+    // The conversation moves on after the backup, then the old phone is lost.
+    await A.page.click(tid('back')); await openBob(A);
+    await send(A, 'after the backup');
+    await logHas(B, 'after the backup');
+    await send(B, 'reply after backup');
+    await logHas(A, 'reply after backup');
+    await A.page.context().close();
+
+    const C = await profile(browser, 'alice-restored'); P.push(C);
+    await C.page.click(tid('have-account')); await C.page.click(tid('restore-file'));
+    await C.page.setInputFiles(tid('restore-file'), file);
+    await C.page.fill(tid('restore-pass'), 'not my passphrase'); await C.page.click(tid('restore-go'));
+    await C.page.waitForFunction(() => /Wrong passphrase/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 30000 });
+    await C.page.fill(tid('restore-pass'), PASS); await C.page.click(tid('restore-go'));
+    await openBob(C);
+    await logHas(C, 'before backup'); // history came back
+    await send(C, 'hello from my restored phone');   // held until the secure link is renewed
+    await logHas(B, 'restored Murmur on a new phone');
+    await logHas(B, 'hello from my restored phone');
+    await send(B, 'welcome back');
+    await logHas(C, 'welcome back');
+
+    // --- 2. online backup → log in on another phone with just username + passphrase ---
+    await C.page.click(tid('back')); await C.page.click(tid('settings'));
+    await C.page.click(tid('online-toggle'));
+    await C.page.fill(tid('confirm-pass'), PASS); await C.page.click(tid('modal-ok'));
+    await C.page.waitForFunction(() => /^On — last backup/.test(document.querySelector('[data-testid="online-status"]')?.textContent || ''), null, { timeout: 60000 });
+    await C.page.context().close();
+
+    const D = await profile(browser, 'alice-login'); P.push(D);
+    await D.page.click(tid('have-account')); await D.page.click(tid('restore-online'));
+    await D.page.fill(tid('login-user'), 'alice_test'); await D.page.fill(tid('login-pass'), 'wrong passphrase here');
+    await D.page.click(tid('login-go'));
+    await D.page.waitForFunction(() => /No online backup found/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 60000 });
+    await D.page.fill(tid('login-pass'), PASS); await D.page.click(tid('login-go'));
+    await openBob(D);
+    await logHas(D, 'welcome back');
+    await send(D, 'logged in on yet another phone');
+    await logHas(B, 'logged in on yet another phone');
+    await send(B, 'got it');
+    await logHas(D, 'got it');
+
+    // --- 3. move to a new phone: exact copy, then the old phone erases itself ---
+    await D.page.click(tid('back')); await D.page.click(tid('settings'));
+    await D.page.click(tid('move-start'));
+    await D.page.fill(tid('confirm-pass'), PASS); await D.page.click(tid('modal-ok'));
+    await D.page.waitForFunction(() => document.querySelector('[data-testid="move-code"]')?.value.startsWith('murmur-move:'), null, { timeout: 60000 });
+    const code = await D.page.inputValue(tid('move-code'));
+    const E = await profile(browser, 'alice-moved'); P.push(E);
+    await E.page.click(tid('have-account')); await E.page.click(tid('restore-move'));
+    await E.page.fill(tid('move-paste'), code); await E.page.click(tid('move-paste-go'));
+    await userReady(E.page);
+    assert.equal(await E.page.inputValue(tid('unlock-user')), 'alice_test', 'same username, remembered');
+    await E.page.fill(tid('unlock-pass'), PASS); await E.page.click(tid('unlock'));
+    await D.page.waitForSelector(tid('get-started'), { timeout: 30000 }); // the old phone erased itself
+    await openBob(E);
+    await logHas(E, 'got it');
+    await send(E, 'moved without a backup file');
+    await logHas(B, 'moved without a backup file');
+    await send(B, 'still here');
+    await logHas(E, 'still here');
+    for (const p of P) assert.deepEqual(p.errors.filter((e) => !/WebSocket connection/.test(e)), [], p.name);
+  } catch (e) { for (const p of P) console.error('DEBUG', p.errors); throw e; } finally { await browser.close(); }
 });
 
 test('voice & video calls: ring, accept, media flows both ways, mute, hang up, decline, and call permissions', { timeout: 240000 }, async () => {
@@ -693,6 +815,13 @@ async function linkFriends(from, to, toPass) {
   await to.page.waitForSelector(tid('verify-banner'));
   await to.page.click(tid('back'));
 }
+/** A real finger: touch pointer events, and — like every touchscreen — pointerleave right after pointerup. */
+const touchHold = async (page, selector, ms) => {
+  await page.$eval(selector, (el) => { const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 7, isPrimary: true, bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+    el.dispatchEvent(new PointerEvent('pointerdown', o)); el.__o = o; });
+  await page.waitForTimeout(ms);
+  await page.$eval(selector, (el) => { el.dispatchEvent(new PointerEvent('pointerup', el.__o)); el.dispatchEvent(new PointerEvent('pointerleave', el.__o)); });
+};
 const holdButton = async (page, selector, ms) => {
   const box = await page.locator(selector).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
@@ -790,6 +919,24 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await holdButton(P.Carol.page, tid('voice'), 800);
     await P.Carol.page.waitForFunction(() => /Couldn’t start recording/.test(document.body.textContent), null, { timeout: 5000 });
     assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0);
+    // --- on a TOUCHSCREEN: lifting the finger also fires pointerleave; that must not count as "slide away to cancel" ---
+    await touchHold(P.Carol.page, tid('voice'), 1600);
+    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
+    await P.Carol.page.click(tid('modal-cancel'));
+    // --- a quick tap locks recording on; a second tap finishes it ---
+    await touchHold(P.Carol.page, tid('voice'), 150);
+    await P.Carol.page.waitForFunction(() => /tap the mic again/.test(document.body.textContent), null, { timeout: 5000 });
+    await P.Carol.page.waitForTimeout(1200);
+    await touchHold(P.Carol.page, tid('voice'), 50);
+    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
+    await P.Carol.page.click(tid('modal-cancel'));
+    // --- sliding the finger well away from the button cancels ---
+    await P.Carol.page.$eval(tid('voice'), (el) => { const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 9, isPrimary: true, bubbles: true, clientX: r.x + 5, clientY: r.y + 5 };
+      el.dispatchEvent(new PointerEvent('pointerdown', o)); el.__o = o; });
+    await P.Carol.page.waitForTimeout(1200);
+    await P.Carol.page.$eval(tid('voice'), (el) => { const o = { ...el.__o, clientY: el.__o.clientY - 200 }; el.dispatchEvent(new PointerEvent('pointermove', o)); el.dispatchEvent(new PointerEvent('pointerup', o)); });
+    await P.Carol.page.waitForTimeout(800);
+    assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0, 'slid away: discarded');
     // --- walkie-talkie: by default you hear the clip first; Delete sends nothing, Send sends it ---
     await holdButton(P.Carol.page, tid('voice'), 1600);
     await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });

@@ -22,7 +22,11 @@ import { contactId } from './identity.js';
 import { Ratchet } from './ratchet.js';
 import * as INV from './invite.js';
 
-const V = 1, KIND_MSG = 5;
+const V = 1, KIND_MSG = 5, KIND_RESYNC = 6;
+// KIND_RESYNC: [V, 6, invite]. Sent by a phone that was restored from a backup, whose ratchet
+// state may be older than the conversation. The invite is signed by its identity key, so a
+// contact accepts it only if that key is the one it already has for this person — nobody else
+// can re-key a conversation. Never creates a contact. Replays are refused (created/id).
 export const MAX_ENVELOPE = 1024 * 1024; // must match relay MAX_MESSAGE
 const DAY = 86400_000;
 const dayOf = (t) => Math.floor(t / DAY);
@@ -79,7 +83,9 @@ export class Remote {
   }
 
   has(cid) { return !!this.peers[cid]; }
-  canSend(cid) { const p = this.peers[cid]; return !!p && Ratchet.fromJSON(p.ratchet).canSend; }
+  canSend(cid) { const p = this.peers[cid]; return !!p && (!!p.resync || Ratchet.fromJSON(p.ratchet).canSend); }
+  /** Contacts still waiting to renew the secure link after a restore. */
+  resyncing() { return Object.entries(this.peers).filter(([, p]) => p.resync).map(([cid]) => cid); }
   forget(cid) {
     return this.#serial(async () => {
       delete this.peers[cid];
@@ -193,6 +199,8 @@ export class Remote {
     return this.#serial(async () => {
       const p = this.peers[cid];
       if (!p) throw new Error('No internet link with this contact yet');
+      // After a restore: hold messages (encrypted at rest in the vault) until the link is renewed.
+      if (p.resync) { if (appMsg.t !== 'ack') { (p.held ||= []).push(appMsg); await this.#savePeers(); } return 'held'; }
       const r = Ratchet.fromJSON(p.ratchet);
       if (!r.canSend) throw new Error('Waiting for their first message before you can write');
       const wire = await r.encrypt(utf8(JSON.stringify(appMsg)));
@@ -200,6 +208,20 @@ export class Remote {
       const env = concat(new Writer().u8(V).u8(KIND_MSG).u32(day).done(), await this.#tag(day, this.identity.publicRaw, fromB64u(p.pub)), wire);
       p.ratchet = r.toJSON(); await this.#savePeers();   // ratchet advanced: persist BEFORE the bytes leave
       await this.#enqueue({ cid, to: p.inbox, mid: appMsg.t === 'ack' ? null : appMsg.id || null }, toB64u(env));
+    }).then((v) => { if (this.online) this.flush(); return v; });
+  }
+
+  /** After restoring a backup: ask every contact to renew the secure link (see KIND_RESYNC). */
+  resyncAll(origin = 'https://local.invalid') {
+    return this.#serial(async () => {
+      for (const [cid, p] of Object.entries(this.peers)) {
+        const inv = await INV.createInvite({ identity: this.identity, name: this.getName(), inbox: this.addressBytes, now: this.now(), ttlS: INV.INVITE_TTL_S });
+        const t = Math.floor(this.now() / 1000);
+        this.rec.invites = [...this.rec.invites.filter((i) => i.expires > t), { ...inv.pending, resync: cid }].slice(-50);
+        p.resync = { id: inv.pending.id, at: t };
+        await this.#enqueue({ cid, to: p.inbox, mid: null }, toB64u(concat(Uint8Array.of(V, KIND_RESYNC), inv.bytes)));
+      }
+      await this.#saveRec(); await this.#savePeers();
     }).then(() => { if (this.online) this.flush(); });
   }
 
@@ -207,6 +229,7 @@ export class Remote {
   async #receive(relayId, data) {
     try {
       if (INV.isJoin(data)) await this.#onJoin(data);
+      else if (data[0] === V && data[1] === KIND_RESYNC) await this.#onResync(data.slice(2));
       else if (data[0] === V && data[1] === KIND_MSG && data.length > 22) await this.#onMessage(data);
     } catch (e) {
       this.emit('warning', `Dropped an undecryptable message (${e.message})`);
@@ -229,6 +252,23 @@ export class Remote {
     throw new Error('unknown sender');
   }
 
+  /** A contact restored their phone and asks to renew the link. Only their KNOWN identity can. */
+  async #onResync(inviteBytes) {
+    const inv = await INV.parseInvite(inviteBytes, { now: this.now() });   // signature + expiry checked
+    const cid = await contactId(inv.identityPub);
+    const p = this.peers[cid];
+    if (!p || !equal(fromB64u(p.pub), inv.identityPub)) throw new Error('resync from someone who is not a contact');
+    const id = toHex(inv.inviteId);
+    if (inv.created < (p.resyncAt || 0) || (p.resyncIds || []).includes(id)) throw new Error('replayed resync');
+    const { join, ratchet, peer } = await INV.acceptInvite(inv, { identity: this.identity, name: this.getName(), inbox: this.addressBytes, now: this.now() });
+    Object.assign(p, { ratchet: ratchet.toJSON(), inbox: toB64u(peer.inbox), resyncAt: inv.created, resyncIds: [...(p.resyncIds || []), id].slice(-10) });
+    await this.#savePeers();
+    await this.#enqueue({ cid, to: p.inbox, mid: null }, toB64u(join));
+    this.emit('resynced', cid, { initiator: false });
+    // A first message lets them write back immediately (the inviter side can't send first).
+    queueMicrotask(() => this.send(cid, { t: 'hello', name: this.getName() }).catch(() => {}));
+  }
+
   async #onJoin(data) {
     const id = INV.joinInviteId(data);
     const pending = this.rec.invites.find((i) => i.id === id);
@@ -237,6 +277,17 @@ export class Remote {
     this.rec.invites = this.rec.invites.filter((i) => i.id !== id); // single use
     await this.#saveRec();
     const cid = await contactId(peer.identityPub);
+    if (pending.resync) {
+      // Our own renewal came back: only from the contact we asked, then release held messages.
+      const p = this.peers[pending.resync];
+      if (!p || cid !== pending.resync) throw new Error('renewal answered by someone else');
+      const held = p.held || [];
+      Object.assign(p, { ratchet: ratchet.toJSON(), inbox: toB64u(peer.inbox) }); delete p.resync; delete p.held;
+      await this.#savePeers();
+      this.emit('resynced', cid, { initiator: true, released: held.length });
+      if (held.length) queueMicrotask(async () => { for (const m of held) await this.send(cid, m).catch(() => {}); });
+      return;
+    }
     this.peers[cid] = { pub: toB64u(peer.identityPub), inbox: toB64u(peer.inbox), ratchet: ratchet.toJSON() };
     await this.#savePeers();
     this.emit('joined', { cid, name: peer.name, pub: peer.identityPub, viaInvite: true });

@@ -1,7 +1,7 @@
 // app.js — Murmur's UI controller. Views are plain functions that rebuild
 // #app from state. All persistence goes through the encrypted Vault.
 
-import { Vault, WrongPassphraseError, VaultWipedError, MIN_PASSPHRASE } from './core/vault.js';
+import { Vault, WrongPassphraseError, VaultWipedError, LockedOutError, MIN_PASSPHRASE } from './core/vault.js';
 import { IdbStore } from './core/storage.js';
 import { Conversation, MAX_FILE, MAX_TEXT, APP_VERSION, newId, fileExtra } from './core/conversation.js';
 import { Remote } from './core/remote.js';
@@ -13,12 +13,14 @@ import { validLocation, relative, formatCoords, mapLinks } from './core/geo.js';
 import { createGroup, applyInvite, inviteMessage, isMember, withoutMember, recipients, GroupError } from './core/groups.js';
 import { contactId, safetyNumber } from './core/identity.js';
 import { toQrText, toPasteText, fromText, PairingError, clampName } from './core/pairing.js';
-import { toB64u, fromB64u, equal, toHex } from './core/bytes.js';
+import { toB64u, fromB64u, equal, toHex, utf8, random } from './core/bytes.js';
 import { encodeQR } from './qr/encode.js';
 import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
+import * as BK from './core/backup.js';
+import { readBox, writeBox } from './core/relaybox.js';
 import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
 import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
@@ -29,7 +31,7 @@ const SLOTS = slots(store); // a = real vault, b = duress decoy or placeholder (
 
 const TTL_OPTIONS = [[0, 'Off'], [30, '30 seconds'], [300, '5 minutes'], [3600, '1 hour'], [86400, '1 day']];
 const LOCK_OPTIONS = [[1, '1 minute'], [5, '5 minutes'], [15, '15 minutes'], [60, '1 hour']];
-const WIPE_OPTIONS = [[0, 'Never'], [5, 'After 5 wrong tries'], [10, 'After 10 wrong tries'], [20, 'After 20 wrong tries']];
+const WIPE_OPTIONS = [[0, 'Never (recommended)'], [10, 'After 10 wrong tries'], [20, 'After 20 wrong tries']];
 
 /** In-memory state. Everything here disappears on lock. */
 const S = {
@@ -99,13 +101,62 @@ function modal({ title, body, actions }) {
 async function persistContacts() {
   await S.vault.putRecord('contacts', [...S.contacts.values()]);
 }
-async function persistHistory(id) {
+// History (if kept) holds text, photos, voice notes, files, locations and call logs — all inside
+// the encrypted vault. Each file's bytes are their own record (media/<contact>/<message>), written
+// once; the history list only references them. Disappearing messages are never stored.
+const MEDIA = (id, mid) => `media/${id}/${mid}`;
+const HISTORY_MAX = 2000;
+const persistQueue = new Map(); // one save at a time per chat, in order
+function persistHistory(id) {
+  const next = (persistQueue.get(id) || Promise.resolve()).then(() => saveHistory(id)).catch((e) => console.warn('history save:', e.message));
+  persistQueue.set(id, next);
+  return next;
+}
+async function saveHistory(id) {
   const c = S.contacts.get(id);
-  if (!c) return;
-  if (!c.keepHistory) { await S.vault.deleteRecord(`history/${id}`); return; }
-  const msgs = (S.chats.get(id) || []).filter((m) => (m.text != null || m.deleted) && !m.ttl && !m.system)
-    .map(({ id: mid, dir, ts, text, status, edited, deleted }) => ({ id: mid, dir, ts, text, status, edited, deleted }));
-  await S.vault.putRecord(`history/${id}`, msgs.slice(-2000));
+  if (!c || !S.vault) return;
+  const had = c.media || [];
+  if (!c.keepHistory) {
+    await S.vault.deleteRecord(`history/${id}`);
+    for (const mid of had) await S.vault.deleteRecord(MEDIA(id, mid));
+    if (had.length) { c.media = []; await persistContacts(); }
+    return;
+  }
+  const out = [];
+  for (const m of (S.chats.get(id) || []).slice(-HISTORY_MAX)) {
+    if (m.ttl) continue;
+    const base = { id: m.id, dir: m.dir, ts: m.ts, status: m.status, edited: m.edited, deleted: m.deleted, system: m.system };
+    if (m.file && !m.deleted) {
+      if (!m.file.stored && m.file.blob) {
+        const bytes = new Uint8Array(await m.file.blob.arrayBuffer());
+        await S.vault.putRecord(MEDIA(id, m.id), { name: m.file.name, mime: m.file.mime, kind: m.file.kind || null, b: toB64u(bytes) });
+        m.file.stored = true;
+      }
+      if (m.file.stored) out.push({ ...base, file: { name: m.file.name, mime: m.file.mime, size: m.file.size, kind: m.file.kind || null } });
+    } else if (m.loc && !m.deleted) out.push({ ...base, loc: m.loc });
+    else if (m.sos && !m.deleted) out.push({ ...base, sos: m.sos });
+    else if (m.text != null || m.deleted) out.push({ ...base, text: m.deleted ? undefined : m.text });
+  }
+  await S.vault.putRecord(`history/${id}`, out);
+  // Files that were deleted (for me or for everyone), cleared or aged out: remove their bytes too.
+  const keep = new Set(out.filter((x) => x.file).map((x) => x.id));
+  for (const mid of had) if (!keep.has(mid)) await S.vault.deleteRecord(MEDIA(id, mid));
+  const now = [...keep];
+  if (now.length !== had.length || now.some((x, i) => x !== had[i])) { c.media = now; await persistContacts(); }
+}
+/** After unlock: turn stored file entries back into viewable photos/voice notes (in the background). */
+async function hydrateMedia(id) {
+  for (const m of S.chats.get(id) || []) {
+    if (!m.file || m.file.url || !m.file.stored) continue;
+    const rec = await S.vault?.getRecord(MEDIA(id, m.id), null);
+    if (!S.vault) return; // locked meanwhile
+    if (!rec) { m.file.missing = true; continue; }
+    const fm = await fileMessage({ id: m.id, dir: m.dir, ts: m.ts, status: m.status }, rec.name, rec.mime, fromB64u(rec.b), rec.kind);
+    m.file = { ...fm.file, stored: true };
+    const el = document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`);
+    if (el && isOpenChat(id)) el.replaceWith(bubble(m, id));
+  }
+  rerenderIf('shared', () => S.viewArgs[0] === id);
 }
 
 function strength(p) {
@@ -147,10 +198,19 @@ async function openVault(vault) {
   S.groups = new Map((await vault.getRecord('groups', [])).map((g) => [g.id, g]));
   for (const c of S.contacts.values()) {
     if (c.verified === undefined) c.verified = !c.remote; // contacts from before internet mode were all paired in person
-    if (c.keepHistory) S.chats.set(c.id, await vault.getRecord(`history/${c.id}`, []));
+    if (c.keepHistory) S.chats.set(c.id, (await vault.getRecord(`history/${c.id}`, [])).map((m) => (m.file ? { ...m, file: { ...m.file, stored: true } } : m)));
   }
   S.lastActivity = Date.now();
+  navigator.storage?.persist?.().catch(() => {}); // ask the browser not to evict our (encrypted) data under storage pressure
+  for (const id of S.chats.keys()) hydrateMedia(id).catch((e) => console.warn('media:', e.message));
   await startRemote().catch((e) => toast(`Internet mode unavailable: ${e.message}`, 'error'));
+  // Restored from a file/online backup (an older copy): renew every secure link once.
+  if (S.remote && S.slot === 'a' && (await store.get('restore/pending'))) {
+    await S.remote.resyncAll().catch((e) => console.warn('resync:', e.message));
+    await store.delete('restore/pending');
+    if (S.remote.resyncing().length) toast('Renewing the secure link with each contact — messages you write now go out as soon as they’re online', 'success', 7000);
+  }
+  setTimeout(() => refreshOnlineBackup().catch((e) => console.warn('online backup:', e.message)), 15_000);
   if (S.pendingInvite) { const t = S.pendingInvite; S.pendingInvite = null; go('acceptinvite', t); } else go('home');
 }
 
@@ -165,7 +225,11 @@ async function startRemote() {
     .on('joined', (j) => onRemoteJoined(j).catch((e) => console.warn(e)))
     .on('sent', (cid, mid) => setMsgStatus(cid, mid, 'sent'))
     .on('send-failed', (cid, mid, why) => { setMsgStatus(cid, mid, 'failed'); toast(why, 'error', 6000); })
-    .on('warning', (w) => console.warn('relay:', w));
+    .on('warning', (w) => console.warn('relay:', w))
+    .on('resynced', (cid, info) => {
+      if (!S.contacts.has(cid)) return;
+      callMsg(cid, info.initiator ? '🔐 Secure link renewed after restoring your account' : `🔐 ${displayName(S.contacts.get(cid))} restored Murmur on a new phone — secure link renewed (same safety number)`);
+    });
   r.start();
 }
 function stopRemote() { S.remote?.stop(); S.remote = null; S.relayOnline = false; }
@@ -179,13 +243,28 @@ function setMsgStatus(cid, mid, status) {
   if (el) el.textContent = STATUS_MARK[status] || '';
   persistHistory(cid).catch(() => {});
 }
-const markDelivered = (cid, mid) => setMsgStatus(cid, mid, 'delivered');
+const ACKED = new Set(); // `${cid}:${mid}` confirmed by the other phone (bounded)
+const markDelivered = (cid, mid) => {
+  ACKED.add(`${cid}:${mid}`); if (ACKED.size > 5000) ACKED.delete(ACKED.values().next().value);
+  setMsgStatus(cid, mid, 'delivered');
+};
+// A nearby (Wi-Fi/hotspot) link can look alive for ~30 s after the other phone has gone
+// (walked out of range, closed, lost). Anything sent over it that isn't confirmed within 5 s
+// is sent again through the relay; the receiver drops the duplicate (same message id).
+const LIVE_CONFIRM_MS = 5000;
+function backstopViaRelay(cid, m) {
+  if (!m?.id) return;
+  setTimeout(() => {
+    if (ACKED.has(`${cid}:${m.id}`) || !S.remote || !hasRemote(cid) || !S.remote.canSend(cid)) return;
+    S.remote.send(cid, m).then(() => setMsgStatus(cid, m.id, S.relayOnline ? 'sent' : 'queued')).catch(() => {});
+  }, LIVE_CONFIRM_MS);
+}
 const STATUS_MARK = { queued: '○', sent: '✓', delivered: '✓✓', failed: '!' };
 
 async function onRemoteJoined({ cid, name, pub }) {
   let c = S.contacts.get(cid);
   if (!c) {
-    c = { id: cid, pub: toB64u(pub), name, alias: '', addedAt: Date.now(), keepHistory: false, ttl: 0, remote: true, verified: false, request: true };
+    c = { id: cid, pub: toB64u(pub), name, alias: '', addedAt: Date.now(), keepHistory: true, ttl: 0, remote: true, verified: false, request: true };
     const look = lookalikeNames(name, [...S.contacts.values()].map(displayName));
     if (look.length) c.lookalike = look;
     S.contacts.set(cid, c);
@@ -428,7 +507,7 @@ async function adoptConversation(conv) {
   const id = await contactId(pub);
   let c = S.contacts.get(id);
   if (!c) {
-    c = { id, pub: toB64u(pub), name: conv.peer.name, alias: '', addedAt: Date.now(), keepHistory: false, ttl: 0 };
+    c = { id, pub: toB64u(pub), name: conv.peer.name, alias: '', addedAt: Date.now(), keepHistory: true, ttl: 0 };
     S.contacts.set(id, c);
   }
   // Scanning each other's codes face to face IS verification.
@@ -487,7 +566,8 @@ VIEWS.welcome = () => h('main.screen.center',
     h('li', h('strong', 'No servers. '), 'Phones connect directly over the same Wi-Fi or a phone hotspot — mobile data can be off.'),
     h('li', h('strong', 'End-to-end encrypted. '), 'Keys are created on this device and never leave it.'),
     h('li', h('strong', 'Nothing in the cloud. '), 'No account, no phone number, no backups. What’s here stays here.')),
-  h('button.primary.big', { onclick: () => go('create'), 'data-testid': 'get-started', autofocus: true }, 'Get started'));
+  h('button.primary.big', { onclick: () => go('create'), 'data-testid': 'get-started', autofocus: true }, 'Get started'),
+  h('button.link', { onclick: () => go('restore'), 'data-testid': 'have-account' }, 'I already have an account'));
 
 VIEWS.create = () => {
   const name = h('input#name', { type: 'text', maxlength: 40, autocomplete: 'off', placeholder: 'e.g. Sam', 'data-testid': 'name', autofocus: true });
@@ -552,16 +632,34 @@ VIEWS.unlock = () => {
     userRow.hidden = !login; // accounts from before usernames: passphrase only, then choose one
   }).catch(() => {}).finally(() => { form.dataset.ready = '1'; });
   const userRow = h('div', { hidden: true }, h('label', { for: 'user' }, 'Username'), user);
+  let cd = 0;
+  const waitText = (ms) => { const s2 = Math.ceil(ms / 1000); return s2 >= 120 ? `${Math.ceil(s2 / 60)} minutes` : `${s2} seconds`; };
+  // Repeated wrong tries make you WAIT (it never erases unless you switched that on in Settings).
+  const countdown = (ms, lead) => {
+    clearInterval(cd); const end = Date.now() + ms;
+    const tick = () => {
+      const left = end - Date.now();
+      if (left <= 0 || !btn.isConnected) { clearInterval(cd); btn.disabled = false; btn.textContent = 'Unlock'; err.textContent = lead; return; }
+      btn.disabled = true; btn.textContent = `Try again in ${waitText(left)}`;
+      err.textContent = `${lead} Too many wrong tries — wait ${waitText(left)}.`;
+    };
+    tick(); cd = setInterval(tick, 1000);
+  };
   const fail = (ex) => {
     btn.disabled = false; btn.textContent = 'Unlock'; p.value = ''; p.focus();
-    if (ex instanceof VaultWipedError) { toast('Too many wrong attempts. Everything was erased.', 'error', 8000); go('welcome'); return; }
-    if (ex instanceof WrongPassphraseError) err.textContent = Number.isFinite(ex.attemptsLeft) ? `Wrong username or passphrase. ${ex.attemptsLeft} tries left before this device is wiped.` : 'Wrong username or passphrase.';
-    else err.textContent = ex.message;
+    if (ex instanceof VaultWipedError) { toast('Too many wrong attempts. Everything was erased (you had switched this on).', 'error', 8000); go('welcome'); return; }
+    if (ex instanceof LockedOutError) { countdown(ex.waitMs, ''); return; }
+    if (ex instanceof WrongPassphraseError) {
+      const lead = Number.isFinite(ex.attemptsLeft) ? `Wrong username or passphrase. ${ex.attemptsLeft} tries left before this device erases itself.` : 'Wrong username or passphrase.';
+      if (ex.waitMs) countdown(ex.waitMs, lead); else err.textContent = lead;
+    } else err.textContent = ex.message;
   };
+  Vault.checkLockout(SLOTS.a).catch((ex) => { if (ex instanceof LockedOutError) countdown(ex.waitMs, ''); }); // still waiting after a reload
   const form = h('form.screen.narrow.center', { 'data-testid': 'unlock-form',
     onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; btn.disabled = true; btn.textContent = 'Unlocking…';
       try {
+        await Vault.checkLockout(SLOTS.a);
         // A wrong username counts exactly like a wrong passphrase.
         if (login && !(await checkLogin(login, user.value))) await Vault.noteFailure(SLOTS.a, () => store.clear());
         // Real passphrase → real chats; duress passcode → the decoy. Nothing on screen says which.
@@ -577,6 +675,7 @@ VIEWS.unlock = () => {
   updateBanner(),
   userRow,
   h('label', { for: 'pass' }, 'Passphrase'), p, err, btn,
+  h('button.link', { type: 'button', onclick: () => go('restore'), 'data-testid': 'restore-here' }, 'Restore or move another account to this phone'),
   h('button.link', { type: 'button', onclick: panicWipe, 'data-testid': 'forgot' }, 'Forgot it? Erase this device and start over'));
   return form;
 };
@@ -600,10 +699,10 @@ async function chooseUsername() {
   }
 }
 
-function header(title, { back, actions = [] } = {}) {
+function header(title, { back, actions = [], lead = null, onTitle = null } = {}) {
   return h('header.bar',
     back ? h('button.icon', { onclick: back, 'aria-label': 'Back', 'data-testid': 'back' }, icon('back')) : h('div.logo.sm', icon('shield', 20)),
-    h('h1', title),
+    onTitle ? h('button.titlebtn', { type: 'button', onclick: onTitle, 'data-testid': 'chat-title' }, lead, h('h1', title)) : [lead, h('h1', title)],
     h('div.actions', actions));
 }
 
@@ -689,7 +788,7 @@ VIEWS.acceptinvite = (text = '') => {
       try {
         const cid = await S.remote.acceptInvite(info.inv, { t: 'hello', name: S.profile.name });
         let c = S.contacts.get(cid);
-        if (!c) { c = { id: cid, pub: toB64u(info.pub), name: info.name, alias: '', addedAt: Date.now(), keepHistory: false, ttl: 0, remote: true, verified: false, request: false }; S.contacts.set(cid, c); }
+        if (!c) { c = { id: cid, pub: toB64u(info.pub), name: info.name, alias: '', addedAt: Date.now(), keepHistory: true, ttl: 0, remote: true, verified: false, request: false }; S.contacts.set(cid, c); }
         else c.remote = true;
         await persistContacts();
         toast(`Joined ${displayName(c)} 🔒`, 'success');
@@ -942,6 +1041,7 @@ function bubble(m, key = S.viewArgs?.[0]) {
     if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': m.file.kind === 'voice' ? 'voice-clip' : 'audio' }));
     if (m.file.url && m.file.playable === 'video') body.push(h('video.attach', { controls: true, playsinline: true, preload: 'metadata', src: m.file.url, 'data-testid': 'video' }));
     if (sf && sf.verdict !== 'ok') body.push(h(`p.filewarn.${sf.verdict}`, { 'data-testid': 'file-warning' }, icon('alert', 14), ` ${sf.reasons[0]}`));
+    if (!m.file.url && m.file.stored && !m.file.missing) body.push(h('p.hint', 'Loading…'));
     body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`, h('span.save', 'Save')) : h('span.file', m.file.name));
   }
   return h(`div.msg.${m.dir}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
@@ -987,6 +1087,7 @@ VIEWS.chat = (id) => {
       if (isOnline(id)) {
         const m = await S.convs.get(id).sendText(text, c.ttl);
         addMessage(id, { ...m, dir: 'out', status: 'sent' });
+        backstopViaRelay(id, m);
       } else {
         const m = { t: 'msg', id: newId(), ts: Date.now(), text, ttl: c.ttl | 0 };
         addMessage(id, { ...m, dir: 'out', status: 'queued' });
@@ -1014,6 +1115,8 @@ VIEWS.chat = (id) => {
   const view = h('div.screen.chat',
     header(displayName(c), {
       back: () => go('home'),
+      lead: avatar(c, { size: 'sm', online: live }),
+      onTitle: () => go('contact', id),
       actions: [h('span.pill', { 'data-online': live, 'data-kind': linkState(id)[1], 'data-testid': 'conn-state' }, linkState(id)[0]),
         ...(online ? [
           callButtons(c).voice ? h('button.icon', { onclick: () => startCall(id, false), 'aria-label': 'Voice call', 'data-testid': 'call-voice' }, icon('phone')) : null,
@@ -1049,7 +1152,11 @@ VIEWS.chat = (id) => {
 // ---- one way to send, whichever path is available ----
 /** Sends an app message to one contact: live session if connected, else the relay. → 'sent' | 'queued' */
 async function deliver(cid, m) {
-  if (isOnline(cid)) { await S.convs.get(cid).sendApp(m); return 'sent'; }
+  if (isOnline(cid)) {
+    await S.convs.get(cid).sendApp(m);
+    if (['loc', 'sos', 'gmsg'].includes(m.t)) backstopViaRelay(cid, m); // the ones that get receipts
+    return 'sent';
+  }
   if (hasRemote(cid) && S.remote.canSend(cid)) { await S.remote.send(cid, m); return S.relayOnline ? 'sent' : 'queued'; }
   throw new Error(`${displayName(S.contacts.get(cid) || { name: 'Contact' })} isn't reachable yet`);
 }
@@ -1113,22 +1220,34 @@ async function prepareOutgoing(file) {
 }
 
 // ---- walkie-talkie: press and hold to talk, release to send ----
+// Gestures (touch and mouse):
+//   hold, talk, lift            → finished (review or send)
+//   quick tap                   → recording stays on ("locked"); tap again to finish
+//   hold and slide far away     → cancelled
+// NOTE: touchscreens fire pointerleave right AFTER pointerup. Treating that as "cancel" threw
+// every iPhone clip away (the browser tests used a mouse, which doesn't). Cancel is now
+// decided by distance, with pointer capture, never by pointerleave.
+const VOICE_LOCK_MS = 600, VOICE_CANCEL_PX = 90;
 function voiceButton(onClip, disabled) {
-  const btn = h('button.icon.mic', { type: 'button', disabled, 'aria-label': 'Hold to talk', 'data-testid': 'voice', title: 'Hold to talk' }, icon('mic'));
-  let rec = null, stream = null, held = false, cancelled = false, started = 0, timer = 0, busy = false;
+  const btn = h('button.icon.mic', { type: 'button', disabled, 'aria-label': 'Hold to talk, or tap to start and tap again to stop', 'data-testid': 'voice', title: 'Hold to talk · tap to lock' }, icon('mic'));
+  let rec = null, stream = null, held = false, cancelled = false, locked = false, started = 0, timer = 0, busy = false, sx = 0, sy = 0;
   // Every way out (stop, cancel, error, exception) goes through here, so the button can never get stuck.
   const reset = () => {
     clearTimeout(timer); stream?.getTracks().forEach((t) => t.stop());
-    rec = null; stream = null; busy = false; btn.classList.remove('rec');
+    rec = null; stream = null; busy = false; locked = false; btn.classList.remove('rec', 'locked');
   };
   const stop = () => { clearTimeout(timer); if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch { reset(); } } };
+  const cancel = () => { if (rec) { cancelled = true; setStatusLine('Cancelled'); } held = false; stop(); };
+  const lock = () => { locked = true; btn.classList.add('locked'); setStatusLine('● Recording… tap the mic again to finish'); };
   btn.addEventListener('pointerdown', async (e) => {
-    e.preventDefault(); if (busy || btn.disabled) return;
-    busy = true; held = true; cancelled = false;
+    e.preventDefault(); if (btn.disabled) return;
+    if (rec && locked) { held = false; stop(); return; } // second tap finishes a locked recording
+    if (busy) return;
+    busy = true; held = true; cancelled = false; locked = false; sx = e.clientX; sy = e.clientY;
+    try { btn.setPointerCapture?.(e.pointerId); } catch { /* synthetic or already released */ }
     try {
       try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
       catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); reset(); return; }
-      if (!held) { toast('Hold the button while you talk'); reset(); return; } // released during the permission prompt
       const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
       const chunks = [];
       // Deliberately NO bitrate option and NO timeslice: WebKit ignores bitrates, and Safari 26 emits
@@ -1141,20 +1260,31 @@ function voiceButton(onClip, disabled) {
         const dur = Date.now() - started; const bytes = chunks.reduce((n, c) => n + c.size, 0);
         reset(); setStatusLine('');
         if (cancelled) return;
-        if (dur <= 500) { toast('Too short — hold the button while you talk'); return; }
+        if (dur <= 500) { toast('Too short — hold the mic while you talk, or tap it once to start'); return; }
         if (!bytes) { toast('Your phone gave Murmur no sound. Close other apps using the microphone and try again.', 'error', 7000); return; }
         onClip(new File(chunks, `voice-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm'}`, { type: mime }), dur);
       };
       started = Date.now(); r.start(); btn.classList.add('rec');
-      setStatusLine('● Recording… release to finish · slide away to cancel');
+      setStatusLine('● Recording… lift to finish · slide away to cancel');
       timer = setTimeout(stop, 120_000); // 2 minutes max
-      if (!held) stop(); // finger already lifted while we were starting
+      if (!held) lock(); // finger lifted while the mic was starting (e.g. first-time permission): keep recording, tap to stop
     } catch (err) {
       toast(`Couldn’t start recording: ${err.message}`, 'error', 6000); reset(); setStatusLine('');
     }
   });
-  btn.addEventListener('pointerup', () => { held = false; stop(); });
-  for (const ev of ['pointerleave', 'pointercancel']) btn.addEventListener(ev, () => { if (rec) { cancelled = true; setStatusLine('Cancelled'); } held = false; stop(); });
+  btn.addEventListener('pointermove', (e) => {
+    if (held && rec && !locked && Math.hypot(e.clientX - sx, e.clientY - sy) > VOICE_CANCEL_PX) cancel();
+  });
+  btn.addEventListener('pointerup', (e) => {
+    if (!held) return;
+    held = false;
+    if (!rec) return; // still starting: the start code locks it
+    if (Math.hypot(e.clientX - sx, e.clientY - sy) > VOICE_CANCEL_PX) { cancel(); return; }
+    if (Date.now() - started < VOICE_LOCK_MS) { lock(); return; } // a tap, not a hold
+    stop();
+  });
+  // The system took the touch (call, notification, gesture): keep what was said — the review step lets you delete it.
+  btn.addEventListener('pointercancel', () => { if (held && rec && !locked) { held = false; stop(); } });
   btn.addEventListener('contextmenu', (e) => e.preventDefault());
   return btn;
 }
@@ -1297,6 +1427,7 @@ async function onAppMessage(cid, m) {
     }
     case 'sos': {
       if (c.request) return; // strangers can't trigger alarms
+      if (findMsg(cid, m.id)) { ack(); return; } // same SOS arrived twice (nearby + relay backstop): one alarm
       const loc = validLocation(m.loc) ? { lat: m.loc.lat, lon: m.loc.lon, acc: m.loc.acc } : null;
       const text = String(m.text || 'SOS').slice(0, 500);
       addMessage(cid, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), sos: { text, loc } }); ack();
@@ -1902,6 +2033,8 @@ VIEWS.contact = (id) => {
     header(displayName(c), { back: () => go('chat', id) }),
     h('div.panel',
       h('div.who', avatar(c, { size: 'xl' }), h('div', h('strong', c.name), c.username ? h('p.handle', { 'data-testid': 'contact-username' }, `@${c.username}`) : null)),
+      (() => { const k = sharedItems(id); return h('button.sharedbtn', { type: 'button', onclick: () => go('shared', id), 'data-testid': 'open-shared' },
+        icon('image', 20), h('span', 'Media, links and docs'), h('span.count', String(k.media.length + k.docs.length + k.links.length))); })(),
       h('h2', 'Calls'),
       h('label.toggle', h('input', { type: 'checkbox', checked: !c.noCalls, 'data-testid': 'allow-calls-from', onchange: async (e) => {
         c.noCalls = !e.target.checked; await persistContacts(); syncProfiles([id]);
@@ -1920,7 +2053,7 @@ VIEWS.contact = (id) => {
       h('div.row', alias, h('button', { onclick: async () => { c.alias = clampName(alias.value); await persistContacts(); toast('Saved'); } }, 'Save')),
       h('h2', 'History'),
       h('label.toggle', keep, ' Keep encrypted history on this device'),
-      h('p.hint', 'Off (default): messages exist only in memory and vanish when you lock or close Murmur. On: stored encrypted with your passphrase. Files and disappearing messages are never stored.'),
+      h('p.hint', 'On (default for new contacts): messages, photos, voice notes and files are kept on this phone, encrypted with your passphrase. Off: they exist only in memory and vanish when you lock or close Murmur. Disappearing messages are never stored.'),
       h('button', { onclick: async () => { c.keepHistory = keep.checked; await persistContacts(); await persistHistory(id); toast(c.keepHistory ? 'History will be kept (encrypted)' : 'History deleted from storage'); } }, 'Apply'),
       h('h2', 'Danger zone'),
       h('div.share',
@@ -1933,9 +2066,350 @@ async function deleteContact(id) {
   if (!c || !(await modal({ title: `Delete ${displayName(c)}?`, body: 'This removes the contact, their key, the internet link and all history from this device.', actions: [['Cancel', false], ['Delete', true, 'danger']] }))) return;
   S.convs.get(id)?.close('deleted');
   await S.remote?.forget(id);
+  for (const mid of c.media || []) await S.vault.deleteRecord(MEDIA(id, mid));
   S.contacts.delete(id); S.chats.delete(id);
   await persistContacts(); await S.vault.deleteRecord(`history/${id}`);
   go('home');
+}
+
+// ---- media, links and docs shared with one contact ----
+function sharedItems(id) {
+  const media = [], docs = [], links = [];
+  for (const m of S.chats.get(id) || []) {
+    if (m.deleted) continue;
+    if (m.file) {
+      const isMedia = m.file.safety?.inline || m.file.playable === 'video' || (!m.file.url && /^(image|video)\//.test(m.file.mime || ''));
+      (isMedia ? media : docs).push(m);
+    } else if (m.text) {
+      for (const seg of linkify(m.text)) if (seg.type === 'link') links.push({ m, seg });
+    }
+  }
+  return { media: media.reverse(), docs: docs.reverse(), links: links.reverse() };
+}
+function openViewer(m, cid) {
+  const f = m.file;
+  const big = f.playable === 'video' ? h('video.viewer', { controls: true, playsinline: true, src: f.url, autoplay: true })
+    : h('img.viewer', { src: f.url, alt: f.name, 'data-testid': 'viewer-image' });
+  modal({ title: `${m.dir === 'out' ? 'You' : displayName(S.contacts.get(cid) || {})} · ${new Date(m.ts).toLocaleString()}`, body: [big],
+    actions: [['Close', false], ['Show in chat', 'chat'], ['Save', 'save', 'primary']] })
+    .then((v) => { if (v === 'save') saveFile(m, cid); else if (v === 'chat') { go('chat', cid); requestAnimationFrame(() => document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`)?.scrollIntoView({ block: 'center' })); } });
+}
+VIEWS.shared = (id, tab = 'media') => {
+  const c = S.contacts.get(id);
+  if (!c) return VIEWS.home();
+  const k = sharedItems(id);
+  const tabs = [['media', 'Media', k.media.length], ['docs', 'Docs', k.docs.length], ['links', 'Links', k.links.length]];
+  const when = (m) => new Date(m.ts).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  const empty = (t) => h('p.empty', t);
+  let body;
+  if (tab === 'media') {
+    body = k.media.length ? h('div.mediagrid', { 'data-testid': 'shared-media' }, k.media.map((m) => h('button.thumb', { type: 'button', onclick: () => m.file.url && openViewer(m, id), 'aria-label': m.file.name },
+      !m.file.url ? h('span.hint', '…') : m.file.playable === 'video' ? [h('video', { src: m.file.url, preload: 'metadata', muted: true, playsinline: true }), h('span.play', '▶')] : h('img', { src: m.file.url, alt: '' }))))
+      : empty('No photos or videos yet.');
+  } else if (tab === 'docs') {
+    body = k.docs.length ? h('ul.doclist', { 'data-testid': 'shared-docs' }, k.docs.map((m) => h('li',
+      h('div.docinfo', icon(m.file.kind === 'voice' ? 'mic' : 'clip', 18), h('div', h('strong', m.file.kind === 'voice' ? 'Voice message' : m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
+      m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
+      m.file.url ? h('button', { type: 'button', onclick: () => saveFile(m, id) }, 'Save') : h('span.hint', 'Loading…'))))
+      : empty('No files or voice messages yet.');
+  } else {
+    body = k.links.length ? h('ul.linklist', { 'data-testid': 'shared-links' }, k.links.map(({ m, seg }) => h('li',
+      h(`button.inlink.risk-${seg.analysis.risk}`, { type: 'button', onclick: () => checkLink(seg, id, m.dir) }, seg.text),
+      h('small', `${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))))
+      : empty('No links yet.');
+  }
+  return h('div.screen.full',
+    header('Media, links and docs', { back: () => go('contact', id) }),
+    h('div.tabs', { role: 'tablist' }, tabs.map(([t, label, n]) => h(`button${t === tab ? '.on' : ''}`, { type: 'button', role: 'tab', 'aria-selected': t === tab, 'data-testid': `tab-${t}`, onclick: () => go('shared', id, t) }, `${label} ${n}`))),
+    h('div.panel', body,
+      c.keepHistory ? null : h('p.hint', 'History is off for this contact, so only what arrived since you unlocked is listed. Turn on “Keep encrypted history” to keep everything.')));
+};
+
+// ---- backup & move: your account on another phone (engine: core/backup.js + core/relaybox.js) ----
+const ONLINE_MIN_BITS = 65;          // online backups can be attacked offline: require a strong passphrase
+const ONLINE_MAX_BYTES = 48 * 1024 * 1024;
+const ONLINE_REFRESH_MS = 20 * 3600e3;
+
+/** Let pending history/media writes and queued relay work finish, so a snapshot is complete. */
+async function settle() {
+  await Promise.all([...persistQueue.values()]).catch(() => {});
+  await S.remote?.idle().catch(() => {});
+}
+async function makePackage({ includeMedia = true, exact = false } = {}) {
+  await settle();
+  return BK.exportVault(SLOTS[S.slot || 'a'], { login: await store.get(LOGIN_KEY), includeMedia, exact });
+}
+/** Ask for the passphrase of the OPEN vault (proves it's you; never stored). → string | null */
+async function askPassphrase(title, body, extra = []) {
+  const inp = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Your passphrase', 'data-testid': 'confirm-pass' });
+  for (;;) {
+    const v = await modal({ title, body: [...[].concat(body), inp, ...extra], actions: [['Cancel', false], ['Continue', 'ok', 'primary']] });
+    if (v !== 'ok') return null;
+    const opened = await Vault.open(SLOTS[S.slot || 'a'], inp.value).catch(() => null);
+    if (opened) { opened.lock(); return inp.value; }
+    toast('That’s not your passphrase', 'error');
+  }
+}
+async function shareOrDownload(bytes, name) {
+  const f = new File([bytes], name, { type: 'application/octet-stream' });
+  if (matchMedia('(pointer:coarse)').matches && navigator.canShare?.({ files: [f] })) {
+    try { await navigator.share({ files: [f] }); return; } catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const url = URL.createObjectURL(f);
+  const a = h('a', { href: url, download: name, hidden: true }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+// 1. Backup file
+async function saveBackupFile() {
+  const media = h('input', { type: 'checkbox', checked: true, 'data-testid': 'backup-media' });
+  const pass = await askPassphrase('Save an encrypted backup',
+    ['The file is locked with your passphrase — keep it somewhere safe (Files, a computer, a USB stick). Anyone who has the file still needs your passphrase.'],
+    [h('label.toggle', media, ' Include photos, voice notes and files')]);
+  if (!pass) return;
+  setStatusLine('Preparing backup…'); toast('Preparing your backup…');
+  try {
+    const sealed = await BK.sealWithPassphrase(await makePackage({ includeMedia: media.checked }), pass);
+    S.settings.backupFileAt = Date.now(); await S.vault.putRecord('settings', S.settings);
+    await shareOrDownload(sealed, `murmur-backup-${new Date().toISOString().slice(0, 10)}.murmur`);
+    toast(`Backup ready (${fmtBytes(sealed.length)})`, 'success');
+    rerenderIf('settings');
+  } catch (e) { toast(`Backup failed: ${e.message}`, 'error'); }
+}
+
+// 2. Online backup (log in on any phone with username + passphrase)
+async function uploadOnline(rec) {
+  let media = true;
+  let sealed = await BK.sealWithKey(await makePackage({ includeMedia: true }), fromB64u(rec.key));
+  if (sealed.length > ONLINE_MAX_BYTES) { media = false; sealed = await BK.sealWithKey(await makePackage({ includeMedia: false }), fromB64u(rec.key)); }
+  if (sealed.length > ONLINE_MAX_BYTES) throw new Error('Your messages alone are too big for an online backup — use a backup file');
+  await writeBox(RELAY_URL, fromB64u(rec.box), BK.toChunks(sealed), { replace: true });
+  Object.assign(rec, { at: Date.now(), size: sealed.length, media });
+  await S.vault.putRecord('cloud', rec);
+  rerenderIf('settings');
+  return rec;
+}
+async function enableOnlineBackup() {
+  if (!S.profile.username) { toast('Choose a username first (Settings → You)', 'error'); return; }
+  const pass = await askPassphrase('Turn on online backup',
+    [h('p', 'Your account is sealed with keys made from your username and passphrase, then stored on the Murmur relay. On a new phone you just log in with those two.'),
+      h('p.warn', icon('alert', 14), ' The trade-off: anyone who knows your username could download the sealed copy and try to guess your passphrase forever. It is only as strong as your passphrase.')]);
+  if (!pass) return;
+  if (strength(pass).bits < ONLINE_MIN_BITS) {
+    await modal({ title: 'Your passphrase is too weak for this', body: ['An online copy can be attacked offline, so Murmur requires a strong passphrase — for example 4–5 random words. Change it in Settings → Security, then try again.'], actions: [['OK', true, 'primary']] });
+    return;
+  }
+  toast('Making your online backup…');
+  try {
+    const k = await BK.onlineKeys(S.profile.username, pass);
+    await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), user: S.profile.username });
+    toast('Online backup is on. Log in on any phone with your username and passphrase.', 'success', 6000);
+  } catch (e) { toast(`Online backup failed: ${e.message}`, 'error', 6000); }
+}
+async function disableOnlineBackup(silent = false) {
+  const rec = await S.vault.getRecord('cloud', null);
+  if (rec) await readBox(RELAY_URL, fromB64u(rec.box), { ack: true }).catch(() => {}); // delete it from the relay
+  await S.vault.deleteRecord('cloud');
+  if (!silent) toast('Online backup turned off and deleted from the relay');
+  rerenderIf('settings');
+}
+/** Keep the online copy fresh (the relay erases anything older than 30 days). */
+async function refreshOnlineBackup(force = false) {
+  const rec = await S.vault?.getRecord('cloud', null);
+  if (!rec || (!force && Date.now() - (rec.at || 0) < ONLINE_REFRESH_MS)) return;
+  await uploadOnline(rec);
+}
+/** The passphrase changed (we have the new one): move the online copy to the new keys. */
+async function rekeyOnlineBackup(newPass) {
+  const rec = await S.vault.getRecord('cloud', null); if (!rec) return;
+  await readBox(RELAY_URL, fromB64u(rec.box), { ack: true }).catch(() => {});
+  const k = await BK.onlineKeys(S.profile.username, newPass);
+  await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), user: S.profile.username });
+}
+
+// 3. Move to a new phone (old phone erases itself once the new one has everything)
+VIEWS.moveout = () => {
+  const qr = h('div.qrbox', h('div.spinner'));
+  const codeBox = h('textarea.code', { readonly: true, rows: 2, 'data-testid': 'move-code', 'aria-label': 'Move code' });
+  const status = h('p', { 'data-testid': 'move-status' }, 'Preparing…');
+  let cancelled = false, keys = null;
+  const cancel = async () => {
+    cancelled = true;
+    if (keys) await readBox(RELAY_URL, keys.box, { ack: true }).catch(() => {});
+    if (S.vault) { await startRemote().catch(() => {}); go('settings'); toast('Move cancelled — nothing changed'); }
+  };
+  (async () => {
+    stopRemote(); // freeze: from now on this phone's state must not move
+    const code = random(32); keys = await BK.moveKeys(code);
+    const sealed = await BK.sealWithKey(await makePackage({ includeMedia: true, exact: true }), keys.key);
+    status.textContent = `Uploading (${fmtBytes(sealed.length)})…`;
+    await writeBox(RELAY_URL, keys.box, BK.toChunks(sealed), { replace: true, onProgress: (i, n) => { status.textContent = `Uploading… ${Math.round((i / n) * 100)}%`; } });
+    if (cancelled) return;
+    const text = BK.moveCodeText(code);
+    codeBox.value = text;
+    clear(qr).append(qrSvg(encodeQR(text, { ecl: 'M' }), 'Move code'));
+    status.textContent = 'On your new phone: open Murmur → “I already have an account” → “Move from my old phone” → scan this.';
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 3000));
+      if (cancelled || S.view !== 'moveout') return;
+      const got = await readBox(RELAY_URL, keys.ack, { ack: true }).catch(() => []);
+      if (got.length) break;
+    }
+    await readBox(RELAY_URL, keys.box, { ack: true }).catch(() => {});
+    await eraseThisPhone();
+    toast('Moved to your new phone. This phone has been erased.', 'success', 8000);
+  })().catch((e) => { status.textContent = `Couldn’t prepare the move: ${e.message}`; status.className = 'error'; });
+  return h('div.screen.full',
+    header('Move to a new phone', { back: cancel }),
+    h('div.pair',
+      h('ol.steps',
+        h('li', 'On the ', h('strong', 'new'), ' phone open Murmur and tap ', h('em', 'I already have an account → Move from my old phone'), '.'),
+        h('li', 'Scan this code (or copy the text). Your account is sent sealed through the relay — nothing is readable on the way.'),
+        h('li', 'You’ll unlock the new phone with the same username and passphrase. ', h('strong', 'This phone then erases itself'), ' so the two never get out of step.')),
+      qr, codeBox,
+      h('div.share', h('button', { onclick: async () => { try { await navigator.clipboard.writeText(codeBox.value); toast('Code copied'); } catch { codeBox.select(); } } }, icon('copy', 18), ' Copy code')),
+      status,
+      h('p.hint', 'The code works once. Don’t send it to anyone — together with your passphrase it opens your account.'),
+      h('button', { onclick: cancel, 'data-testid': 'move-cancel' }, 'Cancel')));
+};
+async function startMove() {
+  const pass = await askPassphrase('Move to a new phone', ['After the move, THIS phone erases itself. Your new phone gets everything: contacts, chats, photos, keys and settings.']);
+  if (pass) go('moveout');
+}
+async function eraseThisPhone() {
+  const r = S.remote; stopRemote();
+  await r?.idle().catch(() => {});
+  for (const conv of S.convs.values()) conv.close('wiped');
+  S.vault?.lock();
+  await store.destroy(); store.destroyed = false;
+  Object.assign(S, { vault: null, contacts: new Map(), chats: new Map(), convs: new Map() });
+  go('welcome');
+}
+
+// ---- the new phone: "I already have an account" ----
+async function finishRestore(pkg, passphrase) {
+  if (await anyVault(store)) await store.clear(); // replacing (the person confirmed)
+  await BK.importVault(store, SLOTS.a, pkg);
+  await ensureSlots(store);
+  if (passphrase) {
+    const { vault, slot } = await unlockAny(store, passphrase);
+    S.slot = slot; await openVault(vault);
+  } else go('unlock');
+}
+async function confirmReplace() {
+  if (!(await anyVault(store))) return true;
+  return (await modal({ title: 'Replace the account on this phone?', body: ['This phone already has a Murmur account. Restoring erases it and puts the other account here instead.'], actions: [['Cancel', false], ['Replace it', true, 'danger']] })) === true;
+}
+VIEWS.restore = (mode = null) => {
+  const back = () => (mode ? go('restore') : go(S.vault ? 'home' : 'welcome'));
+  const out = h('div.screen.narrow');
+  const err = h('p.error', { role: 'alert', 'data-testid': 'restore-error' });
+  const busy = (btn, on, label) => { btn.disabled = on; btn.textContent = on ? 'Working…' : label; };
+  if (!mode) {
+    const opt = (m, ic, t, d) => h('button.tile.wide', { onclick: () => go('restore', m), 'data-testid': `restore-${m}` }, icon(ic, 26), h('span', t), h('small', d));
+    return h('div.screen.full', header('I already have an account', { back }),
+      h('section.pair-actions.column',
+        opt('online', 'globe', 'Log in with username + passphrase', 'If you turned on online backup'),
+        opt('move', 'scan', 'Move from my old phone', 'Old phone nearby: scan its code'),
+        opt('file', 'clip', 'Restore a backup file', 'A .murmur file you saved')),
+      h('p.hint.pad', 'There is no account server: your account exists only on your phone, plus any backup you made. Without one of these, a lost phone’s chats can’t be recovered — by anyone.'));
+  }
+  if (mode === 'online') {
+    const user = h('input', { type: 'text', autocapitalize: 'none', spellcheck: false, autocomplete: 'username', placeholder: 'Username', 'data-testid': 'login-user' });
+    const pass = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Passphrase', 'data-testid': 'login-pass' });
+    const btn = h('button.primary.big', { type: 'submit', 'data-testid': 'login-go' }, 'Log in');
+    return h('form.screen.narrow', { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = '';
+      if (!(await confirmReplace())) return;
+      busy(btn, true, 'Log in');
+      try {
+        const k = await BK.onlineKeys(user.value, pass.value);
+        const rows = await readBox(RELAY_URL, k.box);
+        const sealed = BK.fromChunks(rows.map((r) => r.data));
+        if (!sealed) throw new Error('No online backup found for that username and passphrase.');
+        await finishRestore(await BK.openSealed(sealed, { key: k.key }), pass.value);
+        toast('Welcome back — your account is on this phone', 'success', 6000);
+      } catch (ex) { err.textContent = ex.message; busy(btn, false, 'Log in'); }
+    } },
+    header('Log in', { back }),
+    h('p', 'Works if you turned on ', h('strong', 'online backup'), ' on your old phone.'),
+    h('label', 'Username'), user, h('label', 'Passphrase'), pass, err, btn,
+    h('p.hint', 'Messages that arrived after the last backup (and were already read on the old phone) aren’t included. Your contacts’ phones renew the secure link automatically the next time they’re online.'));
+  }
+  if (mode === 'file') {
+    const file = h('input', { type: 'file', accept: '.murmur,application/octet-stream', 'data-testid': 'restore-file' });
+    const pass = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Passphrase', 'data-testid': 'restore-pass' });
+    const btn = h('button.primary.big', { type: 'submit', 'data-testid': 'restore-go' }, 'Restore');
+    return h('form.screen.narrow', { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = '';
+      const f = file.files[0]; if (!f) { err.textContent = 'Pick your backup file first.'; return; }
+      if (!(await confirmReplace())) return;
+      busy(btn, true, 'Restore');
+      try {
+        const pkg = await BK.openSealed(new Uint8Array(await f.arrayBuffer()), { passphrase: pass.value });
+        await finishRestore(pkg, pass.value);
+        toast('Restored — your account is on this phone', 'success', 6000);
+      } catch (ex) { err.textContent = ex.message; busy(btn, false, 'Restore'); }
+    } },
+    header('Restore a backup file', { back }),
+    h('label', 'Backup file (.murmur)'), file, h('label', 'Passphrase (the one you had when you saved it)'), pass, err, btn);
+  }
+  // mode === 'move'
+  const scanArea = h('div');
+  const paste = h('textarea.code', { rows: 2, placeholder: 'Or paste the code (starts with murmur-move:)', 'data-testid': 'move-paste' });
+  const take = async (text) => {
+    err.textContent = '';
+    try {
+      const code = BK.moveCodeFrom(text);
+      if (!(await confirmReplace())) return true;
+      stopScanner(); clear(scanArea).append(h('p', 'Receiving your account…'));
+      const k = await BK.moveKeys(code);
+      const sealed = BK.fromChunks((await readBox(RELAY_URL, k.box)).map((r) => r.data));
+      if (!sealed) throw new Error('Nothing waiting for this code — keep the old phone on the code screen, then try again.');
+      const pkg = await BK.openSealed(sealed, { key: k.key });
+      await writeBox(RELAY_URL, k.ack, [utf8('received')]);     // tells the old phone it can erase itself
+      await finishRestore(pkg, null);
+      toast('Moved! Unlock with your username and passphrase.', 'success', 8000);
+      return false;
+    } catch (ex) { err.textContent = ex.message; return true; }
+  };
+  const startCam = async () => {
+    stopScanner();
+    const video = h('video.cam', { 'aria-label': 'Camera preview' });
+    clear(scanArea).append(h('div.camwrap', video, h('div.reticle')));
+    S.scanner = new Scanner(video);
+    try { await S.scanner.start((text) => { if (text.includes(BK.MOVE_PREFIX)) take(text); return text.includes(BK.MOVE_PREFIX); }); }
+    catch (e) { stopScanner(); clear(scanArea).append(h('p.error', `Camera unavailable: ${e.message}. Paste the code instead.`)); }
+  };
+  return h('div.screen.full', header('Move from my old phone', { back }),
+    h('div.pair',
+      h('ol.steps', h('li', 'On the old phone: Settings → ', h('em', 'Move to a new phone'), '.'), h('li', 'Scan the code it shows.')),
+      h('button.primary', { onclick: startCam, 'data-testid': 'move-scan' }, icon('scan', 18), ' Scan the code'),
+      scanArea, paste,
+      h('button', { onclick: () => take(paste.value), 'data-testid': 'move-paste-go' }, icon('paste', 18), ' Use pasted code'),
+      err));
+};
+
+/** Settings section. */
+function backupSection() {
+  const info = h('p.hint', { 'data-testid': 'online-status' }, '…');
+  const toggle = h('button', { 'data-testid': 'online-toggle' }, '…');
+  S.vault.getRecord('cloud', null).then((rec) => {
+    info.textContent = rec ? `On — last backup ${new Date(rec.at).toLocaleString()} (${fmtBytes(rec.size)}${rec.media ? '' : ', without photos — too big'}). Refreshed daily while you use Murmur; the relay keeps it 30 days.` : 'Off.';
+    toggle.textContent = rec ? 'Turn off and delete it' : 'Turn on online backup';
+    toggle.onclick = () => (rec ? disableOnlineBackup() : enableOnlineBackup());
+  });
+  return h('div.backup',
+    h('h2', 'Backup & new phone'),
+    h('p.hint', 'Your account lives only on this phone. Make a backup so a lost or broken phone doesn’t mean lost chats.'),
+    h('label', 'Encrypted backup file'),
+    h('div.row', h('button', { onclick: saveBackupFile, 'data-testid': 'backup-file' }, icon('share', 18), ' Save backup file')),
+    h('p.hint', S.settings.backupFileAt ? `Last saved ${new Date(S.settings.backupFileAt).toLocaleString()}.` : 'Never saved.'),
+    h('label', 'Online backup — log in on any phone'),
+    info, h('div.row', toggle, h('button', { onclick: () => refreshOnlineBackup(true).then(() => toast('Backed up', 'success')).catch((e) => toast(e.message, 'error')), 'data-testid': 'online-now' }, 'Back up now')),
+    h('label', 'Move to a new phone'),
+    h('p.hint', 'Old phone in hand: scan a code on the new one. Everything moves; this phone then erases itself.'),
+    h('button', { onclick: startMove, 'data-testid': 'move-start' }, icon('qr', 18), ' Move to a new phone'));
 }
 
 // ---- duress passcode ----
@@ -2009,6 +2483,12 @@ function profileEditor(nameIn) {
       await saveLogin(userIn.value, remembered);
       await saveProfile({ username: normalizeUsername(userIn.value) });
       toast(`Username saved — unlock with @${normalizeUsername(userIn.value)} from now on`, 'success');
+      if (await S.vault.getRecord('cloud', null)) {
+        // The online backup is found by username: move it to the new name (needs the passphrase).
+        const pass = await askPassphrase('Update your online backup', ['Your online backup is found by your username, so it has to move to the new one.']);
+        if (pass) await rekeyOnlineBackup(pass).then(() => toast('Online backup moved to your new username', 'success')).catch((e) => toast(e.message, 'error'));
+        else { await disableOnlineBackup(true); toast('Online backup turned off (it was under your old username)'); }
+      }
     } }, 'Save')),
     h('label.toggle', h('input', { type: 'checkbox', 'data-testid': 'remember-toggle', onchange: async (e) => {
       const rec = await store.get(LOGIN_KEY); if (!rec) return;
@@ -2029,7 +2509,10 @@ VIEWS.settings = () => {
   const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
   const lockSel = h('select', { 'aria-label': 'Auto-lock' }, LOCK_OPTIONS.map(([v, l]) => h('option', { value: v, selected: S.settings.autoLockMin === v }, l)));
   const wipeSel = h('select', { 'aria-label': 'Wipe after failed attempts' });
-  Vault.meta(SLOTS.a).then((m) => m?.wipeAfter ?? 10).then((n) => { for (const [v, l] of WIPE_OPTIONS) wipeSel.append(h('option', { value: v, selected: n === v }, l)); });
+  Vault.meta(SLOTS.a).then((m) => m?.wipeAfter ?? 0).then((n) => {
+    const opts = WIPE_OPTIONS.some(([v]) => v === n) ? WIPE_OPTIONS : [...WIPE_OPTIONS, [n, `After ${n} wrong tries`]]; // keep an older choice visible
+    for (const [v, l] of opts) wipeSel.append(h('option', { value: v, selected: n === v }, l));
+  });
   const oldP = h('input', { type: 'password', placeholder: 'Current passphrase', autocomplete: 'current-password' });
   const newP = h('input', { type: 'password', placeholder: `New passphrase (${MIN_PASSPHRASE}+ chars)`, autocomplete: 'new-password' });
   const fp = h('code.small', { 'data-testid': 'build-fp' }, 'unavailable');
@@ -2058,19 +2541,24 @@ VIEWS.settings = () => {
       h('h2', 'Security'),
       h('label', 'Auto-lock after inactivity'),
       h('div.row', lockSel, h('button', { onclick: async () => { S.settings.autoLockMin = +lockSel.value; await S.vault.putRecord('settings', S.settings); toast('Saved'); } }, 'Save')),
+      h('label', 'Wrong passphrase protection'),
+      h('p.hint', 'After 4 wrong tries Murmur makes you wait — 30 s, then 1 min, 5 min, 15 min, 1 hour — like an iPhone. Only someone holding this phone can even try: there is no online login to attack. Erasing is optional: it stops a thief, but anyone who picks up your phone could also trigger it on purpose.'),
       h('label', 'Erase everything after wrong passphrases'),
       h('div.row', wipeSel, h('button', { onclick: async () => { await Vault.setWipeAfterOn(SLOTS.a, +wipeSel.value); await Vault.setWipeAfterOn(SLOTS.b, +wipeSel.value); toast('Saved'); } }, 'Save')),
-      h('p.hint', 'Slows down someone who grabs your phone. It can’t stop an attacker who copies the encrypted data first — a long passphrase is your real protection.'),
+      h('p.hint', 'Neither the waits nor erasing can stop someone who copies the encrypted data off the phone first — a long passphrase is your real protection.'),
       h('label', 'Change passphrase'),
       oldP, newP,
       h('button', { onclick: async () => {
         try {
           if (await opensOther(store, S.slot, newP.value)) throw new Error('Pick a different passphrase');
-          await S.vault.changePassphrase(oldP.value, newP.value); oldP.value = newP.value = ''; toast('Passphrase changed', 'success'); }
+          await S.vault.changePassphrase(oldP.value, newP.value);
+          const np = newP.value; oldP.value = newP.value = ''; toast('Passphrase changed', 'success');
+          rekeyOnlineBackup(np).catch((e) => toast(`Online backup: ${e.message}`, 'error')); }
         catch (e) { toast(e instanceof WrongPassphraseError ? 'Current passphrase is wrong' : e.message, 'error'); }
       } }, 'Change passphrase'),
 
       duressSection(),
+      backupSection(),
 
       h('h2', 'Messages'),
       h('label', { for: 'voice-send' }, 'Voice messages'),

@@ -59,6 +59,7 @@ export async function unlockAny(inner, passphrase) {
   const s = slots(inner);
   const [ma, mb] = await Promise.all([Vault.meta(s.a), Vault.meta(s.b)]);
   if (!ma && !mb) throw new Error('No vault');
+  await Vault.checkLockout(ma ? s.a : s.b); // one shared lockout: the duress code can't be used to keep guessing
   // Derive both keys every time: equal work for real, duress and wrong passphrases.
   const [ka, kb] = await Promise.all([
     ma ? passphraseKey(passphrase, ma.salt, ma.iterations) : null,

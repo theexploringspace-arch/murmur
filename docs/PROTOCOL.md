@@ -282,3 +282,27 @@ connection gets 10 s to recover.
 `user` (plain) exists only if "remember my username" is on. A wrong username counts as one wrong
 attempt on the shared counter, exactly like a wrong passphrase. Slot B (`b:` keys) is the duress
 decoy or an unopenable placeholder — see THREAT-MODEL "Duress passcode".
+
+Vault records added: `vault/until` (lockout end, plaintext like `vault/fails`; present in every
+vault and placeholder so all slots look alike), `media/<contact>/<message>` (`{ name, mime, kind, b }`,
+encrypted like every record).
+
+## 13. Backups and moving (`backup.js`, `relaybox.js`)
+
+Package (JSON, before sealing): `{ app:'murmur', v:1, created, exact, media, login, entries:[[storeKey, storedValue]…] }`
+— the open slot's raw store entries (records stay vault-encrypted), Uint8Arrays as `{ $b: base64url }`.
+
+Sealed: `"MURMURBK" ‖ 01 ‖ mode ‖ …`
+- mode 1 (file): `u32 iterations ‖ salt16 ‖ iv12 ‖ AES-GCM(PBKDF2(pass, salt, it), json, aad="MURMURBK"‖01‖01)`
+- mode 2 (key): `iv12 ‖ AES-GCM(key32, json, aad="MURMURBK"‖01‖02)`
+
+Online keys: `root = PBKDF2(pass, SHA-256("murmur/online-backup/v1\0"‖lower(username))[0..16], 600k)`;
+`box = HKDF(root, 0³², "…/box")`, `key = HKDF(root, 0³², "…/key")`. Move: `code` = 32 random bytes →
+`box`, `key`, `ack` by HKDF with labels `murmur/move/{box,key,ack}`. QR/text: `murmur-move:` ‖ base64url(code).
+
+Relay chunks: `"MBK1" ‖ id8 ‖ u32 created ‖ u16 i ‖ u16 n ‖ ≤ 900 KiB` in an ordinary mailbox (box secret
+= mailbox secret). The newest complete set wins; uploads replace (ack-delete) the previous set.
+
+Renewal (envelope kind 6): `[01, 06] ‖ invite` (the usual signed invite) to each contact's inbox; the
+contact answers with a normal join + hello. Accepted only if `invite.identityPub` equals the stored key
+for that contact, `created ≥ last renewal` and the invite id is new.

@@ -168,3 +168,19 @@ Rule of thumb: whatever other code uses as a "ready" flag must be assigned **las
 | `core/profile.js` — username rules, login hash, profile validation, per-contact call flags | yes | `test/unit/profile.test.mjs` |
 | `core/call.js` — WebRTC call engine + signal validation + `callDecision()` | engine needs a browser | `test/unit/call.test.mjs` + e2e "voice & video calls" and the relay call in "phase 1" |
 | `relay/src/router.js` `/v1/turn` | — | `test/unit/relay.test.mjs` (fake Cloudflare API, port-53 filter, Origin check, rate limit, STUN fallback) |
+
+## Lesson: the walkie-talkie that only failed on real fingers
+
+On a touchscreen, lifting a finger fires `pointerup` **and then `pointerleave`**. The recorder
+treated `pointerleave` as "slid away — cancel", and since stopping a MediaRecorder is
+asynchronous the clip was still "recording" at that instant: every iPhone clip was silently
+discarded. The browser tests used a **mouse**, which doesn't fire that second event — so they
+passed. Fix: pointer capture, and cancel only by *distance* (> 90 px). The e2e suite now drives
+the button with real touch event sequences (`touchHold`), plus tap-to-lock and slide-to-cancel.
+Lesson: when a bug survives a fix, test the exact input the user has, not a convenient stand-in.
+
+## History storage
+`history/<contact>` is the list; each file's bytes are their own record `media/<contact>/<message>`,
+written once and deleted when the message is deleted (for me / for everyone), cleared, aged out
+(2,000 messages) or when history is switched off. `contact.media` lists what is stored, so orphan
+cleanup never needs to scan storage. Saves are serialized per chat (`persistQueue`).

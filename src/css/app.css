@@ -251,3 +251,38 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .callbtn.accept svg { background: #22c55e; }
 .callscreen[data-state="ringing"] .callbtn.accept svg { animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 14px #22c55e33; } }
+button.mic.locked { outline: 3px solid var(--danger); outline-offset: 3px; }
+
+/* ---- chat header: photo + name, tap for contact info ---- */
+.titlebtn { display: flex; align-items: center; gap: 0.6rem; background: none; border: 0; padding: 0; color: inherit; min-width: 0; flex: 1; text-align: left; cursor: pointer; }
+.titlebtn h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.avatar.sm { width: 34px; height: 34px; font-size: 0.9rem; }
+.avatar.sm[data-online=true]::after { width: 9px; height: 9px; }
+
+/* ---- media, links and docs ---- */
+.sharedbtn { display: flex; align-items: center; gap: 0.7rem; width: 100%; padding: 0.85rem 1rem; margin: 0.4rem 0 0.6rem; border-radius: var(--r); background: var(--bg3); border: 1px solid var(--line); color: var(--fg); font: inherit; text-align: left; }
+.sharedbtn span:first-of-type { flex: 1; }
+.sharedbtn .count { color: var(--fg2); font-variant-numeric: tabular-nums; }
+.tabs { display: flex; gap: 0.4rem; padding: 0.6rem 1rem 0; }
+.tabs button { flex: 1; padding: 0.55rem; border-radius: 999px; background: var(--bg3); border: 1px solid var(--line); color: var(--fg2); font: inherit; }
+.tabs button.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 700; }
+.mediagrid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 3px; }
+.thumb { position: relative; aspect-ratio: 1; padding: 0; border: 0; background: var(--bg3); overflow: hidden; border-radius: 4px; }
+.thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.thumb .play { position: absolute; inset: 0; display: grid; place-items: center; color: #fff; font-size: 1.6rem; text-shadow: 0 1px 4px #000; }
+.doclist, .linklist { list-style: none; margin: 0; padding: 0; }
+.doclist li, .linklist li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; padding: 0.7rem 0; border-bottom: 1px solid var(--line); }
+.docinfo { display: flex; gap: 0.6rem; align-items: center; flex: 1; min-width: 0; }
+.docinfo strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.docinfo small, .linklist small { color: var(--fg2); }
+.doclist audio { width: 100%; }
+.linklist .inlink { text-align: left; word-break: break-all; }
+.linklist small { width: 100%; }
+.modal img.viewer, .modal video.viewer { display: block; max-width: 100%; max-height: 65vh; margin: 0 auto; border-radius: var(--r); }
+
+/* ---- backup & move ---- */
+.pair-actions.column { display: flex; flex-direction: column; gap: 0.7rem; }
+.tile.wide { display: grid; grid-template-columns: auto 1fr; grid-template-rows: auto auto; column-gap: 0.9rem; text-align: left; align-items: center; }
+.tile.wide svg { grid-row: span 2; }
+.tile.wide small { grid-column: 2; }
+.hint.pad { padding: 0 1rem; }

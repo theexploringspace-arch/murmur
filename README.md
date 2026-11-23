@@ -51,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 122 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, scam checks, media, groups, QR, build
+npm test            # 129 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -184,11 +184,14 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 |---|---|---|---|
 | Text, receipts ✓✓, disappearing | ✅ | ✅ | |
 | Photos & videos | ✅ | ✅ (512 KiB chunks) | Photos go at **standard size** (longest side 1600 px, ~250–450 KB: usually one relay message) with an **Original quality** switch. Hidden location/camera data removed; you see exactly what will be sent and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
-| Walkie-talkie | ✅ | ✅ | Hold the mic button and talk (2 min max). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
+| Walkie-talkie | ✅ | ✅ | Hold the mic, talk, lift — or **tap once to lock** recording on and tap again to finish; slide far away to cancel (2 min max). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
 | Voice & video calls | ✅ | ✅ | Peer-to-peer, end-to-end encrypted (DTLS-SRTP keyed through the authenticated chat). Mute, camera off, flip camera. **Hide my IP** (default on) routes internet calls through TURN. Rings only while Murmur is open on their phone. One-to-one only |
 | Call permissions | ✅ | ✅ | Settings → *Calls*: allow voice / video. Contact info: block calls from one person. Their phone hides the buttons **and** yours refuses the call anyway |
 | Edit & delete | ✅ | ✅ | Long-press (or right-click) a message. Edit your text for **15 min**; **delete for everyone** within **1 hour**; delete for me any time. Receivers enforce the same rules and only accept changes from the real author |
 | Profile | ✅ | ✅ | Photo (256×256, re-drawn so no metadata), display name and **@username** — sent only to your contacts, encrypted. Strangers who used your invite link don't get your photo until you accept them |
+| History & shared media | ✅ | ✅ | On by default for new contacts: text, **photos, voice notes, files**, locations and call logs are kept on the phone, encrypted with your passphrase (disappearing messages never). Tap the contact's photo at the top of a chat → **Media, links and docs** |
+| Backup & new phone | ✅ | needs internet for online/move | Settings → *Backup & new phone*: **backup file** (sealed with your passphrase; keep it anywhere), **online backup** (opt-in, strong passphrase required; then on any phone: *I already have an account → Log in* with username + passphrase), **move to a new phone** (scan a code; the old phone erases itself). Restoring an older backup renews each secure link automatically |
+| Wrong-passphrase protection | — | — | After 4 wrong tries you must wait (30 s → 1 h), like an iPhone. Erasing after N tries is **opt-in** — by default nobody can wipe your phone just by typing wrong |
 | Username login | — | — | Unlock with **username + passphrase** (username optionally remembered). The username is stored only as a salted hash on the phone; there is no account server, so it can't be used to log in on another phone |
 | Location | ✅ | ✅ | Once, or live for 15 min / 1 h (updates every 30 s while Murmur is open). Shows distance & direction — no map server. "Map" opens your map app only after a warning |
 | SOS | ✅ | ✅ (queued if no signal) | Hold 1.5 s. Sends your message + GPS to chosen contacts. **Cannot call emergency services** |

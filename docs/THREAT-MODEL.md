@@ -16,7 +16,7 @@ Honest about both halves: what Murmur defends, and where it can't.
 | A1 | Anyone on the same Wi-Fi (passive) | read messages? **No** | DTLS + Murmur AES-256-GCM. They **can** see that two devices exchanged traffic, roughly how much and when |
 | A2 | Active attacker on the Wi-Fi (MITM) | intercept or impersonate? **No** | Endpoints are learned by scanning screens in person; codes are signed; the handshake binds identity keys **and** both DTLS fingerprints |
 | A3 | Someone who relays/edits a *pasted* code | swap in their own connection? **No** — they can only offer *their own* identity | Edits break the signature. A whole substitute code carries a different key → a new contact, flagged if the name matches an existing one. Verify safety numbers when codes travel over other channels |
-| A4 | Thief with the phone, app locked | read data? **Only by guessing the passphrase** | All data is AES-GCM under a key derived with PBKDF2 (600k). A **strong passphrase** is the real protection; the wipe-after-N-attempts setting only stops on-device guessing, because an attacker who copies the browser profile can guess offline |
+| A4 | Thief with the phone, app locked | read data? **Only by guessing the passphrase** | All data (history, photos, files included) is AES-GCM under a key derived with PBKDF2 (600k). On the phone, wrong tries 5+ force growing waits (30 s … 1 h; the duress code is blocked during a wait too). Erase-after-N is opt-in, because by default it would let anyone holding the phone destroy your data. Neither helps if the attacker copies the browser storage and guesses offline — a **strong passphrase** is the real protection |
 | A5 | Thief with the phone, app **unlocked** | read what's on screen and in memory? **Yes** | Mitigations: auto-lock (default 5 min, also when backgrounded), history off by default, disappearing messages, panic wipe |
 | A5b | Someone **forcing you** to unlock ("open it and show me") | see your real chats? **No, if you use the duress passcode** | It opens a decoy vault (slot B) that looks like a normal Murmur. See "Duress passcode" below for exactly what it does and doesn't hide |
 | A6 | Later compromise of a device | decrypt earlier recorded traffic? **No** | Ephemeral ECDH per session + per-message hash ratchet; old keys are erased. Re-key every 100 msgs / 5 min limits exposure inside a long session |
@@ -151,6 +151,18 @@ differ from the real passphrase, and changing either passphrase to match the oth
 
 **Calls can't ring a closed app.** Without a push service (which would mean Apple/Google learn
 who contacts you), an incoming call only rings while Murmur is open on that phone.
+
+## Backups, online login and moving phones
+
+| Threat | Outcome | Why |
+|---|---|---|
+| Someone gets your **backup file** | Needs your passphrase | Sealed with AES-256-GCM under PBKDF2(passphrase, 600k); inside are the vault's records, themselves still encrypted. Not even record names are visible. Guessing is offline — a strong passphrase is the protection |
+| The relay (or whoever breaks into it) and your **online backup** | Needs your username **and** passphrase | The mailbox address and key both derive from PBKDF2(passphrase, salt = H(username)). The relay can't tell whose it is. But anyone who knows your username can guess offline — so Murmur refuses to turn it on with a passphrase scoring under 65 bits, says so plainly, and keeps it **opt-in** (it bends the "nothing in the cloud" rule). It expires 30 days after the last refresh (daily while you use Murmur) |
+| Someone sees your **move code** | Still needs your passphrase | The code opens the sealed package; the vault inside still needs the passphrase. The code is single-use and the old phone erases itself once the new one confirms |
+| A restored phone uses an **old** ratchet state | Handled | After a file/online restore, every contact gets a renewal invite signed by your identity key; their phone accepts it only from that key (never creates contacts, refuses replays) and the link is re-keyed. Messages you write meanwhile wait, encrypted at rest. Messages that reached the old phone after the backup aren't in it |
+| Someone renews a link pretending to be your contact | **No** | Renewal invites must be signed by the identity key already stored for that contact (tested with a forged one) |
+| The duress decoy leaks via a backup | **No** | A backup contains only the vault that is open; the other slot is never included |
+| A nearby link dies silently (phone walks away) | Messages still arrive | Anything sent nearby and not confirmed within 5 s is re-sent via the relay; duplicates are dropped by id (one SOS alarm, not two) |
 
 ## Known limitations (by design)
 

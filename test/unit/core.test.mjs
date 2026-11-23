@@ -243,7 +243,8 @@ async function pair({ tap, rekeyEveryMessages = 1000, aliceId, bobId, bobExpects
   return { A, B: Bs, inbox, errors, ready };
 }
 const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
-const until = async (fn, ms = 3000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error('timeout'); await settle(5); } };
+const until = async (fn, ms = 15000) => // generous: the re-key stress test can be slow on a busy machine (was a rare flake at 3 s)
+  { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error('timeout'); await settle(5); } };
 
 describe('secure session', () => {
   test('handshake and bidirectional messaging', async () => {

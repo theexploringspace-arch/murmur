@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { MemoryStore, SlotStore } from '../../src/js/core/storage.js';
-import { Vault, WrongPassphraseError, VaultWipedError } from '../../src/js/core/vault.js';
+import { Vault, WrongPassphraseError, VaultWipedError, LockedOutError } from '../../src/js/core/vault.js';
 import { slots, ensureSlots, unlockAny, setDuress, clearDuress, opensOther, anyVault } from '../../src/js/core/duress.js';
 
 const IT = { iterations: 1000 }; // fast PBKDF2 for tests (the app uses 600k)
@@ -49,12 +49,17 @@ test('using the duress passcode is NOT a wrong attempt (20 uses never trigger th
   assert.equal((await unlockAny(inner, REAL)).slot, 'a');
 });
 
-test('wrong passphrases count once each, and the limit erases BOTH slots', async () => {
+test('wrong passphrases count once each; IF erasing is switched on, the limit erases BOTH slots', async () => {
   const inner = await phoneWithRealChats();
   await setDuress(inner, 'a', DURESS, { iterations: 1000 });
-  await assert.rejects(unlockAny(inner, WRONG), (e) => e instanceof WrongPassphraseError && e.attemptsLeft === 9);
-  for (let i = 0; i < 8; i++) await assert.rejects(unlockAny(inner, WRONG), WrongPassphraseError);
-  await assert.rejects(unlockAny(inner, WRONG), VaultWipedError);
+  await Vault.setWipeAfterOn(slots(inner).a, 10); // opt-in
+  let now = 1e12; const real = Vault.clock; Vault.clock = () => now;
+  try {
+    await assert.rejects(unlockAny(inner, WRONG), (e) => e instanceof WrongPassphraseError && e.attemptsLeft === 9);
+    for (let i = 0; i < 8; i++) { now += 2 * 3600e3; await assert.rejects(unlockAny(inner, WRONG), WrongPassphraseError); }
+    now += 2 * 3600e3;
+    await assert.rejects(unlockAny(inner, WRONG), VaultWipedError);
+  } finally { Vault.clock = real; }
   assert.equal(await anyVault(inner), false, 'real and decoy are both gone');
   assert.deepEqual(await inner.keys(), []);
 });
@@ -68,7 +73,7 @@ test('"erase real chats" option: the duress passcode destroys the real vault and
   assert.equal((await d.vault.getRecord('settings')).eraseOther, undefined, 'flag consumed');
   d.vault.lock();
   await assert.rejects(unlockAny(inner, REAL), WrongPassphraseError, 'real passphrase opens nothing now');
-  assert.deepEqual((await slots(inner).a.keys()).sort(), ['rec/profile', 'rec/settings', 'vault/fails', 'vault/identity', 'vault/meta'],
+  assert.deepEqual((await slots(inner).a.keys()).sort(), ['rec/profile', 'rec/settings', 'vault/fails', 'vault/identity', 'vault/meta', 'vault/until'],
     'real slot now holds only an ordinary placeholder: contacts gone, nothing says why');
   const again = await unlockAny(inner, DURESS);
   assert.equal(again.erasedOther, false, 'the erase flag removed itself');
@@ -105,4 +110,23 @@ test('older installs (one vault, no slots) get their second slot and keep workin
   await ensureSlots(inner, IT);
   assert.equal((await unlockAny(inner, REAL)).slot, 'a');
   assert.ok(await Vault.exists(slots(inner).b));
+});
+
+test('by default nothing is ever erased: repeated wrong tries only make you WAIT (like an iPhone)', async () => {
+  const inner = await phoneWithRealChats();
+  await setDuress(inner, 'a', DURESS, { iterations: 1000 });
+  let now = 1e12; const real = Vault.clock; Vault.clock = () => now;
+  try {
+    for (let i = 0; i < 4; i++) await assert.rejects(unlockAny(inner, WRONG), (e) => e instanceof WrongPassphraseError && e.attemptsLeft === Infinity && e.waitMs === 0);
+    await assert.rejects(unlockAny(inner, WRONG), (e) => e.waitMs === 30e3, '5th wrong try: 30 s wait');
+    // During the wait even the RIGHT passphrase — and the duress code — are refused, without trying them.
+    await assert.rejects(unlockAny(inner, REAL), (e) => e instanceof LockedOutError && e.waitMs === 30e3);
+    await assert.rejects(unlockAny(inner, DURESS), LockedOutError);
+    now += 30e3;
+    await assert.rejects(unlockAny(inner, WRONG), (e) => e.waitMs === 60e3, 'then longer');
+    for (let i = 0; i < 20; i++) { now += 2 * 3600e3; await assert.rejects(unlockAny(inner, WRONG), WrongPassphraseError); }
+    now += 2 * 3600e3;
+    assert.equal((await unlockAny(inner, REAL)).slot, 'a', '26 wrong tries later, your chats are still there');
+    await assert.rejects(unlockAny(inner, WRONG), (e) => e.waitMs === 0, 'a successful unlock resets the count');
+  } finally { Vault.clock = real; }
 });
