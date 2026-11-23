@@ -45,6 +45,13 @@ Whoever controls the origin that served Murmur could publish modified JavaScript
   hosting Murmur altered ./index.html". Tested in `test/e2e/run.mjs` via `serve.mjs --imitate-host-injection`.
   Residual risk: while *online and uninstalled*, the injected script still runs. Use a host that
   serves files byte-for-byte (GitHub Pages, Cloudflare Pages).
+- **Updates are announced, never silent.** A new build downloads in the background and must pass the
+  same per-file integrity check before it can even wait. Murmur then shows "Restart to update" with the
+  *new* fingerprint; the running code changes only when the person taps it (or closes every Murmur
+  window). Before this existed, phones kept running an old build for days with no hint — which is how a
+  stale copy with an outdated CSP made the relay look "unreachable". The tap does not add trust (whoever
+  controls the host still controls `sw.js`); it adds *visibility*: you can compare the new fingerprint
+  with a friend's before restarting. Tested in `test/e2e/run.mjs` ("updates: …").
 - **No dependencies, no build step** — the deployed files equal the audited source.
 
 If your adversary can compromise your hosting, a native app (or a pinned, locally-sideloaded copy)

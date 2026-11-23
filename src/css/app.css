@@ -154,6 +154,9 @@ code.safety { display: block; font-size: 1.15rem; letter-spacing: 0.06em; word-s
 .pill[data-kind="queued"] { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 50%, transparent); }
 .banner { margin: 0.6rem 1rem 0; padding: 0.75rem 0.9rem; border-radius: var(--r); background: var(--bg2); border: 1px solid var(--line); font-size: 0.9rem; line-height: 1.4; }
 .banner p { margin: 0 0 0.5rem; }
+.banner.update { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.banner.update .hint { margin: 0 0 0.6rem; }
+.screen.narrow .banner.update { margin: 0 0 1rem; text-align: left; }
 .banner.warn { background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 p.warn { color: var(--warn); font-size: 0.9rem; line-height: 1.4; }
 p.ok { color: var(--ok); font-weight: 600; }
@@ -203,3 +206,5 @@ button.small { padding: 0.25rem 0.6rem; min-height: 0; font-size: 0.8rem; }
 .sectionhead button { min-height: 0; padding: 0.3rem 0.6rem; font-size: 0.85rem; }
 .groups .hint { padding: 0 1.1rem; }
 .avatar.group { display: grid; place-items: center; }
+
+button.file .save { margin-left: 0.6rem; padding: 0.1rem 0.55rem; border-radius: 999px; background: var(--accent); color: var(--bg); font-size: 0.8rem; font-weight: 700; }

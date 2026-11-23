@@ -129,7 +129,7 @@ had to be in the browser. Open DevTools on a laptop, reproduce, and read the Con
 | media privacy | `media.test.mjs` | real PIL/ffmpeg files with GPS, camera and comments; secrets gone, pixels identical (PIL), orientation kept, video still decodes (ffprobe), damaged files refused |
 | location & groups | `geo-groups.test.mjs` | known distances and bearings; coordinate validation; only the creator changes the roster; replayed rosters refused; removal; ID generator checked against the receiver's rules |
 | deployment | `sitecheck.test.mjs` | the live-site checker passes on an honest host and names the injected script on a tampering one |
-| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, walkie-talkie with fake mic, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal |
+| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, walkie-talkie with fake mic, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal; **updates**: new build verified, announced with its fingerprint, applied on tap, data kept |
 
 ### Internet mode components
 ```

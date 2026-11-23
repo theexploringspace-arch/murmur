@@ -10,7 +10,7 @@
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, existsSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, existsSync, rmSync, cpSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -382,6 +382,48 @@ test('host injects a script into index.html: offline install is refused AND the 
 
 
 
+test('updates: a new build is verified, announced with its fingerprint, and applied on tap — data kept', { timeout: 180000 }, async () => {
+  const port = PORT + 2;
+  const dir = '.e2e-update'; // served dir (relative to repo root, like dist)
+  const abs = join(root, dir);
+  rmSync(abs, { recursive: true, force: true });
+  cpSync(join(root, 'dist'), abs, { recursive: true });
+  const fpA = JSON.parse(readFileSync(join(abs, 'build-info.json'), 'utf8')).fingerprint;
+  const srv = spawn(process.execPath, [join(root, 'tools/serve.mjs'), '--port', String(port), '--dir', dir], { stdio: 'pipe' });
+  await new Promise((r) => srv.stdout.once('data', r));
+  const browser = await chromium.launch({ executablePath: CHROME });
+  try {
+    const page = await (await browser.newContext()).newPage();
+    await page.goto(`http://localhost:${port}/`);
+    await onboard({ page }, 'Uma', 'correct horse battery staple');
+    await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 30000 });
+    await page.click(tid('settings'));
+    assert.equal(await page.textContent(tid('build-fp')), fpA);
+    assert.equal(await page.$(tid('update-banner')), null, 'no banner without an update');
+
+    // The host publishes a new build (different relay → different files → new fingerprint).
+    execFileSync(process.execPath, [join(root, 'tools/build.mjs'), '--relay', 'http://127.0.0.1:9', '--out', abs], { stdio: 'pipe' });
+    const fpB = JSON.parse(readFileSync(join(abs, 'build-info.json'), 'utf8')).fingerprint;
+    assert.notEqual(fpA, fpB);
+
+    // Nothing changes by itself: the new build downloads, verifies, then WAITS and is announced.
+    await page.click(tid('check-update'));
+    await page.waitForSelector(tid('update-banner'), { timeout: 30000 });
+    assert.match(await page.textContent(tid('update-banner')), new RegExp(fpB));
+    assert.equal(await page.textContent(tid('build-fp')), fpA, 'still running the old build until the person agrees');
+
+    // One tap: the verified build takes over and the page reloads into it.
+    await Promise.all([page.waitForEvent('load', { timeout: 30000 }), page.click(tid('apply-update'))]);
+    await page.waitForSelector(tid('unlock-pass'), { timeout: 30000 }); // vault survived; it's locked after a restart
+    await page.fill(tid('unlock-pass'), 'correct horse battery staple');
+    await page.click(tid('unlock'));
+    await page.click(tid('settings'));
+    await page.waitForFunction(([s, fp]) => document.querySelector(s)?.textContent === fp, [tid('build-fp'), fpB], { timeout: 10000 });
+    assert.equal(await page.$(tid('update-banner')), null, 'banner gone once updated');
+    assert.match(await page.inputValue('input[aria-label="Display name"]'), /Uma/, 'profile kept across the update');
+  } finally { await browser.close(); srv.kill(); rmSync(abs, { recursive: true, force: true }); }
+});
+
 test('internet mode: invite link, stranger gating, scam warnings, offline queue, verification', { timeout: 240000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME });
   const C = await profile(browser, 'carol'), D = await profile(browser, 'dave');
@@ -509,6 +551,21 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
       return { jpeg: b[0] === 0xff && b[1] === 0xd8, secret: /SECRET/.test(t) };
     });
     assert.deepEqual(got, { jpeg: true, secret: false }, 'photo arrives as a JPEG with no hidden camera/location data');
+
+    // --- saving it on a phone: the system share sheet ("Save Image" → Photos), not a dead download link ---
+    await P.Dave.page.evaluate(() => {
+      const real = window.matchMedia.bind(window);
+      window.matchMedia = (q) => (q === '(pointer:coarse)' ? { matches: true, media: q } : real(q)); // a touch phone
+      navigator.canShare = (d) => Array.isArray(d?.files) && d.files.every((f) => f instanceof File);
+      navigator.share = async (d) => {
+        const f = d.files[0]; const b = new Uint8Array(await f.arrayBuffer());
+        window.__shared = { n: d.files.length, name: f.name, type: f.type, jpeg: b[0] === 0xff && b[1] === 0xd8, secret: /SECRET/.test(new TextDecoder('latin1').decode(b)) };
+      };
+    });
+    await P.Dave.page.click(`${tid('msg-in')} ${tid('file')}`);
+    await P.Dave.page.waitForFunction(() => !!window.__shared, null, { timeout: 5000 });
+    assert.deepEqual(await P.Dave.page.evaluate(() => window.__shared), { n: 1, name: 'photo-gps.jpg', type: 'image/jpeg', jpeg: true, secret: false },
+      'phone save hands the cleaned photo, with its real image type, to the share sheet');
 
     // --- location: GPS position, distance and direction, no map server ---
     await P.Carol.page.click(tid('share-location'));

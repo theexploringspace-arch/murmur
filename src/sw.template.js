@@ -4,9 +4,10 @@
 // SHA-256 recorded at build time, and refuses to install if any byte differs.
 // After that, Murmur is served entirely from this device — airplane mode works.
 //
-// Updates: browsers re-check sw.js periodically. A changed build installs as
-// a NEW cache and only takes over after every Murmur tab is closed; its build
-// fingerprint (Settings) will differ — compare it with a friend's.
+// Updates: Murmur re-checks sw.js whenever it comes to the front. A changed build
+// installs as a NEW cache, verified file by file, then WAITS. The app shows "Restart
+// to update" with the new fingerprint; only that tap (or closing every Murmur window)
+// lets it take over. Its fingerprint (Settings) will differ — compare with a friend's.
 
 const VERSION = '__VERSION__';
 const FILES = __PRECACHE__; // { "./path": "sha256-hex" }
@@ -44,6 +45,12 @@ async function precache() {
     }
   }
 }
+
+// The page asks for this only after the person taps "Restart to update", and only a
+// worker that already finished install — i.e. passed every integrity check — can be waiting.
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'murmur-skip-waiting') self.skipWaiting();
+});
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {

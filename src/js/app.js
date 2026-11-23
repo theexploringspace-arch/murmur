@@ -228,7 +228,8 @@ async function fileMessage(base, name, mime, bytes, kind) {
   const playable = safety.verdict === 'ok' && /^(audio\/|video\/(mp4|webm|quicktime))/.test(safety.realType)
     ? (kind === 'voice' || safety.realType.startsWith('audio/') ? 'audio' : 'video') : null;
   const type = safety.inline || playable ? safety.realType : 'application/octet-stream'; // never let the browser sniff/render other types
-  return { ...base, file: { name: safety.name, mime, size: bytes.length, url: URL.createObjectURL(new Blob([bytes], { type })), safety, playable, kind } };
+  const blob = new Blob([bytes], { type });
+  return { ...base, file: { name: safety.name, mime, size: bytes.length, blob, url: URL.createObjectURL(blob), safety, playable, kind } };
 }
 
 async function sendFileRemote(cid, file, ttl, progress, extra = {}) {
@@ -281,7 +282,7 @@ function wireAutoLock() {
   let hiddenAt = 0;
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) hiddenAt = Date.now();
-    else S.remote?.kick();
+    else { S.remote?.kick(); checkForUpdate(); }
     if (document.hidden) return;
     if (S.vault && hiddenAt && Date.now() - hiddenAt > S.settings.autoLockMin * 60000) lock('Locked while you were away');
   });
@@ -324,16 +325,69 @@ function explainOfflineError(raw) {
   return `Offline mode is OFF: Murmur couldn't download all of its files (${raw}). Open it again while online.`;
 }
 
+// ---- updates ----
+// A new build installs in the background as a *waiting* service worker, after its own
+// integrity check passed. Browsers only swap it in once every Murmur window is closed,
+// which on phones can take days. So: look for updates whenever Murmur comes to the
+// front, and when one is verified and waiting, say so and let the person apply it.
+const UPD = { reg: null, waiting: null, running: null, next: null, applying: false };
+
+/** The fingerprint inside a build's own cache (never the network). */
+async function cachedFingerprint(cacheName) {
+  try {
+    const res = await (await caches.open(cacheName)).match('./build-info.json');
+    return res ? (await res.json()).fingerprint : null;
+  } catch { return null; }
+}
+async function noteWaiting(worker) {
+  if (!worker || !navigator.serviceWorker.controller) return; // first install: nothing to replace
+  UPD.waiting = worker;
+  const names = (await caches.keys()).filter((k) => k.startsWith('murmur-'));
+  const fps = await Promise.all(names.map(cachedFingerprint));
+  UPD.next = fps.find((f) => f && f !== UPD.running) || null;
+  rerenderIf('home'); rerenderIf('settings');
+  rerenderIf('unlock', () => !document.getElementById('pass')?.value); // never wipe a half-typed passphrase
+}
+function checkForUpdate() { UPD.reg?.update().catch(() => {}); }
+function applyUpdate() {
+  if (!UPD.waiting || UPD.applying) return;
+  UPD.applying = true;
+  UPD.waiting.postMessage({ type: 'murmur-skip-waiting' }); // reload happens on controllerchange
+}
+function updateBanner() {
+  if (!UPD.waiting) return null;
+  return h('div.banner.update', { 'data-testid': 'update-banner' },
+    h('p', icon('shield', 14), ' A new version of Murmur is downloaded and passed its integrity check.'),
+    UPD.next ? h('p.hint', 'New fingerprint: ', h('code.small', UPD.next)) : null,
+    h('button.primary', { type: 'button', onclick: applyUpdate, 'data-testid': 'apply-update' }, UPD.applying ? 'Restarting…' : 'Restart to update'));
+}
+
 async function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
+  fetch('./build-info.json').then((r) => r.json()).then((b) => { UPD.running = b.fingerprint; }).catch(() => {});
   navigator.serviceWorker.addEventListener('message', (e) => {
     if (e.data?.type !== 'murmur-offline-error') return;
     offlineError = explainOfflineError(String(e.data.message));
     toast(offlineError, 'error', 15000);
     rerenderIf('settings');
   });
-  try { await navigator.serviceWorker.register(scriptUrl('./sw.js'), { scope: './' }); }
-  catch (e) { console.warn('Service worker not registered (offline use unavailable):', e.message); }
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    // A new verified build took over. Reload so page and cache are the same build —
+    // but a first install claiming this page is not an update: don't yank it out
+    // from under someone mid-setup.
+    if (hadController || UPD.applying) location.reload();
+  });
+  try {
+    const reg = await navigator.serviceWorker.register(scriptUrl('./sw.js'), { scope: './' });
+    UPD.reg = reg;
+    if (reg.waiting) noteWaiting(reg.waiting);
+    reg.addEventListener('updatefound', () => {
+      const w = reg.installing;
+      w?.addEventListener('statechange', () => { if (w.state === 'installed') noteWaiting(w); });
+    });
+    checkForUpdate();
+  } catch (e) { console.warn('Service worker not registered (offline use unavailable):', e.message); }
 }
 
 // ---------------------------------------------------------------- conversations
@@ -475,6 +529,7 @@ VIEWS.unlock = () => {
     },
   },
   h('div.brand', h('div.logo', icon('lock', 40)), h('h1', 'Murmur is locked')),
+  updateBanner(),
   h('label', { for: 'pass' }, 'Passphrase'), p, err, btn,
   h('button.link', { type: 'button', onclick: panicWipe, 'data-testid': 'forgot' }, 'Forgot it? Erase this device and start over'));
 };
@@ -496,6 +551,7 @@ VIEWS.home = () => {
         h('button.icon', { onclick: () => lock(), 'aria-label': 'Lock', 'data-testid': 'lock' }, icon('lock')),
       ],
     }),
+    updateBanner(),
     h('section.pair-actions',
       h('button.tile', { onclick: () => go('invite'), 'data-testid': 'invite' }, icon('qr', 30), h('span', 'Show my code'), h('small', 'Start a new chat')),
       h('button.tile', { onclick: () => go('join'), 'data-testid': 'join' }, icon('scan', 30), h('span', 'Scan a code'), h('small', 'Join a friend’s chat'))),
@@ -782,6 +838,15 @@ async function saveFile(m, cid) {
       actions: [['Cancel', false], [sf.verdict === 'danger' ? 'Save anyway' : 'Save', true, sf.verdict === 'danger' ? 'danger' : 'primary']] });
     if (!ok) return;
   }
+  // Phones: <a download> on a blob does nothing useful in an iPhone Home Screen app (and
+  // can strand you on a preview with no way back). The system share sheet is the real
+  // path there — "Save Image"/"Save Video" go to Photos, "Save to Files" for the rest.
+  // It must be called straight from the tap, so the Blob is already in memory (no await).
+  const f = m.file.blob && new File([m.file.blob], m.file.name, { type: m.file.blob.type });
+  if (f && matchMedia('(pointer:coarse)').matches && navigator.canShare?.({ files: [f] })) {
+    try { await navigator.share({ files: [f] }); return; }
+    catch (e) { if (e.name === 'AbortError') return; /* person closed the sheet */ console.warn('share failed, downloading instead:', e.message); }
+  }
   const a = h('a', { href: m.file.url, download: m.file.name, hidden: true }); document.body.append(a); a.click(); a.remove();
 }
 
@@ -804,7 +869,7 @@ function bubble(m, key = S.viewArgs?.[0]) {
     if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': m.file.kind === 'voice' ? 'voice-clip' : 'audio' }));
     if (m.file.url && m.file.playable === 'video') body.push(h('video.attach', { controls: true, playsinline: true, preload: 'metadata', src: m.file.url, 'data-testid': 'video' }));
     if (sf && sf.verdict !== 'ok') body.push(h(`p.filewarn.${sf.verdict}`, { 'data-testid': 'file-warning' }, icon('alert', 14), ` ${sf.reasons[0]}`));
-    body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`) : h('span.file', m.file.name));
+    body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`, h('span.save', 'Save')) : h('span.file', m.file.name));
   }
   return h(`div.msg.${m.dir}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
     ...body,
@@ -1430,6 +1495,7 @@ VIEWS.settings = () => {
       h('h2', 'This app'),
       h('p', `Murmur ${APP_VERSION} · `, sw),
       h('p.hint', 'Build fingerprint (compare with a friend to confirm you run identical code): '), fp,
+      updateBanner() || h('button', { onclick: () => { checkForUpdate(); toast('Checking for a new version…'); }, 'data-testid': 'check-update' }, 'Check for update'),
       h('button', { onclick: () => go('about') }, icon('shield', 18), ' How Murmur protects you'),
 
       h('h2', 'Panic'),

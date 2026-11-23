@@ -104,6 +104,11 @@ Cloudflare redirects `/index.html` to `/`. The service worker therefore download
 `./` (which every host serves) and still refuses any redirect it didn't expect. The local dev
 server copies Cloudflare's redirect so the offline e2e test covers it.
 
+**Updates.** After you deploy, each phone downloads the new build in the background, checks
+every file's hash, and then shows **"Restart to update"** with the new fingerprint (home screen,
+lock screen and Settings → *Check for update*). Nothing changes until that tap — so two friends
+can compare fingerprints first.
+
 **Avoid hosts that inject into your pages.** Netlify's free plan adds a "Powered by Netlify"
 script to every HTML page and only lets paid plans turn it off. Murmur's service worker sees
 that `index.html` no longer matches its build hash and **refuses to install** — so offline
