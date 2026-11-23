@@ -3,14 +3,17 @@
 
 import { Vault, WrongPassphraseError, VaultWipedError, MIN_PASSPHRASE } from './core/vault.js';
 import { IdbStore } from './core/storage.js';
-import { Conversation, MAX_FILE, MAX_TEXT, APP_VERSION, newId } from './core/conversation.js';
+import { Conversation, MAX_FILE, MAX_TEXT, APP_VERSION, newId, fileExtra } from './core/conversation.js';
 import { Remote } from './core/remote.js';
 import { RELAY_URL } from './config.js';
 import { linkify, inspectFile, lookalikeNames } from './core/safety.js';
 import { sha256 } from './core/crypto.js';
+import { stripMetadata } from './core/media.js';
+import { validLocation, relative, formatCoords, mapLinks } from './core/geo.js';
+import { createGroup, applyInvite, inviteMessage, isMember, withoutMember, recipients, GroupError } from './core/groups.js';
 import { contactId, safetyNumber } from './core/identity.js';
 import { toQrText, toPasteText, fromText, PairingError, clampName } from './core/pairing.js';
-import { toB64u, fromB64u, equal } from './core/bytes.js';
+import { toB64u, fromB64u, equal, toHex } from './core/bytes.js';
 import { encodeQR } from './qr/encode.js';
 import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
@@ -38,6 +41,10 @@ const S = {
   relayOnline: false,
   rfiles: new Map(),     // incoming files over the relay: `${cid}:${fid}` → {meta, parts, got}
   pendingInvite: null,   // invite link opened before unlocking
+  myCid: null,           // my own contact id (groups list me by it)
+  groups: new Map(),     // gid → group (see core/groups.js)
+  myLoc: null,           // my last GPS fix, only kept in memory, used for "how far?"
+  liveShares: new Map(), // chat key → {watchId, lid, until, last}
 };
 
 // ---------------------------------------------------------------- utilities
@@ -122,6 +129,8 @@ async function openVault(vault) {
   S.settings = { autoLockMin: 5, ...(await vault.getRecord('settings', {})) };
   S.contacts = new Map((await vault.getRecord('contacts', [])).map((c) => [c.id, c]));
   S.chats = new Map();
+  S.myCid = await contactId(vault.identity.publicRaw);
+  S.groups = new Map((await vault.getRecord('groups', [])).map((g) => [g.id, g]));
   for (const c of S.contacts.values()) {
     if (c.verified === undefined) c.verified = !c.remote; // contacts from before internet mode were all paired in person
     if (c.keepHistory) S.chats.set(c.id, await vault.getRecord(`history/${c.id}`, []));
@@ -149,7 +158,8 @@ function stopRemote() { S.remote?.stop(); S.remote = null; S.relayOnline = false
 
 function setMsgStatus(cid, mid, status) {
   const m = (S.chats.get(cid) || []).find((x) => x.id === mid && x.dir === 'out');
-  if (!m || m.status === 'delivered') return;
+  if (!m) { if (status === 'delivered') groupAck(cid, mid); return; }
+  if (m.status === 'delivered') return;
   m.status = status;
   const el = document.querySelector(`[data-mid="${mid}"] .status`);
   if (el) el.textContent = STATUS_MARK[status] || '';
@@ -202,25 +212,28 @@ async function onRemoteMessage(cid, m) {
         const blob = new Blob(f.parts, { type: 'application/octet-stream' });
         const bytes = new Uint8Array(await blob.arrayBuffer());
         if (toB64u(await sha256(bytes)) !== f.meta.sha) { toast(`File “${f.meta.name}” failed its integrity check`, 'error'); return; }
-        addMessage(cid, await fileMessage({ id: String(f.meta.id), dir: 'in', ts: +f.meta.ts || Date.now(), ttl: Math.max(0, f.meta.ttl | 0) }, String(f.meta.name), String(f.meta.mime), bytes));
+        await receivedFile(cid, { id: String(f.meta.id), ts: +f.meta.ts || Date.now(), ttl: Math.max(0, f.meta.ttl | 0) }, String(f.meta.name), String(f.meta.mime), bytes, fileExtra(f.meta));
         S.remote.send(cid, { t: 'ack', id: f.meta.id }).catch(() => {});
       }
       break;
     }
-    default: break;
+    default: await onAppMessage(cid, m); break;
   }
 }
 
 /** Build a file message: checks the REAL type from the bytes before anything is shown. */
-async function fileMessage(base, name, mime, bytes) {
+async function fileMessage(base, name, mime, bytes, kind) {
   const safety = inspectFile(name, mime, bytes);
-  const type = safety.inline ? safety.realType : 'application/octet-stream'; // never let the browser sniff/render other types
-  return { ...base, file: { name: safety.name, mime, size: bytes.length, url: URL.createObjectURL(new Blob([bytes], { type })), safety } };
+  // Audio/video play inside Murmur only when their CONTENT is really audio/video and nothing was flagged.
+  const playable = safety.verdict === 'ok' && /^(audio\/|video\/(mp4|webm|quicktime))/.test(safety.realType)
+    ? (kind === 'voice' || safety.realType.startsWith('audio/') ? 'audio' : 'video') : null;
+  const type = safety.inline || playable ? safety.realType : 'application/octet-stream'; // never let the browser sniff/render other types
+  return { ...base, file: { name: safety.name, mime, size: bytes.length, url: URL.createObjectURL(new Blob([bytes], { type })), safety, playable, kind } };
 }
 
-async function sendFileRemote(cid, file, ttl, progress) {
+async function sendFileRemote(cid, file, ttl, progress, extra = {}) {
   const bytes = new Uint8Array(await file.arrayBuffer());
-  const meta = { t: 'file', id: newId(), ts: Date.now(), name: String(file.name || 'file').slice(0, 120), mime: String(file.type || 'application/octet-stream').slice(0, 100),
+  const meta = { t: 'file', id: extra.id || newId(), ts: Date.now(), ...fileExtra(extra), name: String(file.name || 'file').slice(0, 120), mime: String(file.type || 'application/octet-stream').slice(0, 100),
     size: bytes.length, sha: toB64u(await sha256(bytes)), chunks: Math.ceil(bytes.length / REMOTE_CHUNK) || 1, ttl: ttl | 0 };
   await S.remote.send(cid, meta);
   for (let i = 0; i < meta.chunks; i++) {
@@ -252,10 +265,11 @@ async function onControl(conv, id, m) {
 
 function lock(reason) {
   stopRemote();
+  stopAllLiveShares();
   for (const conv of S.convs.values()) conv.close('locked');
   for (const msgs of S.chats.values()) for (const m of msgs) if (m.file?.url) URL.revokeObjectURL(m.file.url);
   S.vault?.lock();
-  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), rfiles: new Map() });
+  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
   go('unlock');
   if (reason) toast(reason);
@@ -329,10 +343,12 @@ function addMessage(cid, m) {
   if (list.some((x) => x.id === m.id && x.dir === m.dir)) return;
   if (m.ttl) m.expiresAt = Date.now() + m.ttl * 1000;
   list.push(m);
-  if (m.dir === 'in' && !(S.view === 'chat' && S.viewArgs[0] === cid && !document.hidden)) S.unread.set(cid, (S.unread.get(cid) || 0) + 1);
+  const open = isOpenChat(cid);
+  if (m.dir === 'in' && !(open && !document.hidden)) S.unread.set(cid, (S.unread.get(cid) || 0) + 1);
   persistHistory(cid).catch(() => {});
-  if (S.view === 'chat' && S.viewArgs[0] === cid) appendBubble(m); else rerenderIf('home');
+  if (open) appendBubble(m, cid); else rerenderIf('home');
 }
+const isOpenChat = (key) => (S.view === 'chat' && S.viewArgs[0] === key) || (S.view === 'group' && `g:${S.viewArgs[0]}` === key);
 
 /** Called once a Conversation is connected: bind it to a (possibly new) contact. */
 async function adoptConversation(conv) {
@@ -350,7 +366,8 @@ async function adoptConversation(conv) {
   if (old && old !== conv) old.close('replaced by new connection');
   S.convs.set(id, conv);
   conv.on('message', (m) => addMessage(id, { ...m, dir: 'in' }))
-    .on('file', async (f) => addMessage(id, await fileMessage({ id: f.id, dir: 'in', ts: f.ts, ttl: f.ttl }, f.name, f.mime, new Uint8Array(await f.blob.arrayBuffer()))))
+    .on('file', async (f) => receivedFile(id, { id: f.id, ts: f.ts, ttl: f.ttl }, f.name, f.mime, new Uint8Array(await f.blob.arrayBuffer()), f))
+    .on('app', (m) => onAppMessage(id, m).catch((e) => console.warn(e)))
     .on('control', (m) => onControl(conv, id, m).catch((e) => toast(`Internet setup failed: ${e.message}`, 'error')))
     .on('file-start', (f) => { if (S.view === 'chat' && S.viewArgs[0] === id) setStatusLine(`Receiving ${f.name}…`); })
     .on('file-progress', (_fid, got, size) => { if (S.view === 'chat' && S.viewArgs[0] === id) setStatusLine(`Receiving… ${Math.round((got / size) * 100)}%`); })
@@ -474,6 +491,7 @@ VIEWS.home = () => {
   return h('div.screen.full',
     header('Murmur', {
       actions: [
+        h('button.sos', { onclick: () => go('sos'), 'aria-label': 'Emergency SOS', 'data-testid': 'sos' }, 'SOS'),
         h('button.icon', { onclick: () => go('settings'), 'aria-label': 'Settings', 'data-testid': 'settings' }, icon('gear')),
         h('button.icon', { onclick: () => lock(), 'aria-label': 'Lock', 'data-testid': 'lock' }, icon('lock')),
       ],
@@ -493,7 +511,14 @@ VIEWS.home = () => {
         h('span.cname', displayName(c)),
         h('span.cstate', { 'data-kind': linkState(c.id)[1] }, c.request ? 'wants to chat' : linkState(c.id)[0]),
         S.unread.get(c.id) ? h('span.badge', String(S.unread.get(c.id))) : null))))
-      : h('div.empty', h('p', 'No contacts yet.'), h('p', 'Meet up, tap ', h('strong', 'Show my code'), ', and let your friend scan it — or send an ', h('strong', 'invite link'), '.')));
+      : h('div.empty', h('p', 'No contacts yet.'), h('p', 'Meet up, tap ', h('strong', 'Show my code'), ', and let your friend scan it — or send an ', h('strong', 'invite link'), '.')),
+    list.length ? h('section.groups',
+      h('div.sectionhead', h('h2', 'Groups'), h('button', { onclick: () => go('newgroup'), 'data-testid': 'new-group' }, icon('users', 16), ' New group')),
+      [...S.groups.values()].filter((g) => !g.removed).length
+        ? h('ul.contacts', [...S.groups.values()].filter((g) => !g.removed).map((g) => h('li', h('button.contact', { onclick: () => { S.unread.delete(`g:${g.id}`); go('group', g.id); }, 'data-testid': `group-${g.name}` },
+          h('span.avatar.group', icon('users', 18)), h('span.cname', g.name), h('span.cstate', `${g.members.length} people`),
+          S.unread.get(`g:${g.id}`) ? h('span.badge', String(S.unread.get(`g:${g.id}`))) : null))))
+        : h('p.hint', 'No groups yet.')) : null);
 };
 
 // ---- invite by link (friends far away) ----
@@ -765,12 +790,19 @@ function richText(m, cid) {
     : h(`button.inlink.risk-${seg.analysis.risk}`, { type: 'button', 'data-testid': 'link', onclick: () => checkLink(seg, cid, m.dir) }, seg.text))));
 }
 
-function bubble(m, cid = S.viewArgs?.[0]) {
+function bubble(m, key = S.viewArgs?.[0]) {
+  if (m.system) return h('p.sysmsg', { 'data-mid': m.id }, m.text);
+  const cid = m.from || key; // in groups, safety decisions use the actual sender
   const body = [];
+  if (m.from && m.dir === 'in' && String(key).startsWith('g:')) body.push(h('div.sender', { 'data-testid': 'sender' }, memberName(S.groups.get(String(key).slice(2)), m.from)));
+  if (m.sos) body.push(sosCard(m));
+  if (m.loc) body.push(locCard(m));
   if (m.text != null) body.push(richText(m, cid));
   if (m.file) {
     const sf = m.file.safety;
     if (m.file.url && sf?.inline) body.push(h('img.attach', { src: m.file.url, alt: m.file.name }));
+    if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': m.file.kind === 'voice' ? 'voice-clip' : 'audio' }));
+    if (m.file.url && m.file.playable === 'video') body.push(h('video.attach', { controls: true, playsinline: true, preload: 'metadata', src: m.file.url, 'data-testid': 'video' }));
     if (sf && sf.verdict !== 'ok') body.push(h(`p.filewarn.${sf.verdict}`, { 'data-testid': 'file-warning' }, icon('alert', 14), ` ${sf.reasons[0]}`));
     body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`) : h('span.file', m.file.name));
   }
@@ -778,15 +810,21 @@ function bubble(m, cid = S.viewArgs?.[0]) {
     ...body,
     h('div.meta', fmtTime(m.ts),
       m.expiresAt ? h('span.ttl', icon('timer', 12), h('span', { 'data-expires': m.expiresAt })) : null,
-      m.dir === 'out' ? h('span.status', { title: m.status || 'sent' }, STATUS_MARK[m.status] || '✓') : null));
+      m.dir === 'out' ? h('span.status', { title: m.status || 'sent' }, groupStatus(m, key)) : null));
+}
+function groupStatus(m, key) {
+  if (!String(key).startsWith('g:') || !m.acks) return STATUS_MARK[m.status] || '✓';
+  const g = S.groups.get(String(key).slice(2)); const n = g ? recipients(g, S.myCid).length : 0;
+  if (m.status === 'queued' && !m.acks.length) return STATUS_MARK.queued;
+  return m.acks.length && m.acks.length >= n ? '✓✓' : m.acks.length ? `✓ ${m.acks.length}/${n}` : '✓';
 }
 
-function appendBubble(m) {
+function appendBubble(m, key) {
   const log = document.getElementById('log');
   if (!log) return;
   const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 120;
   document.querySelector('#log .empty')?.remove();
-  log.append(bubble(m));
+  log.append(bubble(m, key)); // key tells the renderer whether this is a group chat (sender names)
   if (nearBottom || m.dir === 'out') log.scrollTop = log.scrollHeight;
   purgeExpired();
 }
@@ -801,16 +839,12 @@ VIEWS.chat = (id) => {
   const msgs = S.chats.get(id) || [];
   const log = h('div#log.log', { 'aria-live': 'polite', 'data-testid': 'log' },
     msgs.length ? msgs.map((m) => bubble(m, id)) : h('p.empty', online ? 'Say hi. Messages are end-to-end encrypted.' : 'Not connected.'));
-  const input = h('textarea#compose', { rows: 1, placeholder: live ? 'Message' : online ? (S.relayOnline ? 'Message (via internet)' : 'Message — sends when you’re online') : hasRemote(id) ? 'Waiting for their first message…' : 'Reconnect to send', disabled: !online, maxlength: 8000, 'data-testid': 'compose', 'aria-label': 'Message' });
-  const fileIn = h('input', { type: 'file', hidden: true, 'data-testid': 'file-input' });
   let typingSent = false, typingTimer = 0;
-
-  const send = async () => {
-    const text = input.value;
-    if (!text.trim() || !canChat(id)) return;
-    if (text.length > MAX_TEXT) { toast(`Message too long (max ${MAX_TEXT} characters)`, 'error'); return; }
-    input.value = ''; input.style.height = '';
-    try {
+  const comp = composer({
+    key: id, disabled: !online,
+    placeholder: live ? 'Message' : online ? (S.relayOnline ? 'Message (via internet)' : 'Message — sends when you’re online') : hasRemote(id) ? 'Waiting for their first message…' : 'Reconnect to send',
+    onText: async (text) => {
+      if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
       if (isOnline(id)) {
         const m = await S.convs.get(id).sendText(text, c.ttl);
         addMessage(id, { ...m, dir: 'out', status: 'sent' });
@@ -819,31 +853,20 @@ VIEWS.chat = (id) => {
         addMessage(id, { ...m, dir: 'out', status: 'queued' });
         await S.remote.send(id, m);
       }
-    } catch (e) { toast(e.message, 'error'); input.value = text; }
-    if (typingSent) { conv?.setTyping(false); typingSent = false; }
-  };
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); } });
+      if (typingSent) { S.convs.get(id)?.setTyping(false); typingSent = false; }
+    },
+    onFile: async (f, kind) => {
+      setStatusLine(`Sending ${f.name}…`);
+      const r = await deliverFile(id, f, c.ttl, (s, t) => setStatusLine(`Sending… ${Math.round((s / t) * 100)}%`), kind ? { kind } : {});
+      addMessage(id, await fileMessage({ id: r.meta.id, dir: 'out', ts: r.meta.ts, ttl: r.meta.ttl, status: r.status }, r.meta.name, r.meta.mime, r.bytes, kind));
+      setStatusLine('');
+    },
+    onLocation: () => shareLocation(id, () => [id]),
+  });
+  const input = comp.querySelector('textarea');
   input.addEventListener('input', () => {
-    input.style.height = ''; input.style.height = `${Math.min(140, input.scrollHeight)}px`;
     if (!typingSent && input.value) { conv?.setTyping(true); typingSent = true; }
     clearTimeout(typingTimer); typingTimer = setTimeout(() => { if (typingSent) { conv?.setTyping(false); typingSent = false; } }, 2500);
-  });
-  fileIn.addEventListener('change', async () => {
-    const f = fileIn.files[0]; fileIn.value = '';
-    if (!f) return;
-    if (f.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
-    try {
-      setStatusLine(`Sending ${f.name}…`);
-      const progress = (s, t) => setStatusLine(`Sending… ${Math.round((s / t) * 100)}%`);
-      if (isOnline(id)) {
-        const meta = await S.convs.get(id).sendFile(f, c.ttl, progress);
-        addMessage(id, await fileMessage({ id: meta.id, dir: 'out', ts: meta.ts, ttl: meta.ttl, status: 'sent' }, meta.name, meta.mime, new Uint8Array(await meta.blob.arrayBuffer())));
-      } else if (canChat(id)) {
-        const { meta, bytes } = await sendFileRemote(id, f, c.ttl, progress);
-        addMessage(id, await fileMessage({ id: meta.id, dir: 'out', ts: meta.ts, ttl: meta.ttl, status: S.relayOnline ? 'sent' : 'queued' }, meta.name, meta.mime, bytes));
-      }
-      setStatusLine('');
-    } catch (e) { toast(e.message, 'error'); }
   });
 
   const ttlSel = h('select', { 'aria-label': 'Disappearing messages', 'data-testid': 'ttl', onchange: async (e) => { c.ttl = +e.target.value; await persistContacts(); toast(c.ttl ? `New messages disappear after ${TTL_OPTIONS.find(([v]) => v === c.ttl)[1]}` : 'Disappearing messages off'); } },
@@ -869,17 +892,456 @@ VIEWS.chat = (id) => {
       h('div.share',
         h('button.primary', { onclick: () => go('invite', id), 'data-testid': 'reconnect-invite' }, icon('qr', 18), ' Show my code'),
         h('button', { onclick: () => go('join', id), 'data-testid': 'reconnect-join' }, icon('scan', 18), ' Scan theirs'))),
+    liveBanner(id),
     log,
     h('p#typing.typing', { hidden: !S.typing.get(id) }, `${displayName(c)} is typing…`),
     h('p#chatstatus.chatstatus', { hidden: true }),
-    h('form.composer', { onsubmit: (e) => { e.preventDefault(); send(); } },
-      h('button.icon', { type: 'button', onclick: () => fileIn.click(), disabled: !online, 'aria-label': 'Attach file', 'data-testid': 'attach' }, icon('clip')),
-      input, fileIn,
-      h('label.ttlwrap', { title: 'Disappearing messages' }, icon('timer', 18), ttlSel),
-      h('button.icon.send', { type: 'submit', disabled: !online, 'aria-label': 'Send', 'data-testid': 'send' }, icon('send'))));
+    h('div.chattools', h('label.ttlwrap', { title: 'Disappearing messages' }, icon('timer', 16), ttlSel)),
+    comp);
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; if (online) input.focus(); });
   return view;
 };
+
+// ================================================================ phase 1: media, voice, location, SOS, groups
+
+// ---- one way to send, whichever path is available ----
+/** Sends an app message to one contact: live session if connected, else the relay. → 'sent' | 'queued' */
+async function deliver(cid, m) {
+  if (isOnline(cid)) { await S.convs.get(cid).sendApp(m); return 'sent'; }
+  if (hasRemote(cid) && S.remote.canSend(cid)) { await S.remote.send(cid, m); return S.relayOnline ? 'sent' : 'queued'; }
+  throw new Error(`${displayName(S.contacts.get(cid) || { name: 'Contact' })} isn't reachable yet`);
+}
+async function deliverFile(cid, file, ttl, progress, extra = {}) {
+  if (isOnline(cid)) {
+    const meta = await S.convs.get(cid).sendFile(file, ttl, progress, extra);
+    return { meta, bytes: new Uint8Array(await meta.blob.arrayBuffer()), status: 'sent' };
+  }
+  if (canChat(cid)) { const r = await sendFileRemote(cid, file, ttl, progress, extra); return { ...r, status: S.relayOnline ? 'sent' : 'queued' }; }
+  throw new Error(`${displayName(S.contacts.get(cid) || { name: 'Contact' })} isn't reachable yet`);
+}
+
+/** Every received file goes here: routes group files to their group, checks content, acks. */
+async function receivedFile(cid, base, name, mime, bytes, extra = {}) {
+  let key = cid, from;
+  if (extra.gid) {
+    if (!isMember(S.groups.get(extra.gid), cid)) return; // not from a member: drop
+    key = `g:${extra.gid}`; from = cid;
+  }
+  addMessage(key, { ...(await fileMessage({ ...base, dir: 'in' }, name, mime, bytes, extra.kind)), from });
+}
+
+// ---- photos & videos: remove hidden location/camera data before sending ----
+async function prepareOutgoing(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const real = inspectFile(file.name, file.type, bytes).realType;
+  if (real === 'image/heic') {
+    // HEIC can't be cleaned byte-by-byte here: re-draw it as a JPEG (drops all metadata).
+    try {
+      const bmp = await createImageBitmap(file);
+      const cv = document.createElement('canvas'); cv.width = bmp.width; cv.height = bmp.height;
+      cv.getContext('2d').drawImage(bmp, 0, 0);
+      const blob = await new Promise((r) => cv.toBlob(r, 'image/jpeg', 0.92));
+      return { file: new File([blob], file.name.replace(/\.hei[cf]$/i, '') + '.jpg', { type: 'image/jpeg' }), note: 'Converted to JPEG and removed hidden location & camera info' };
+    } catch { return { file, note: 'Couldn’t remove hidden info from this HEIC photo', warn: true }; }
+  }
+  if (!/^(image|video)\//.test(real)) return { file, note: null };
+  const r = stripMetadata(bytes); // throws MediaError on damaged files: better to refuse than half-clean
+  if (!r.stripped) return { file, note: null };
+  return { file: new File([r.bytes], file.name, { type: file.type || real }), note: r.removed.length ? 'Removed hidden location & camera info' : null };
+}
+
+// ---- walkie-talkie: press and hold to talk, release to send ----
+function voiceButton(onClip, disabled) {
+  const btn = h('button.icon.mic', { type: 'button', disabled, 'aria-label': 'Hold to talk', 'data-testid': 'voice', title: 'Hold to talk' }, icon('mic'));
+  let rec = null, stream = null, held = false, cancelled = false, started = 0, timer = 0;
+  const stop = () => { clearTimeout(timer); if (rec && rec.state !== 'inactive') rec.stop(); };
+  btn.addEventListener('pointerdown', async (e) => {
+    e.preventDefault(); if (rec || btn.disabled) return;
+    held = true; cancelled = false;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); held = false; return; }
+    if (!held) { stream.getTracks().forEach((t) => t.stop()); toast('Hold the button while you talk'); return; } // released during the permission prompt
+    const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
+    const chunks = [];
+    rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+    rec.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data); };
+    rec.onstop = () => {
+      stream.getTracks().forEach((t) => t.stop());
+      const mime = (rec.mimeType || type || 'audio/webm').split(';')[0];
+      const dur = Date.now() - started; rec = null; btn.classList.remove('rec'); setStatusLine('');
+      if (!cancelled && dur > 500) onClip(new File(chunks, `voice-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm'}`, { type: mime }), dur);
+      else if (!cancelled) toast('Too short — hold the button while you talk');
+    };
+    started = Date.now(); rec.start(250); btn.classList.add('rec');
+    setStatusLine('● Recording… release to send · slide away to cancel');
+    timer = setTimeout(stop, 120_000); // 2 minutes max
+  });
+  btn.addEventListener('pointerup', () => { held = false; stop(); });
+  for (const ev of ['pointerleave', 'pointercancel']) btn.addEventListener(ev, () => { if (rec) { cancelled = true; setStatusLine('Cancelled'); } held = false; stop(); });
+  btn.addEventListener('contextmenu', (e) => e.preventDefault());
+  return btn;
+}
+
+// ---- location ----
+function getPosition({ timeout = 20000 } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject(new Error('This device has no location service')); return; }
+    navigator.geolocation.getCurrentPosition(
+      (p) => { S.myLoc = { lat: p.coords.latitude, lon: p.coords.longitude, acc: Math.round(p.coords.accuracy) }; resolve(S.myLoc); },
+      (e) => reject(new Error(e.code === 1 ? 'Location access is off for Murmur (allow it in Settings)' : 'Couldn’t get a GPS fix — go outside or try again')),
+      { enableHighAccuracy: true, timeout, maximumAge: 10_000 });
+  });
+}
+const locMessage = (p, extra = {}) => ({ t: 'loc', id: newId(), ts: Date.now(), lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), acc: p.acc, ...extra });
+
+async function shareLocation(key, targets) {
+  const choice = await modal({ title: 'Share your location',
+    body: [h('p', 'Your GPS position is sent end-to-end encrypted. GPS works without internet; the message travels nearby or through the relay.'),
+      h('p.hint', 'Live sharing updates every 30 seconds while Murmur is open, then stops by itself.')],
+    actions: [['Cancel', false], ['Send once', 'once', 'primary'], ['Live 15 min', 15], ['Live 1 hour', 60]] });
+  if (!choice) return;
+  let p; try { setStatusLine('Getting your location…'); p = await getPosition(); } catch (e) { setStatusLine(''); toast(e.message, 'error', 6000); return; } finally { setStatusLine(''); }
+  const live = choice !== 'once' ? { lid: newId(), until: Date.now() + choice * 60_000 } : {};
+  const m = locMessage(p, { ...live, ...(key.startsWith('g:') ? { gid: key.slice(2) } : {}) });
+  await sendToTargets(key, targets, m, { loc: pick(m) });
+  if (live.lid) startLiveShare(key, targets, live);
+}
+const pick = (m) => ({ lat: m.lat, lon: m.lon, acc: m.acc, lid: m.lid, until: m.until });
+
+function startLiveShare(key, targets, { lid, until }) {
+  stopLiveShare(key);
+  const share = { lid, until, last: Date.now(), watchId: navigator.geolocation.watchPosition(async (pos) => {
+    if (Date.now() > until) { stopLiveShare(key); return; }
+    if (Date.now() - share.last < 30_000) return;
+    share.last = Date.now();
+    S.myLoc = { lat: pos.coords.latitude, lon: pos.coords.longitude, acc: Math.round(pos.coords.accuracy) };
+    const m = locMessage(S.myLoc, { lid, until, ...(key.startsWith('g:') ? { gid: key.slice(2) } : {}) });
+    updateLiveBubble(key, lid, m);
+    for (const cid of targets()) deliver(cid, m).catch(() => {});
+  }, () => {}, { enableHighAccuracy: true, maximumAge: 15_000 }) };
+  S.liveShares.set(key, share);
+  rerenderIf('chat'); rerenderIf('group');
+}
+function stopLiveShare(key) {
+  const s = S.liveShares.get(key); if (!s) return;
+  navigator.geolocation?.clearWatch(s.watchId); S.liveShares.delete(key);
+  rerenderIf('chat'); rerenderIf('group');
+}
+function stopAllLiveShares() { for (const k of [...S.liveShares.keys()]) stopLiveShare(k); }
+function updateLiveBubble(key, lid, m) {
+  const msg = (S.chats.get(key) || []).find((x) => x.loc?.lid === lid);
+  if (!msg) return false;
+  msg.loc = pick(m); msg.ts = m.ts;
+  const el = document.querySelector(`[data-mid="${msg.id}"]`);
+  if (el) el.replaceWith(bubble(msg, key));
+  return true;
+}
+
+function locCard(m) {
+  const L = m.loc;
+  const rel = h('p.rel', { 'data-testid': 'loc-relative' }, relative(S.myLoc, L) || '');
+  const live = L.until && Date.now() < L.until;
+  return h('div.loc', { 'data-testid': 'loc-card' },
+    h('p.loctitle', icon('pin', 16), h('strong', L.lid ? (live ? ' Live location' : ' Live location (ended)') : ' Location'),
+      live ? h('small', ` until ${fmtTime(L.until)}`) : null),
+    h('p.coords', formatCoords(L)), rel,
+    h('div.share',
+      m.dir === 'in' ? h('button', { type: 'button', 'data-testid': 'how-far', onclick: async () => {
+        try { rel.textContent = 'Getting your position…'; await getPosition(); rel.textContent = relative(S.myLoc, L); } catch (e) { rel.textContent = e.message; }
+      } }, 'How far?') : null,
+      h('button', { type: 'button', onclick: async () => { try { await navigator.clipboard.writeText(`${L.lat}, ${L.lon}`); toast('Coordinates copied'); } catch {} } }, 'Copy'),
+      h('button', { type: 'button', onclick: async () => {
+        const ok = await modal({ title: 'Open in a map app?', body: ['The map company (Apple, Google…) will see this location, and you need internet to load the map. Murmur itself sends nothing.'], actions: [['Cancel', false], ['Open map', true, 'primary']] });
+        if (ok) window.open(/iPhone|iPad|Mac/.test(navigator.userAgent) ? mapLinks(L).apple : mapLinks(L).osm, '_blank', 'noopener,noreferrer');
+      } }, 'Map')));
+}
+
+// ---- SOS ----
+function sosCard(m) {
+  return h('div.sos-card', { 'data-testid': 'sos-card' }, h('p', h('strong', '🚨 SOS'), ' ', m.sos.text), m.sos.loc ? locCard({ ...m, loc: m.sos.loc }) : h('p.hint', 'No location included'));
+}
+VIEWS.sos = () => {
+  const people = [...S.contacts.values()].filter((c) => !c.request);
+  const checks = new Map(people.map((c) => [c.id, h('input', { type: 'checkbox', checked: true, 'data-testid': `sos-to-${displayName(c)}` })]));
+  const text = h('textarea', { rows: 3, maxlength: 500, 'data-testid': 'sos-text', 'aria-label': 'SOS message' }, 'I need help. This is an SOS from Murmur.');
+  text.value = 'I need help. This is an SOS from Murmur.';
+  const withLoc = h('input', { type: 'checkbox', checked: true, 'data-testid': 'sos-loc' });
+  const progress = h('span.holdbar');
+  const btn = h('button.sosbtn', { type: 'button', 'data-testid': 'sos-send', disabled: !people.length }, progress, h('span', 'Hold to send SOS'));
+  let t = 0;
+  const cancel = () => { clearTimeout(t); btn.classList.remove('holding'); };
+  btn.addEventListener('pointerdown', (e) => { e.preventDefault(); btn.classList.add('holding'); t = setTimeout(async () => { btn.classList.remove('holding'); await sendSos(); }, 1500); });
+  btn.addEventListener('pointerup', cancel); btn.addEventListener('pointerleave', cancel); btn.addEventListener('pointercancel', cancel);
+  const sendSos = async () => {
+    const to = people.filter((c) => checks.get(c.id).checked).map((c) => c.id);
+    if (!to.length) { toast('Choose at least one person', 'error'); return; }
+    let loc = null;
+    if (withLoc.checked) { try { setStatusLine('Getting your location…'); loc = await getPosition({ timeout: 8000 }); } catch (e) { toast(`${e.message} — sending without location`, 'error'); } }
+    const m = { t: 'sos', id: newId(), ts: Date.now(), text: text.value.trim().slice(0, 500) || 'SOS', ...(loc ? { loc: { lat: +loc.lat.toFixed(6), lon: +loc.lon.toFixed(6), acc: loc.acc } } : {}) };
+    const res = { sent: 0, queued: 0, failed: [] };
+    for (const cid of to) {
+      try { const st = await deliver(cid, m); res[st] += 1; addMessage(cid, { id: m.id, dir: 'out', ts: m.ts, status: st, sos: { text: m.text, loc: m.loc } }); }
+      catch { res.failed.push(displayName(S.contacts.get(cid))); }
+    }
+    toast(`SOS sent to ${res.sent}${res.queued ? `, waiting for internet for ${res.queued}` : ''}${res.failed.length ? ` — couldn’t reach ${res.failed.join(', ')}` : ''}`, res.failed.length ? 'error' : 'success', 10000);
+    go('home');
+  };
+  return h('div.screen.full', header('Emergency SOS', { back: () => go('home') }),
+    h('div.settings',
+      h('p.warn', { 'data-testid': 'sos-disclaimer' }, icon('alert', 16), h('strong', ' Murmur cannot call emergency services.'), ' In danger, call your local emergency number (112, or 911 in the US). Many phones can also send an emergency SOS by satellite.'),
+      h('p', 'This sends an alert — with your GPS position if you allow it — to the people you choose. It goes nearby if they’re close, or through the relay; if there’s no network it waits on your phone and sends the moment you get signal.'),
+      h('h2', 'Send to'),
+      people.length ? h('ul.picklist', people.map((c) => h('li', h('label', checks.get(c.id), ` ${displayName(c)}`, c.verified ? h('small', ' ✓ verified') : null)))) : h('p.hint', 'Add contacts first.'),
+      h('h2', 'Message'), text,
+      h('label.checkline', withLoc, ' Include my location'),
+      btn));
+};
+
+// ---- incoming location / SOS / group messages (live or relay) ----
+async function onAppMessage(cid, m) {
+  const c = S.contacts.get(cid);
+  if (!c) return;
+  // Messages that get a delivery receipt must carry a sane id; roster updates (ginv) don't.
+  if (['loc', 'sos', 'gmsg'].includes(m.t) && (typeof m.id !== 'string' || !m.id || m.id.length > 32)) return;
+  const ack = () => deliver(cid, { t: 'ack', id: m.id }).catch(() => {});
+  switch (m.t) {
+    case 'loc': {
+      if (!validLocation(m)) return;
+      let key = cid, from;
+      if (m.gid) {
+        const g = S.groups.get(m.gid);
+        if (!isMember(g, cid) || !(from = groupOrigin(g, cid, m))) return;
+        key = `g:${m.gid}`; forwardIfAdmin(g, m, cid);
+      }
+      const L = { lat: m.lat, lon: m.lon, acc: m.acc, lid: typeof m.lid === 'string' ? m.lid.slice(0, 32) : undefined, until: Number.isFinite(m.until) ? m.until : undefined };
+      if (L.lid && updateLiveBubble(key, L.lid, { ...m, ...L })) return;
+      addMessage(key, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), loc: L, from }); ack();
+      break;
+    }
+    case 'sos': {
+      if (c.request) return; // strangers can't trigger alarms
+      const loc = validLocation(m.loc) ? { lat: m.loc.lat, lon: m.loc.lon, acc: m.loc.acc } : null;
+      const text = String(m.text || 'SOS').slice(0, 500);
+      addMessage(cid, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), sos: { text, loc } }); ack();
+      navigator.vibrate?.([400, 150, 400, 150, 400]);
+      const v = await modal({ title: `🚨 SOS from ${displayName(c)}`, body: [h('p.sostext', { 'data-testid': 'sos-alert' }, text),
+        loc ? h('p', formatCoords(loc), ' ', relative(S.myLoc, loc) || '') : h('p.hint', 'No location was included.'),
+        h('p.hint', 'If they may be in danger, contact local emergency services.')],
+        actions: [['Close', false], ['Open chat', true, 'primary']] });
+      if (v) go('chat', cid);
+      break;
+    }
+    case 'ginv': {
+      if (c.request) return;
+      let g;
+      try { g = applyInvite(S.groups.get(m.gid), m, cid, S.myCid); } catch (e) { console.warn('group update refused:', e.message); return; }
+      const isNew = !S.groups.has(g.id);
+      S.groups.set(g.id, g); await persistGroups();
+      if (isNew && !g.removed) toast(`${displayName(c)} added you to “${g.name}”`, 'success', 6000);
+      if (g.removed && !isNew) toast(`You were removed from “${g.name}”`);
+      rerenderIf('home'); rerenderIf('group', () => S.viewArgs[0] === g.id); rerenderIf('groupinfo', () => S.viewArgs[0] === g.id);
+      break;
+    }
+    case 'gmsg': {
+      const g = S.groups.get(m.gid);
+      if (!isMember(g, cid) || typeof m.text !== 'string' || m.text.length > MAX_TEXT) return;
+      const from = groupOrigin(g, cid, m); if (!from) return;
+      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), text: m.text, from }); ack();
+      forwardIfAdmin(g, m, cid);
+      break;
+    }
+    case 'gleave': {
+      const g = S.groups.get(m.gid);
+      if (!isMember(g, cid)) return;
+      if (g.admin === S.myCid) await updateRoster(withoutMember(g, cid), [cid]);
+      else { g.members = g.members.filter((x) => x.cid !== cid); await persistGroups(); }
+      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: Date.now(), text: `${memberName(g, cid)} left the group`, system: true });
+      break;
+    }
+    default: break;
+  }
+}
+
+// ---- groups ----
+// Members who aren't each other's contacts can't send to each other directly, so the
+// group's creator forwards every member message to everyone else (marked `fwd`).
+// Only the creator may forward, only for real members, and forwarded copies are never
+// forwarded again. Recipients see the original author's name with "(via group)" when
+// they don't have that person as a verified contact themselves.
+function groupOrigin(g, cid, m) {
+  if (!m.fwd) return cid;
+  if (cid !== g.admin || typeof m.fwd !== 'string' || !isMember(g, m.fwd) || m.fwd === S.myCid) return null;
+  return m.fwd;
+}
+function forwardIfAdmin(g, m, cid) {
+  if (m.fwd || g.admin !== S.myCid) return;
+  for (const r of recipients(g, S.myCid)) if (r !== cid && S.contacts.has(r)) deliver(r, { ...m, fwd: cid }).catch(() => {});
+}
+const persistGroups = () => S.vault.putRecord('groups', [...S.groups.values()]);
+function memberName(g, cid) {
+  if (cid === S.myCid) return 'You';
+  const c = S.contacts.get(cid);
+  return c ? displayName(c) : `${g?.members.find((m) => m.cid === cid)?.name || 'Someone'} (via group)`;
+}
+/** Send to every member except me; returns {sent, queued, failed[]}. */
+async function fanOut(g, m) {
+  const res = { sent: 0, queued: 0, failed: [] };
+  await Promise.all(recipients(g, S.myCid).map(async (cid) => {
+    if (!S.contacts.has(cid)) { res.failed.push(memberName(g, cid)); return; }
+    try { res[await deliver(cid, m)] += 1; } catch { res.failed.push(memberName(g, cid)); }
+  }));
+  return res;
+}
+async function updateRoster(g, alsoTell = []) {
+  S.groups.set(g.id, g); await persistGroups();
+  const msg = inviteMessage(g);
+  for (const cid of new Set([...recipients(g, S.myCid), ...alsoTell])) if (S.contacts.has(cid)) deliver(cid, msg).catch(() => {});
+  rerenderIf('group', () => S.viewArgs[0] === g.id); rerenderIf('groupinfo', () => S.viewArgs[0] === g.id); rerenderIf('home');
+}
+function groupAck(cid, mid) {
+  for (const [key, msgs] of S.chats) {
+    if (!key.startsWith('g:')) continue;
+    const m = msgs.find((x) => x.id === mid && x.dir === 'out');
+    if (!m) continue;
+    m.acks = [...new Set([...(m.acks || []), cid])];
+    const g = S.groups.get(key.slice(2)); const n = g ? recipients(g, S.myCid).length : m.acks.length;
+    m.status = m.acks.length >= n ? 'delivered' : 'sent';
+    const el = document.querySelector(`[data-mid="${mid}"] .status`);
+    if (el) el.textContent = m.acks.length >= n ? '✓✓' : `✓ ${m.acks.length}/${n}`;
+    return;
+  }
+}
+
+VIEWS.newgroup = () => {
+  const people = [...S.contacts.values()].filter((c) => !c.request);
+  const name = h('input', { placeholder: 'Group name', maxlength: 48, 'data-testid': 'group-name', 'aria-label': 'Group name' });
+  const checks = new Map(people.map((c) => [c.id, h('input', { type: 'checkbox', 'data-testid': `pick-${displayName(c)}` })]));
+  const create = async () => {
+    const chosen = people.filter((c) => checks.get(c.id).checked);
+    let g;
+    try { g = createGroup({ name: name.value, me: { cid: S.myCid, name: S.profile.name }, members: chosen.map((c) => ({ cid: c.id, name: displayName(c) })), randomHex: (bytes) => toHex(crypto.getRandomValues(new Uint8Array(bytes))) }); }
+    catch (e) { toast(e instanceof GroupError ? e.message : 'Could not create the group', 'error'); return; }
+    S.groups.set(g.id, g); await persistGroups();
+    const r = await fanOut(g, inviteMessage(g));
+    toast(r.failed.length ? `Group created — couldn’t reach ${r.failed.join(', ')} yet` : `Group “${g.name}” created`, r.failed.length ? 'error' : 'success');
+    go('group', g.id);
+  };
+  return h('div.screen.full', header('New group', { back: () => go('home') }),
+    h('div.settings',
+      name,
+      h('h2', 'Members'),
+      people.length ? h('ul.picklist', people.map((c) => h('li', h('label', checks.get(c.id), ` ${displayName(c)}`, c.verified ? h('small', ' ✓ verified') : h('small', ' not verified'))))) : h('p.hint', 'Add contacts first.'),
+      h('p.hint', 'Each message is end-to-end encrypted separately for every member — no group server, no shared key. Up to 20 people.'),
+      h('button.primary', { onclick: create, 'data-testid': 'create-group' }, 'Create group')));
+};
+
+VIEWS.group = (gid) => {
+  const g = S.groups.get(gid);
+  if (!g) return VIEWS.home();
+  const key = `g:${gid}`; S.unread.delete(key);
+  const msgs = S.chats.get(key) || [];
+  const active = !g.removed;
+  const log = h('div#log.log', { 'aria-live': 'polite', 'data-testid': 'log' }, msgs.length ? msgs.map((m) => bubble(m, key)) : h('p.empty', 'Messages here go to everyone in the group, each one end-to-end encrypted.'));
+  const comp = composer({
+    key, disabled: !active,
+    placeholder: active ? `Message ${g.name}` : 'You are no longer in this group',
+    onText: async (text) => {
+      const m = { t: 'gmsg', gid, id: newId(), ts: Date.now(), text };
+      addMessage(key, { ...m, dir: 'out', status: 'sent', acks: [] });
+      const r = await fanOut(g, m);
+      if (r.failed.length) toast(`Couldn’t reach ${r.failed.join(', ')} yet`, 'error');
+      if (r.queued && !r.sent) setMsgStatusDirect(key, m.id, 'queued');
+    },
+    onFile: (file, kind) => groupFile(g, file, kind),
+    onLocation: () => shareLocation(key, () => recipients(S.groups.get(gid), S.myCid).filter((c) => S.contacts.has(c))),
+  });
+  return h('div.screen.chat',
+    header(g.name, { back: () => go('home'), actions: [
+      h('span.pill', { 'data-testid': 'group-size' }, `${g.members.length} people`),
+      h('button.icon', { onclick: () => go('groupinfo', gid), 'aria-label': 'Group info', 'data-testid': 'group-info' }, icon('info'))] }),
+    liveBanner(key),
+    g.members.some((m) => m.cid !== S.myCid && !S.contacts.has(m.cid)) ? h('div.banner', h('p', icon('shield', 14), ' Some members aren’t your contacts: their names come from the group creator, and their messages reach you only through people you know.')) : null,
+    log, h('p#chatstatus.chatstatus', { hidden: true }), comp);
+};
+function setMsgStatusDirect(key, mid, status) {
+  const m = (S.chats.get(key) || []).find((x) => x.id === mid); if (!m) return;
+  m.status = status; const el = document.querySelector(`[data-mid="${mid}"] .status`); if (el) el.textContent = STATUS_MARK[status];
+}
+async function groupFile(g, file, kind) {
+  const id = newId(); let first = null; const failed = [];
+  for (const cid of recipients(g, S.myCid)) {
+    if (!S.contacts.has(cid)) { failed.push(memberName(g, cid)); continue; }
+    try { const r = await deliverFile(cid, file, 0, (s, t) => setStatusLine(`Sending to ${memberName(g, cid)}… ${Math.round((s / t) * 100)}%`), { gid: g.id, kind, id }); first ||= r; }
+    catch { failed.push(memberName(g, cid)); }
+  }
+  setStatusLine('');
+  if (first) addMessage(`g:${g.id}`, { ...(await fileMessage({ id, dir: 'out', ts: Date.now(), status: first.status, acks: [] }, file.name, file.type, first.bytes, kind)) });
+  if (failed.length) toast(`Couldn’t reach ${failed.join(', ')} yet`, 'error');
+}
+
+VIEWS.groupinfo = (gid) => {
+  const g = S.groups.get(gid);
+  if (!g) return VIEWS.home();
+  const amAdmin = g.admin === S.myCid;
+  return h('div.screen.full', header(g.name, { back: () => go('group', gid) }),
+    h('div.settings',
+      h('h2', `Members (${g.members.length})`),
+      h('ul.picklist', { 'data-testid': 'member-list' }, g.members.map((m) => {
+        const c = S.contacts.get(m.cid);
+        return h('li', h('span', memberName(g, m.cid), m.cid === g.admin ? h('small', ' · creator') : null, c ? h('small', c.verified ? ' ✓ verified' : ' not verified') : null),
+          amAdmin && m.cid !== S.myCid ? h('button.danger.small', { onclick: async () => {
+            if (!(await modal({ title: `Remove ${memberName(g, m.cid)}?`, body: ['They will stop receiving new messages in this group.'], actions: [['Cancel', false], ['Remove', true, 'danger']] }))) return;
+            await updateRoster(withoutMember(g, m.cid), [m.cid]);
+          } }, 'Remove') : null);
+      })),
+      h('p.hint', amAdmin ? 'You created this group, so only you can change its members or name.' : 'Only the person who created the group can change its members.'),
+      !g.removed ? h('button.danger', { 'data-testid': 'leave-group', onclick: async () => {
+        if (!(await modal({ title: `Leave “${g.name}”?`, body: ['You will stop receiving its messages. Messages on this phone are deleted.'], actions: [['Cancel', false], ['Leave', true, 'danger']] }))) return;
+        await fanOut(g, { t: 'gleave', gid, id: newId() });
+        S.groups.delete(gid); S.chats.delete(`g:${gid}`); await persistGroups(); go('home');
+      } }, amAdmin ? 'Leave and close the group for me' : 'Leave group') : null));
+};
+
+// ---- shared composer (1:1 chats and groups) ----
+function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
+  const input = h('textarea#compose', { rows: 1, placeholder, disabled, maxlength: MAX_TEXT, 'data-testid': 'compose', 'aria-label': 'Message' });
+  const fileIn = h('input', { type: 'file', hidden: true, 'data-testid': 'file-input' });
+  const send = async () => {
+    const text = input.value; if (!text.trim() || disabled) return;
+    input.value = ''; input.style.height = '';
+    try { await onText(text); } catch (e) { toast(e.message, 'error'); input.value = text; }
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); } });
+  input.addEventListener('input', () => { input.style.height = ''; input.style.height = `${Math.min(140, input.scrollHeight)}px`; });
+  const sendFile = async (f, kind) => {
+    if (f.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
+    try {
+      const prep = kind === 'voice' ? { file: f } : await prepareOutgoing(f);
+      if (prep.note) toast(prep.note, prep.warn ? 'error' : 'success');
+      await onFile(prep.file, kind);
+    } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
+  };
+  fileIn.addEventListener('change', () => { const f = fileIn.files[0]; fileIn.value = ''; if (f) sendFile(f); });
+  return h('form.composer', { onsubmit: (e) => { e.preventDefault(); send(); } },
+    h('button.icon', { type: 'button', onclick: () => fileIn.click(), disabled, 'aria-label': 'Attach photo, video or file', 'data-testid': 'attach' }, icon('clip')),
+    h('button.icon', { type: 'button', onclick: onLocation, disabled, 'aria-label': 'Share location', 'data-testid': 'share-location' }, icon('pin')),
+    input, fileIn,
+    voiceButton((clip) => sendFile(clip, 'voice'), disabled),
+    h('button.icon.send', { type: 'submit', disabled, 'aria-label': 'Send', 'data-testid': 'send' }, icon('send')));
+}
+function liveBanner(key) {
+  const s = S.liveShares.get(key);
+  return s ? h('div.banner', { 'data-testid': 'live-banner' }, h('p', icon('pin', 14), ` Sharing your live location until ${fmtTime(s.until)}`),
+    h('button', { onclick: () => stopLiveShare(key), 'data-testid': 'stop-live' }, 'Stop sharing')) : null;
+}
+/** Sends one message to several contacts and shows it once in `key`. */
+async function sendToTargets(key, targets, m, display) {
+  const to = targets(); let status = 'sent'; const failed = [];
+  for (const cid of to) { try { if ((await deliver(cid, m)) === 'queued') status = 'queued'; } catch { failed.push(displayName(S.contacts.get(cid) || { name: '?' })); } }
+  if (failed.length === to.length) { toast(`Couldn’t send: ${failed.join(', ')} not reachable`, 'error'); return; }
+  addMessage(key, { id: m.id, dir: 'out', ts: m.ts, status, acks: [], ...display });
+  if (failed.length) toast(`Couldn’t reach ${failed.join(', ')} yet`, 'error');
+}
 
 VIEWS.contact = (id) => {
   const c = S.contacts.get(id);

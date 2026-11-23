@@ -225,3 +225,30 @@ When a live session (§4) connects:
 
 ### 8.6 App messages over the relay
 These are the same JSON types as §6 (`hello`, `msg`, `ack`, `file`, `chunk`). Over the relay, file chunks are 192 KiB.
+
+## 9. Location, SOS and groups (app messages, live or relay)
+
+These are carried exactly like `msg`. They go over the live session when one is connected, and otherwise over the relay. Unknown types are ignored, for forward compatibility.
+
+| Type | Fields | Receiver checks |
+|---|---|---|
+| `loc` | `id, ts, lat, lon, acc, [lid, until], [gid], [fwd]` | finite, \|lat\| ≤ 90, \|lon\| ≤ 180, acc ≥ 0; a live update with a known `lid` replaces the earlier card; acks |
+| `sos` | `id, ts, text ≤ 500, [loc]` | ignored from unaccepted ("request") contacts; shows an alarm; acks |
+| `ginv` | `gid(32 hex), name, admin, members[{cid,name}] (2–20), v` | sender must be `admin`; the admin can never change; `v` must increase (no replay); a removed member sees "no longer in this group" |
+| `gmsg` | `gid, id, ts, text, [fwd]` | sender must be a member. If `fwd` is set, the sender must be the admin and `fwd` a member. The admin forwards non-forwarded messages to the other members |
+| `gleave` | `gid, id` | sender must be a member; the admin publishes a new roster |
+| `file` meta | `+ gid?, kind?='voice'` | group files must come from members; voice clips are shown as audio only if the content sniffs as audio/video |
+
+Group delivery is **pairwise fan-out**: each copy is encrypted separately over that member's 1:1 link. There is no group key and no group server.
+
+## 10. Media sanitising (`media.js`), applied before sending
+
+| Format | Removed | Kept |
+|---|---|---|
+| JPEG | APP1 (EXIF and XMP), APP2 except ICC, APP3–APP15 (incl. APP13 IPTC), COM | JFIF, Adobe APP14, ICC, all image data (byte-identical); a minimal EXIF with **only Orientation** is re-added |
+| PNG | tEXt, iTXt, zTXt, eXIf, tIME | everything else |
+| WebP | EXIF, XMP chunks; their VP8X flags are cleared; RIFF size is fixed | everything else |
+| MP4/MOV | `moov/udta`, `moov/meta`, `trak/udta`, `trak/meta` → zero-filled `free` boxes (same size, so all offsets stay valid) | all media |
+| HEIC (in the browser) | re-drawn to JPEG, which drops everything | pixels |
+
+A damaged file throws `MediaError` and isn't sent: it's never half-cleaned.

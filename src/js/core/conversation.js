@@ -29,6 +29,15 @@ const HANDSHAKE_TIMEOUT = 15000;
 export const APP_VERSION = '1.0.0';
 
 export const newId = () => toHex(random(8));
+/** Message types handled by the app layer (location, SOS, groups); everything else unknown is ignored. */
+export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave']);
+/** Optional file tags: which group a file belongs to, and whether it is a voice clip. */
+export function fileExtra(m) {
+  const out = {};
+  if (typeof m?.gid === 'string' && /^[0-9a-f]{32}$/.test(m.gid)) out.gid = m.gid;
+  if (m?.kind === 'voice') out.kind = 'voice';
+  return out;
+}
 
 export class Conversation {
   /** @param {{identity, name:string}} me */
@@ -130,17 +139,20 @@ export class Conversation {
 
   /** Internet-mode setup messages travel inside this authenticated session. */
   sendControl(m) { return this.#send(m); }
+  /** Location, SOS and group messages (validated by the app, see APP_TYPES). */
+  sendApp(m) { return this.#send(m); }
 
   setTyping(on) { if (this.state === 'connected') this.session.sendMessage({ t: 'typing', on: !!on }).catch(() => {}); }
 
   /** @param {File|Blob} file @param {(sent:number,total:number)=>void} progress */
-  async sendFile(file, ttl = 0, progress = () => {}) {
+  async sendFile(file, ttl = 0, progress = () => {}, extra = {}) {
     if (file.size > MAX_FILE) throw new Error(`File too large (max ${MAX_FILE / 1048576} MB)`);
     const bytes = new Uint8Array(await file.arrayBuffer());
     const meta = {
-      t: 'file', id: newId(), ts: Date.now(), name: String(file.name || 'file').slice(0, 120),
+      t: 'file', id: /^[0-9a-f]{16}$/.test(extra.id || '') ? extra.id : newId(), ts: Date.now(), name: String(file.name || 'file').slice(0, 120),
       mime: String(file.type || 'application/octet-stream').slice(0, 100), size: bytes.length,
       sha: toB64u(await sha256(bytes)), chunks: Math.ceil(bytes.length / CHUNK) || 1, ttl: ttl | 0,
+      ...fileExtra(extra),
     };
     await this.#send(meta);
     for (let i = 0; i < meta.chunks; i++) {
@@ -191,7 +203,7 @@ export class Conversation {
       }
       case 'bye': this.close('peer left'); break;
       case 'r-invite': case 'r-join': case 'r-need': this.emit('control', m); break; // internet-mode setup (remote.js)
-      default: break; // ignore unknown types (forward compatibility)
+      default: if (APP_TYPES.has(m.t)) this.emit('app', m); break;
     }
   }
 
@@ -200,7 +212,7 @@ export class Conversation {
     const blob = new Blob(f.parts, { type: f.meta.mime });
     const hash = toB64u(await sha256(new Uint8Array(await blob.arrayBuffer())));
     if (hash !== f.meta.sha) { this.emit('error', new Error(`File "${f.meta.name}" failed its integrity check`)); return; }
-    this.emit('file', { id: String(f.meta.id), ts: +f.meta.ts || Date.now(), name: String(f.meta.name), mime: String(f.meta.mime), size: blob.size, ttl: Math.max(0, f.meta.ttl | 0), blob });
+    this.emit('file', { id: String(f.meta.id), ts: +f.meta.ts || Date.now(), name: String(f.meta.name), mime: String(f.meta.mime), size: blob.size, ttl: Math.max(0, f.meta.ttl | 0), blob, ...fileExtra(f.meta) });
     this.session.sendMessage({ t: 'ack', id: f.meta.id }).catch(() => {});
   }
 

@@ -168,3 +168,38 @@ button.file { background: none; border: 1px dashed var(--line); padding: 0.4rem 
 .filewarn.danger { color: var(--danger); } .filewarn.warn { color: var(--warn); }
 .reconnect.compact { padding-top: 0.4rem; padding-bottom: 0.4rem; }
 .reconnect.compact p { font-size: 0.85rem; margin: 0 0 0.3rem; }
+
+/* ---- location, SOS, voice, groups ---- */
+button.sos { background: var(--danger); color: #fff; border: none; font-weight: 800; letter-spacing: 0.06em; padding: 0.35rem 0.7rem; min-height: 0; border-radius: 999px; }
+.loc, .sos-card { margin: 0.2rem 0 0.4rem; }
+.loc .loctitle { margin: 0 0 0.2rem; display: flex; align-items: center; gap: 0.2rem; }
+.loc .coords { font-family: ui-monospace, monospace; font-size: 0.85rem; margin: 0.1rem 0; }
+.loc .rel { font-weight: 700; margin: 0.2rem 0; }
+.loc .share button { padding: 0.3rem 0.6rem; min-height: 0; font-size: 0.85rem; }
+.sos-card { border-left: 4px solid var(--danger); padding-left: 0.6rem; }
+.sostext { font-size: 1.15rem; font-weight: 700; }
+.sosbtn { position: relative; overflow: hidden; width: 100%; margin-top: 1rem; background: var(--danger); color: #fff; font-weight: 800; font-size: 1.1rem; border: none; padding: 1.1rem; border-radius: var(--r); touch-action: none; user-select: none; -webkit-user-select: none; }
+.sosbtn span { position: relative; }
+.sosbtn .holdbar { position: absolute; inset: 0; width: 0; background: rgba(255, 255, 255, 0.25); }
+.sosbtn.holding .holdbar { width: 100%; transition: width 1.5s linear; }
+button.mic { touch-action: none; user-select: none; -webkit-user-select: none; }
+button.mic.rec { color: #fff; background: var(--danger); border-radius: 50%; animation: pulse 1s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--danger) 25%, transparent); } }
+@media (prefers-reduced-motion: reduce) { button.mic.rec { animation: none; } .sosbtn.holding .holdbar { transition: none; } }
+.msg audio { width: min(260px, 70vw); display: block; margin: 0.2rem 0; }
+.msg video.attach { max-width: min(280px, 72vw); border-radius: 10px; display: block; }
+.sender { font-size: 0.78rem; font-weight: 700; color: var(--accent); margin-bottom: 0.15rem; }
+.sysmsg { text-align: center; color: var(--fg2); font-size: 0.8rem; margin: 0.4rem 0; }
+.chattools { display: flex; justify-content: flex-end; padding: 0 0.75rem; }
+.chattools .ttlwrap { font-size: 0.8rem; }
+.picklist { list-style: none; padding: 0; margin: 0.3rem 0 0.8rem; }
+.picklist li { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.45rem 0; border-bottom: 1px solid var(--line); }
+.picklist label { display: flex; align-items: center; gap: 0.4rem; flex: 1; }
+.picklist small { color: var(--fg2); }
+button.small { padding: 0.25rem 0.6rem; min-height: 0; font-size: 0.8rem; }
+.checkline { display: flex; align-items: center; gap: 0.4rem; margin: 0.6rem 0; }
+.sectionhead { display: flex; align-items: center; justify-content: space-between; padding: 0 1.1rem; margin-top: 1rem; }
+.sectionhead h2 { margin: 0; font-size: 0.85rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg2); }
+.sectionhead button { min-height: 0; padding: 0.3rem 0.6rem; font-size: 0.85rem; }
+.groups .hint { padding: 0 1.1rem; }
+.avatar.group { display: grid; place-items: center; }

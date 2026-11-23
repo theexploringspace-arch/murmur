@@ -1,10 +1,15 @@
 # Murmur
 
-**Offline, end-to-end encrypted messaging in the browser. No servers. No accounts. No cloud.**
+**End-to-end encrypted messaging in the browser — nearby with no internet at all, or far away through a relay that can't read anything. No accounts, no phone numbers, no cloud backups.**
 
 Two phones on the same Wi-Fi — or one phone's hotspot with mobile data switched off — scan each
-other's QR codes and talk directly. Messages and files are encrypted on the sender's phone and
-decrypted only on the recipient's. Nothing is relayed, logged, synced or backed up anywhere.
+other's QR codes and talk directly. Friends who are far away join with an invite link, and their
+messages wait (encrypted, unreadable) on a relay for up to 30 days until delivered.
+
+**What you can do:** text · photos & videos with hidden GPS/camera data removed · hold-to-talk
+voice clips (walkie-talkie) · share your location once or live, with distance and direction ·
+emergency SOS to chosen contacts · small private groups · disappearing messages — with on-device
+protection against phishing links, disguised files and impersonators.
 
 ```
  Alice's phone                                         Bob's phone
@@ -29,6 +34,9 @@ decrypted only on the recipient's. Nothing is relayed, logged, synced or backed 
 | **At rest** | Passphrase → PBKDF2-SHA256 (600k) → key-encryption key → data key → everything. History **off** by default |
 | **Web hardening** | Strict CSP (`default-src 'none'`), Trusted Types, no `innerHTML`, zero third-party code, zero dependencies |
 | **Offline app** | Service worker caches every file after verifying its SHA-256; airplane-mode capable |
+| **Far away** | Double Ratchet (Signal's design) over an untrusted relay; relay stores only ciphertext, deletes on delivery, 30-day cap |
+| **Media privacy** | EXIF/XMP/GPS stripped from JPEG/PNG/WebP and QuickTime metadata zeroed in MP4/MOV — byte-level, no quality loss |
+| **Groups** | Pairwise fan-out over each member's own E2E link; only the creator can change membership |
 
 ![Welcome, invite QR, chat and safety-number screens](docs/screenshots.png)
 
@@ -43,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 83 unit tests: crypto, protocol, attacks, QR codec, build output
+npm test            # 99 unit tests: crypto, protocol, ratchet, relay, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -150,6 +158,22 @@ To use another domain, change `routes` and `ALLOWED_ORIGINS` in `relay/wrangler.
 Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhost:8080`, then
 `node tools/build.mjs --relay http://127.0.0.1:8787` and `npm run serve`.
 
+## Features in detail
+
+| Feature | Nearby (no internet) | Far away (relay) | Notes |
+|---|---|---|---|
+| Text, receipts ✓✓, disappearing | ✅ | ✅ | |
+| Photos & videos | ✅ | ✅ (sent in 192 KiB chunks) | Hidden location/camera data removed before sending; only real images/videos are displayed |
+| Walkie-talkie | ✅ | ✅ | Hold the mic button, release to send (2 min max). Needs microphone permission |
+| Location | ✅ | ✅ | Once, or live for 15 min / 1 h (updates every 30 s while Murmur is open). Shows distance & direction — no map server. "Map" opens your map app only after a warning |
+| SOS | ✅ | ✅ (queued if no signal) | Hold 1.5 s. Sends your message + GPS to chosen contacts. **Cannot call emergency services** |
+| Groups | ✅ | ✅ | Up to 20. The creator forwards text and location to members who aren't each other's contacts ("via group"); files go to your direct contacts in the group |
+| Scam protection | ✅ | ✅ | Links never open in one tap; lookalike/brand-fake domains, hidden destinations and disguised files are flagged |
+
+### Checking a deployment
+- `node tools/site-check.mjs https://murmur.princeisgenius.com` — fetches every file like a phone would and proves it's **byte-for-byte the tested build** (catches CDN/host injection), and checks the security headers.
+- `node tools/relay-smoke.mjs https://relay.princeisgenius.com` — acts like a phone against the relay: health, WebSocket, mailbox login, keep-alive, delivery, deletion.
+
 ## Project layout
 
 ```
@@ -205,4 +229,3 @@ murmur/
 ## License
 
 MIT — see [LICENSE](LICENSE).
-Relay: relay.princeisgenius.com

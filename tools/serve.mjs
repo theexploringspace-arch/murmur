@@ -33,7 +33,7 @@ const SECURITY_HEADERS = {
   'Referrer-Policy': 'no-referrer',
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Resource-Policy': 'same-origin',
-  'Permissions-Policy': 'camera=(self), microphone=(), geolocation=(), payment=(), usb=(), bluetooth=()',
+  'Permissions-Policy': 'camera=(self), microphone=(self), geolocation=(self), payment=(), usb=()',
   'X-Frame-Options': 'DENY',
   'Cache-Control': 'no-cache',
 };

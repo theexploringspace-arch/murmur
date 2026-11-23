@@ -7,7 +7,7 @@
 //   npm i -D playwright && npx playwright install chromium   (one-time, needs internet)
 //   npm run build && npm run test:e2e
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, existsSync } from 'node:fs';
@@ -380,7 +380,7 @@ test('host injects a script into index.html: offline install is refused AND the 
   } finally { await browser.close(); bad.kill(); }
 });
 
-process.on('exit', () => server.kill());
+
 
 test('internet mode: invite link, stranger gating, scam warnings, offline queue, verification', { timeout: 240000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME });
@@ -459,4 +459,118 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
   } finally { await browser.close(); }
 });
 
-process.on('exit', () => relay.server.close());
+async function linkFriends(from, to, toPass) {
+  await from.page.click(tid('link-invite'));
+  await from.page.waitForFunction((s) => /#i=/.test(document.querySelector(s)?.value || ''), tid('invite-link'));
+  const link = await from.page.$eval(tid('invite-link'), (e) => e.value);
+  await from.page.click(tid('back'));
+  await to.page.goto('about:blank'); await to.page.goto(link);
+  await to.page.fill(tid('unlock-pass'), toPass); await to.page.click(tid('unlock'));
+  await to.page.waitForSelector(tid('join-invite')); await to.page.click(tid('join-invite'));
+  await to.page.waitForSelector(tid('verify-banner'));
+  await to.page.click(tid('back'));
+}
+const holdButton = async (page, selector, ms) => {
+  const box = await page.locator(selector).boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down(); await page.waitForTimeout(ms); await page.mouse.up();
+};
+
+test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people, relay + forwarding)', { timeout: 300000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] });
+  const pass = { Carol: 'correct horse battery staple', Dave: 'tr0ub4dor & 3 bananas', Emma: 'purple monkey dishwasher 9' };
+  const P = {};
+  try {
+    for (const n of ['Carol', 'Dave', 'Emma']) {
+      P[n] = await profile(browser, n.toLowerCase() + '-p1');
+      await P[n].ctx.grantPermissions(['geolocation', 'microphone', 'clipboard-read', 'clipboard-write'], { origin: ORIGIN });
+      await onboard(P[n], n, pass[n]);
+    }
+    await P.Carol.ctx.setGeolocation({ latitude: 6.5244, longitude: 3.3792, accuracy: 15 });   // Lagos
+    await P.Dave.ctx.setGeolocation({ latitude: 6.6018, longitude: 3.3515, accuracy: 20 });    // ~9 km N
+    await P.Emma.ctx.setGeolocation({ latitude: 6.4550, longitude: 3.3941, accuracy: 30 });
+    // Carol knows Dave and Emma; Dave and Emma do NOT know each other.
+    await linkFriends(P.Carol, P.Dave, pass.Dave);
+    await linkFriends(P.Carol, P.Emma, pass.Emma);
+    for (const n of ['Dave', 'Emma']) {
+      await P.Carol.page.waitForSelector(tid(`contact-${n}`), { timeout: 20000 });
+      await P.Carol.page.click(tid(`contact-${n}`)); await P.Carol.page.click(tid('accept-request')); await P.Carol.page.click(tid('back'));
+    }
+
+    // --- photo privacy: GPS/camera data never leaves Carol's phone ---
+    await P.Carol.page.click(tid('contact-Dave'));
+    await P.Carol.page.setInputFiles(tid('file-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await P.Carol.page.waitForFunction(() => /Removed hidden location/.test(document.body.textContent), null, { timeout: 15000 });
+    await P.Dave.page.click(tid('contact-Carol'));
+    await P.Dave.page.waitForSelector(`${tid('msg-in')} img.attach`, { timeout: 20000 });
+    const got = await P.Dave.page.evaluate(async () => {
+      const b = new Uint8Array(await (await fetch(document.querySelector('[data-testid="msg-in"] img.attach').src)).arrayBuffer());
+      const t = new TextDecoder('latin1').decode(b);
+      return { jpeg: b[0] === 0xff && b[1] === 0xd8, secret: /SECRET/.test(t) };
+    });
+    assert.deepEqual(got, { jpeg: true, secret: false }, 'photo arrives as a JPEG with no hidden camera/location data');
+
+    // --- location: GPS position, distance and direction, no map server ---
+    await P.Carol.page.click(tid('share-location'));
+    await P.Carol.page.click(tid('modal-once'));
+    await P.Dave.page.waitForSelector(`${tid('msg-in')} ${tid('loc-card')}`, { timeout: 20000 });
+    await P.Dave.page.click(`${tid('msg-in')} ${tid('how-far')}`);
+    await P.Dave.page.waitForFunction(() => /km S of you|km SSE of you|km SSW of you/.test(document.querySelector('[data-testid="msg-in"] [data-testid="loc-relative"]')?.textContent || ''), null, { timeout: 15000 });
+
+    // --- walkie-talkie: hold to talk, release to send ---
+    await holdButton(P.Carol.page, tid('voice'), 1600);
+    await P.Dave.page.waitForSelector(tid('voice-clip'), { timeout: 30000 });
+    const dur = await P.Dave.page.evaluate(() => new Promise((res) => {
+      const a = document.querySelector('[data-testid="voice-clip"]');
+      const done = () => res(a.duration);
+      if (a.readyState >= 1) done(); else a.addEventListener('loadedmetadata', done, { once: true });
+      setTimeout(() => res(-1), 8000);
+    }));
+    assert.ok(dur === Infinity || dur > 0.5, `voice clip has audio (duration ${dur})`); // Chrome reports Infinity for streamed WebM
+
+    // --- SOS: Dave holds the button; Carol gets an alarm with his position ---
+    await P.Dave.page.click(tid('back')); await P.Dave.page.click(tid('sos'));
+    assert.match(await P.Dave.page.textContent(tid('sos-disclaimer')), /cannot call emergency services/);
+    await holdButton(P.Dave.page, tid('sos-send'), 300); // too short: must NOT send
+    await P.Dave.page.waitForTimeout(500);
+    assert.ok(await P.Dave.page.$(tid('sos-send')), 'a quick tap does not send SOS');
+    await holdButton(P.Dave.page, tid('sos-send'), 2000);
+    await P.Carol.page.waitForSelector(tid('sos-alert'), { timeout: 20000 });
+    assert.match(await P.Carol.page.textContent('.modal'), /SOS from Dave[\s\S]*I need help[\s\S]*6\.60180/);
+    await P.Carol.page.click(tid('modal-false'));
+
+    // --- groups: Carol creates; Dave and Emma (strangers to each other) can talk via forwarding ---
+    await P.Carol.page.click(tid('back'));
+    await P.Carol.page.click(tid('new-group'));
+    await P.Carol.page.fill(tid('group-name'), 'Hike crew');
+    await P.Carol.page.click(tid('pick-Dave')); await P.Carol.page.click(tid('pick-Emma'));
+    await P.Carol.page.click(tid('create-group'));
+    await P.Carol.page.waitForSelector(tid('group-size'));
+    for (const n of ['Dave', 'Emma']) {
+      await P[n].page.waitForSelector(tid('group-Hike crew'), { timeout: 20000 });
+      await P[n].page.click(tid('group-Hike crew'));
+    }
+    await send(P.Dave, 'who is bringing water?');
+    await P.Emma.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /who is bringing water/.test(m.textContent) && /Dave \(via group\)/.test(m.querySelector('[data-testid="sender"]')?.textContent || '')), null, { timeout: 20000 });
+    await P.Carol.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /who is bringing water/.test(m.textContent) && m.querySelector('[data-testid="sender"]')?.textContent === 'Dave'), null, { timeout: 20000 });
+    await send(P.Emma, 'I will!');
+    await P.Dave.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /I will!/.test(m.textContent)), null, { timeout: 20000 });
+    await send(P.Carol, 'see you at 7');
+    await P.Carol.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"] .status')].at(-1)?.textContent === '✓✓', null, { timeout: 20000 });
+    // (Non-creators can't change the roster: covered by geo-groups.test.mjs.)
+    // Carol removes Emma: Emma's group closes and she stops getting messages
+    await P.Carol.page.click(tid('group-info'));
+    const before = await P.Carol.page.$$eval(`${tid('member-list')} li`, (x) => x.length);
+    assert.equal(before, 3);
+    await P.Carol.page.locator(`${tid('member-list')} li`, { hasText: 'Emma' }).locator('button').click();
+    await P.Carol.page.click(tid('modal-true'));
+    await P.Carol.page.waitForFunction(() => document.querySelectorAll('[data-testid="member-list"] li').length === 2);
+    await P.Emma.page.waitForFunction(() => /no longer in this group/.test(document.querySelector('[data-testid="compose"]')?.placeholder || ''), null, { timeout: 20000 });
+
+    assert.deepEqual(leaks, []);
+    for (const n of Object.keys(P)) assert.deepEqual(await P[n].page.evaluate(() => window.__csp), [], `${n} CSP`);
+  } finally { await browser.close(); }
+});
+
+// Tear everything down so the test process exits by itself (no lingering servers).
+after(() => { server.kill(); relay.server.closeAllConnections?.(); relay.server.close(); });

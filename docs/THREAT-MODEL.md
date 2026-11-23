@@ -79,6 +79,21 @@ to a web app.
 - **Doesn't catch:** a brand-new phishing site with an ordinary name, or social engineering in plain text. That's why links are **never one-tap**: the real destination is always shown first, with a reminder never to type passwords after following a link.
 - **No cloud lookups (e.g. Safe Browsing).** They would tell a third party what people share.
 
+## Location, SOS, groups and media — added threats
+
+- **Photos leaking where you live.** This is handled: EXIF GPS, camera serials and comments are stripped from JPEG/PNG/WebP, and video metadata is zeroed. It's tested on real files, and the image data stays byte-identical. What it **doesn't** cover: what's *visible* in the picture (street signs, landmarks), and file types other than JPEG/PNG/WebP/MP4/MOV/HEIC, which are sent unchanged. HEIC is converted on the device: this path is implemented but hasn't been verified on a real iPhone. iPhones usually hand Safari a JPEG anyway.
+- **Location messages** are as private as any message: end-to-end encrypted. Live sharing stops on its own and stops on lock. The "Map" button warns first, because opening a map app tells that map company where the person is.
+- **SOS** reaches only your Murmur contacts, and only when a path exists: nearby, or relay plus internet. Otherwise it's queued. **It can't contact emergency services and must not be relied on as the only lifeline.** The app says so on the SOS screen. A "request" contact (a stranger who used your invite) can't trigger alarms.
+- **Groups.** Each member's copy is protected by their own 1:1 link, so there's no group key to steal.
+  - The creator is trusted for: the member list, and the names of members you don't know.
+  - Forwarded messages (labelled "(via group)") are only as authentic as the creator is honest. A malicious creator could make up such a message. Messages from people who are your own verified contacts can't be faked.
+  - Removing a member stops *future* messages to them. It can't erase what they already received.
+- **Host/CDN rewriting pages.** Cloudflare Web Analytics, or a free-plan badge, can be injected at the edge. Defences:
+  1. Strict CSP blocks the injected script from running.
+  2. The service worker refuses an altered copy, so offline mode stays off and the user is warned.
+  3. `Cache-Control: no-transform` asks the CDN not to rewrite pages.
+  4. `tools/site-check.mjs` proves the live site matches the build byte for byte.
+
 ## Known limitations (by design)
 
 - **Proximity required**: both devices on the same LAN at the same time. No store-and-forward, no mesh.

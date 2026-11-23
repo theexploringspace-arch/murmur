@@ -67,3 +67,17 @@ PROTOCOL.md is transport-agnostic. Implement `SecureSession` in Kotlin with
 `java.security` (ECDH/ECDSA P-256, HKDF via HMAC, AES/GCM) and make it interoperate with the JS
 version over a local WebSocket. The unit tests' handshake vectors are your conformance suite.
 This is the first step toward a native Android client with Wi-Fi Direct — no shared network needed.
+
+### 9. Bug hunt (it really happened)
+Internet mode passed every test, yet failed on every real phone. The browser console said:
+*Connecting to 'wss://relay…' violates … "connect-src 'self' blob:"*. `index.html` allowed the relay.
+Why was it still blocked, and why didn't the tests see it? Hint: count how many places a CSP can come from. Then
+read `build.test.mjs` → "the CSP header and the <meta> CSP allow exactly the same things".
+
+### 10. Threat-model question: groups
+Dave and Emma are in Carol's group but have never met. Emma sees "Dave (via group): send me the code".
+Who could have written that message? What would Emma have to do to be sure it was Dave?
+(Answer: Carol, or Dave. Only Carol's forwarding links them. Emma should pair with Dave and compare safety numbers.)
+
+### 11. Implement: per-member delivery details
+Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the message (`m.acks` already holds the ids).
