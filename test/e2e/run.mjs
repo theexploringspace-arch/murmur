@@ -510,10 +510,25 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     await onboard(A, 'Alice', PASS); await onboard(B, 'Bob', 'another long passphrase');
     await pairByText(A, B);
 
+    // --- Bob is mid-sentence when Alice's new photo arrives and re-draws his chat: nothing he typed is lost ---
+    const draft = 'half-typed while your photo changes';
+    await B.page.fill(tid('compose'), draft);
+    await B.page.$eval(tid('compose'), (t) => t.setSelectionRange(4, 4));
+
     // --- profile photo + @username reach the contact ---
     await A.page.click(tid('back')); await A.page.click(tid('settings'));
     await A.page.setInputFiles(tid('pic-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
     await A.page.waitForFunction(() => /Profile photo updated/.test(document.body.textContent), null, { timeout: 15000 });
+    await B.page.waitForFunction(() => !!document.querySelector('.screen [data-testid="avatar"] img'), null, { timeout: 20000 }); // the chat WAS re-drawn
+    assert.deepEqual(await B.page.$eval(tid('compose'), (t) => [t.value, document.activeElement === t, t.selectionStart]), [draft, true, 4],
+      'draft, keyboard focus and cursor all survive the redraw');
+    await B.page.click(tid('send'));
+    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice'));
+    assert.equal(await B.page.inputValue(tid('compose')), '', 'a sent draft is gone');
+    await B.page.fill(tid('compose'), 'kept while I look elsewhere');
+    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice'));
+    assert.equal(await B.page.inputValue(tid('compose')), 'kept while I look elsewhere', 'leaving the chat keeps the draft, like WhatsApp');
+    await B.page.fill(tid('compose'), '');
     await B.page.click(tid('back'));
     await B.page.waitForFunction(() => !!document.querySelector('[data-testid="contact-Alice"] [data-testid="avatar"] img'), null, { timeout: 20000 });
     await B.page.waitForFunction(() => document.querySelector('[data-testid="contact-Alice"] [data-testid="avatar"] img')?.naturalWidth > 0, null, { timeout: 10000 });
@@ -525,6 +540,7 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
 
     // --- edit (both phones update, marked "edited") ---
     await A.page.click(tid('back')); await A.page.click(tid('contact-Bob'));
+    await A.page.waitForFunction((t) => document.querySelector('[data-testid="log"]')?.textContent.includes(t), draft, { timeout: 15000 });
     await send(A, 'helo wrld');
     await B.page.waitForFunction(() => /helo wrld/.test(document.querySelector('[data-testid="log"]')?.textContent || ''), null, { timeout: 15000 });
     await bubbleMenu(A, 'helo wrld');
@@ -822,6 +838,8 @@ const touchHold = async (page, selector, ms) => {
   await page.waitForTimeout(ms);
   await page.$eval(selector, (el) => { el.dispatchEvent(new PointerEvent('pointerup', el.__o)); el.dispatchEvent(new PointerEvent('pointerleave', el.__o)); });
 };
+// SHOTS=dir saves screenshots of the voice UI states (for eyeballing the design; off in CI).
+const shot = async (page, name) => { if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/${name}.png` }); };
 const holdButton = async (page, selector, ms) => {
   const box = await page.locator(selector).boundingBox();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
@@ -919,46 +937,85 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await holdButton(P.Carol.page, tid('voice'), 800);
     await P.Carol.page.waitForFunction(() => /Couldn’t start recording/.test(document.body.textContent), null, { timeout: 5000 });
     assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0);
+    assert.equal(await P.Carol.page.getAttribute('form.composer', 'data-voice'), 'idle', 'failed start leaves the composer usable');
+    const C = P.Carol.page, D = P.Dave.page;
+    const voiceState = (s) => C.waitForFunction((v) => document.querySelector('form.composer')?.dataset.voice === v, s, { timeout: 15000 });
     // --- on a TOUCHSCREEN: lifting the finger also fires pointerleave; that must not count as "slide away to cancel" ---
-    await touchHold(P.Carol.page, tid('voice'), 1600);
-    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
-    await P.Carol.page.click(tid('modal-cancel'));
-    // --- a quick tap locks recording on; a second tap finishes it ---
-    await touchHold(P.Carol.page, tid('voice'), 150);
-    await P.Carol.page.waitForFunction(() => /tap the mic again/.test(document.body.textContent), null, { timeout: 5000 });
-    await P.Carol.page.waitForTimeout(1200);
-    await touchHold(P.Carol.page, tid('voice'), 50);
-    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
-    await P.Carol.page.click(tid('modal-cancel'));
+    await touchHold(C, tid('voice'), 1600);
+    await voiceState('review'); // listen-first happens IN the composer bar…
+    assert.equal(await C.$$eval('.modal', (e) => e.length), 0, '…not in a pop-up over the chat');
+    await C.waitForFunction(() => +document.querySelector('[data-testid="voice-review"]')?.dataset.duration > 0.5, null, { timeout: 15000 });
+    await C.click(tid('voice-trash'));
+    await voiceState('idle');
+    // --- a quick tap = hands-free: timer runs, live waveform, ⏸ stops and lets you listen ---
+    await touchHold(C, tid('voice'), 150);
+    await voiceState('locked');
+    await C.waitForFunction(() => document.querySelector('[data-testid="voice-timer"]')?.textContent === '0:01', null, { timeout: 5000 });
+    await shot(C, '2-locked');
+    await C.click(tid('voice-stop'));
+    await voiceState('review');
+    await C.waitForSelector('[data-testid="voice-review"][data-duration]');
+    await shot(C, '3-review');
+    await C.click(tid('voice-trash'));
     // --- sliding the finger well away from the button cancels ---
-    await P.Carol.page.$eval(tid('voice'), (el) => { const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 9, isPrimary: true, bubbles: true, clientX: r.x + 5, clientY: r.y + 5 };
+    await C.$eval(tid('voice'), (el) => { const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 9, isPrimary: true, bubbles: true, clientX: r.x + 5, clientY: r.y + 5 };
       el.dispatchEvent(new PointerEvent('pointerdown', o)); el.__o = o; });
-    await P.Carol.page.waitForTimeout(1200);
-    await P.Carol.page.$eval(tid('voice'), (el) => { const o = { ...el.__o, clientY: el.__o.clientY - 200 }; el.dispatchEvent(new PointerEvent('pointermove', o)); el.dispatchEvent(new PointerEvent('pointerup', o)); });
-    await P.Carol.page.waitForTimeout(800);
-    assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0, 'slid away: discarded');
-    // --- walkie-talkie: by default you hear the clip first; Delete sends nothing, Send sends it ---
-    await holdButton(P.Carol.page, tid('voice'), 1600);
-    await P.Carol.page.waitForSelector(tid('review-audio'), { timeout: 15000 });
-    await P.Carol.page.click(tid('modal-cancel'));
-    await holdButton(P.Carol.page, tid('voice'), 1600);
-    await P.Carol.page.click(tid('modal-send'));
-    await P.Dave.page.waitForSelector(tid('voice-clip'), { timeout: 30000 });
-    const dur = await P.Dave.page.evaluate(() => new Promise((res) => {
-      const a = document.querySelector('[data-testid="voice-clip"]');
-      const done = () => res(a.duration);
-      if (a.readyState >= 1) done(); else a.addEventListener('loadedmetadata', done, { once: true });
-      setTimeout(() => res(-1), 8000);
-    }));
-    assert.ok(dur === Infinity || dur > 0.5, `voice clip has audio (duration ${dur})`); // Chrome reports Infinity for streamed WebM
-    assert.equal(await P.Dave.page.$$eval(tid('voice-clip'), (e) => e.length), 1, 'the deleted clip never arrived');
+    await voiceState('holding');
+    await C.waitForTimeout(1200);
+    await shot(C, '1-holding');
+    await C.$eval(tid('voice'), (el) => { const o = { ...el.__o, clientY: el.__o.clientY - 200 }; el.dispatchEvent(new PointerEvent('pointermove', o)); el.dispatchEvent(new PointerEvent('pointerup', o)); });
+    await voiceState('idle');
+    assert.equal(await C.$$eval(tid('voice-review'), (e) => e.length), 0, 'slid away: discarded');
+    // --- leaving the chat mid-recording releases the microphone and throws the clip away ---
+    await touchHold(C, tid('voice'), 150);
+    await voiceState('locked');
+    await C.click(tid('back')); await C.click(tid('contact-Dave'));
+    await voiceState('idle');
+    // --- hold, talk, lift → review → 🗑 sends nothing; ➤ sends it ---
+    await holdButton(C, tid('voice'), 1600);
+    await voiceState('review');
+    await C.click(tid('voice-trash'));
+    await holdButton(C, tid('voice'), 1600);
+    await voiceState('review');
+    await C.click(tid('voice-send-now'));
+    await voiceState('idle');
+    await D.waitForFunction(() => +document.querySelector('[data-testid="msg-in"] [data-testid="voice-clip"]')?.dataset.duration > 0.5, null, { timeout: 30000 });
+    assert.equal(await D.$$eval(tid('voice-clip'), (e) => e.length), 1, 'the deleted clips never arrived');
+    // The bubble is a player, not a file: no file name, no size, no Save button.
+    const bubbleText = await D.$eval(`${tid('msg-in')}:has(${tid('voice-clip')})`, (el) => el.textContent);
+    assert.doesNotMatch(bubbleText, /voice-\d+|\.(m4a|webm|ogg)|KB|Save/, `voice bubble shows only player + time (${bubbleText})`);
+    assert.equal(await D.$$eval(`${tid('msg-in')}:has(${tid('voice-clip')}) ${tid('file')}`, (e) => e.length), 0);
+    assert.match(await D.textContent(tid('voice-time')), /^0:0[1-9]$/, 'shows its length');
+    await shot(D, '4-received'); await shot(C, '4-sent');
+    // Play / pause / speed.
+    await D.click(tid('voice-play'));
+    await D.waitForFunction(() => document.querySelector('[data-testid="voice-clip"]').dataset.state === 'playing', null, { timeout: 5000 });
+    await D.click(tid('voice-speed'));
+    await shot(D, '5-playing');
+    assert.equal(await D.$eval(tid('voice-audio'), (a) => a.playbackRate), 1.5);
+    assert.equal(await D.textContent(tid('voice-speed')), '1.5×');
+    // At the end it resets by itself: ▶ again, full length shown, no bars lit.
+    await D.waitForFunction(() => document.querySelector('[data-testid="voice-clip"]').dataset.state === 'paused', null, { timeout: 15000 });
+    assert.match(await D.textContent(tid('voice-time')), /^0:0[1-9]$/);
+    assert.equal(await D.$$eval(`${tid('voice-clip')} .vwave span.on`, (e) => e.length), 0);
+    // Pause mid-way.
+    await D.click(tid('voice-play'));
+    await D.waitForFunction(() => document.querySelector('[data-testid="voice-clip"]').dataset.state === 'playing', null, { timeout: 5000 });
+    await D.click(tid('voice-play'));
+    await D.waitForFunction(() => document.querySelector('[data-testid="voice-clip"]').dataset.state === 'paused', null, { timeout: 5000 });
+    // --- hands-free, then ➤ while still recording: sent straight away, like WhatsApp ---
+    await touchHold(C, tid('voice'), 150);
+    await voiceState('locked');
+    await C.waitForTimeout(1200);
+    await C.click(tid('voice-send-now'));
+    await D.waitForFunction((s) => document.querySelectorAll(s).length === 2, tid('voice-clip'), { timeout: 30000 });
     // Real walkie-talkie mode (Settings): sends the moment you let go, no question asked.
-    await P.Carol.page.click(tid('back')); await P.Carol.page.click(tid('settings'));
-    await P.Carol.page.selectOption(tid('voice-send'), 'release');
-    await P.Carol.page.click(tid('back')); await P.Carol.page.click(tid('contact-Dave'));
-    await holdButton(P.Carol.page, tid('voice'), 1600);
-    await P.Dave.page.waitForFunction((s) => document.querySelectorAll(s).length === 2, tid('voice-clip'), { timeout: 30000 });
-    assert.equal(await P.Carol.page.$$eval('.modal', (e) => e.length), 0, 'no review step in walk-talkie mode');
+    await C.click(tid('back')); await C.click(tid('settings'));
+    await C.selectOption(tid('voice-send'), 'release');
+    await C.click(tid('back')); await C.click(tid('contact-Dave'));
+    await holdButton(C, tid('voice'), 1600);
+    await D.waitForFunction((s) => document.querySelectorAll(s).length === 3, tid('voice-clip'), { timeout: 30000 });
+    assert.equal(await C.$$eval(tid('voice-review'), (e) => e.length), 0, 'no review step in walkie-talkie mode');
 
     // --- a video call between phones that are NOT nearby: every signal goes through the relay mailbox ---
     assert.equal(await P.Carol.page.getAttribute(tid('conn-state'), 'data-online'), 'false', 'internet link, not a nearby one');

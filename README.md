@@ -51,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 129 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, scam checks, media, groups, QR, build
+npm test            # 137 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, voice waveforms, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -184,7 +184,7 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 |---|---|---|---|
 | Text, receipts ✓✓, disappearing | ✅ | ✅ | |
 | Photos & videos | ✅ | ✅ (512 KiB chunks) | Photos go at **standard size** (longest side 1600 px, ~250–450 KB: usually one relay message) with an **Original quality** switch. Hidden location/camera data removed; you see exactly what will be sent and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
-| Walkie-talkie | ✅ | ✅ | Hold the mic, talk, lift — or **tap once to lock** recording on and tap again to finish; slide far away to cancel (2 min max). Default: listen back, then **Send** or **Delete**; Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
+| Voice messages | ✅ | ✅ | WhatsApp-style. **Hold** the mic, talk, lift; **tap once** for hands-free (⏸ stop and listen · ➤ send now · 🗑 delete); slide far away to cancel (2 min max). The listen-first step happens **inside the composer bar** — no pop-up. Bubbles show ▶, a waveform you can tap or drag to seek, the length, and 1× / 1.5× / 2× — no file name, size or Save button. Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
 | Voice & video calls | ✅ | ✅ | Peer-to-peer, end-to-end encrypted (DTLS-SRTP keyed through the authenticated chat). Mute, camera off, flip camera. **Hide my IP** (default on) routes internet calls through TURN. Rings only while Murmur is open on their phone. One-to-one only |
 | Call permissions | ✅ | ✅ | Settings → *Calls*: allow voice / video. Contact info: block calls from one person. Their phone hides the buttons **and** yours refuses the call anyway |
 | Edit & delete | ✅ | ✅ | Long-press (or right-click) a message. Edit your text for **15 min**; **delete for everyone** within **1 hour**; delete for me any time. Receivers enforce the same rules and only accept changes from the real author |

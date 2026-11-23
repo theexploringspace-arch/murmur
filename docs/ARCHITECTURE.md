@@ -129,7 +129,7 @@ had to be in the browser. Open DevTools on a laptop, reproduce, and read the Con
 | media privacy | `media.test.mjs` | real PIL/ffmpeg files with GPS, camera and comments; secrets gone, pixels identical (PIL), orientation kept, video still decodes (ffprobe), damaged files refused |
 | location & groups | `geo-groups.test.mjs` | known distances and bearings; coordinate validation; only the creator changes the roster; replayed rosters refused; removal; ID generator checked against the receiver's rules |
 | deployment | `sitecheck.test.mjs` | the live-site checker passes on an honest host and names the injected script on a tampering one |
-| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, walkie-talkie with fake mic (review → delete sends nothing, review → send, then instant mode), photo preview where Cancel sends nothing, phone Save via share sheet, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal; **updates**: new build verified, announced with its fingerprint, applied on tap, data kept |
+| whole app | `e2e/run.mjs` | two Chromium profiles + local relay; network guard; offline; CSP/TT; fake camera; invite link, request gating, scam modal, offline queue, verification; **3 people**: GPS-free photo, location distance/direction, voice messages with fake mic (touch hold → in-bar review → 🗑 sends nothing; hands-free timer → ⏸ → review; slide-to-cancel; leaving the chat mid-recording discards; ➤ sends; received bubble has a decoded length, play/pause/1.5×, and no file name/size/Save; hands-free ➤ sends at once; instant mode), photo preview where Cancel sends nothing, phone Save via share sheet, SOS hold (and a too-short tap that must not send), group via creator forwarding, member removal; **updates**: new build verified, announced with its fingerprint, applied on tap, data kept |
 
 ### Internet mode components
 ```
@@ -167,6 +167,8 @@ Rule of thumb: whatever other code uses as a "ready" flag must be assigned **las
 | `core/edits.js` — edit/delete windows, author checks | yes | `test/unit/edits.test.mjs` |
 | `core/profile.js` — username rules, login hash, profile validation, per-contact call flags | yes | `test/unit/profile.test.mjs` |
 | `core/call.js` — WebRTC call engine + signal validation + `callDecision()` | engine needs a browser | `test/unit/call.test.mjs` + e2e "voice & video calls" and the relay call in "phase 1" |
+| `core/waveform.js` — bar heights, live mic level, clock text, speeds, seek maths | yes | `test/unit/waveform.test.mjs` |
+| `ui/voice.js` — voice bubble player + recorder bar (needs MediaRecorder/WebAudio) | browser only | e2e "phase 1" voice section |
 | `relay/src/router.js` `/v1/turn` | — | `test/unit/relay.test.mjs` (fake Cloudflare API, port-53 filter, Origin check, rate limit, STUN fallback) |
 
 ## Lesson: the walkie-talkie that only failed on real fingers
@@ -178,6 +180,26 @@ discarded. The browser tests used a **mouse**, which doesn't fire that second ev
 passed. Fix: pointer capture, and cancel only by *distance* (> 90 px). The e2e suite now drives
 the button with real touch event sequences (`touchHold`), plus tap-to-lock and slide-to-cancel.
 Lesson: when a bug survives a fix, test the exact input the user has, not a convenient stand-in.
+
+## Lesson: state that must outlive a re-render
+The chat screen is redrawn from scratch whenever something changes (a relay reconnect, a
+contact's new photo). That was harmless for text, but the voice recorder used to live *inside*
+the composer: a redraw mid-recording would have orphaned a running MediaRecorder (microphone
+left on, clip lost) and wiped a clip you were reviewing. Now `S.voiceRec` holds one recorder per
+chat and each redraw re-attaches the same button and bar; bubble players are cached by blob URL
+(`PLAYERS`) so a playing note keeps playing. Only *leaving* the chat (or locking) stops them —
+`render()` compares the screen key, and `dropFileUrl()` stops a player before its URL is revoked.
+The same redraw silently **wiped half-typed messages** — and that, not the network, was why the
+e2e suite occasionally "lost" the first message after connecting (a redraw landed between typing
+and tapping Send, so Send sent an empty box; the other phone had already seen "typing…"). It
+failed about 1 run in 4 on the old code. Drafts now live in `S.drafts` (memory only, cleared on
+lock) and `render()` restores focus and cursor; the "profile photo" e2e test types on one phone
+while the other changes its photo, and fails on the old code.
+Lesson: before putting long-lived state in a view, ask what happens when that view is rebuilt —
+and when a "flaky" test fails the same way twice, it is usually a real bug wearing a disguise.
+
+The waveform is computed on each phone from the decrypted audio (`decodeAudioData`), never sent:
+a sender can't make a clip look different from what it sounds like, and the protocol didn't change.
 
 ## History storage
 `history/<contact>` is the list; each file's bytes are their own record `media/<contact>/<message>`,

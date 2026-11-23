@@ -18,6 +18,7 @@ import { encodeQR } from './qr/encode.js';
 import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
+import { voicePlayer, voiceRecorder, stopAllVoice } from './ui/voice.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 import * as BK from './core/backup.js';
 import { readBox, writeBox } from './core/relaybox.js';
@@ -41,6 +42,7 @@ const S = {
   convs: new Map(),      // id → Conversation (live)
   unread: new Map(),
   typing: new Map(),
+  drafts: new Map(),     // chat key → unsent text (memory only, never stored)
   view: null, viewArgs: null,
   scanner: null,
   lastActivity: Date.now(),
@@ -74,9 +76,23 @@ function go(view, ...args) {
   S.view = view; S.viewArgs = args;
   render();
 }
+// Voice notes outlive re-renders of the SAME chat (the relay flickering re-draws it): a playing
+// clip keeps playing and a recording in progress keeps recording. Leaving the chat stops both.
+const PLAYERS = new Map(); // blob url → player element, reused by bubble()
+let lastScreen = '';
 function render() {
+  const screen = `${S.view}:${S.viewArgs?.[0] ?? ''}`;
+  if (screen !== lastScreen) {
+    lastScreen = screen; stopAllVoice(); PLAYERS.clear();
+    if (S.voiceRec) { S.voiceRec.discard(); S.voiceRec = null; } // releases the microphone
+  }
+  // Re-drawing the same chat must not steal the keyboard or move the cursor while you type.
+  const typing = document.activeElement?.id === 'compose' ? document.activeElement : null;
+  const sel = typing && [typing.selectionStart, typing.selectionEnd];
   const v = VIEWS[S.view];
   clear($app).append(v(...(S.viewArgs || [])));
+  const again = typing && document.getElementById('compose');
+  if (again) { again.focus(); try { again.setSelectionRange(...sel); } catch { /* value shorter now */ } return; }
   const focus = $app.querySelector('[autofocus]');
   if (focus) focus.focus();
 }
@@ -363,11 +379,12 @@ function lock(reason) {
   stopRemote();
   stopAllLiveShares();
   for (const conv of S.convs.values()) conv.close('locked');
-  for (const msgs of S.chats.values()) for (const m of msgs) if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  stopAllVoice(); if (S.voiceRec) { S.voiceRec.discard(); S.voiceRec = null; }
+  for (const msgs of S.chats.values()) for (const m of msgs) dropFileUrl(m);
   for (const u of PIC_URLS.values()) URL.revokeObjectURL(u); PIC_URLS.clear();
   endCall('locked');
   S.vault?.lock();
-  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
+  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
   go('unlock');
   if (reason) toast(reason);
@@ -401,7 +418,7 @@ function purgeExpired() {
   for (const [id, msgs] of S.chats) {
     const keep = msgs.filter((m) => !m.expiresAt || m.expiresAt > now);
     if (keep.length !== msgs.length) {
-      for (const m of msgs) if (m.expiresAt && m.expiresAt <= now && m.file?.url) URL.revokeObjectURL(m.file.url);
+      for (const m of msgs) if (m.expiresAt && m.expiresAt <= now) dropFileUrl(m);
       S.chats.set(id, keep);
       rerenderIf('chat', () => S.viewArgs[0] === id);
     }
@@ -1019,6 +1036,15 @@ async function saveFile(m, cid) {
   const a = h('a', { href: m.file.url, download: m.file.name, hidden: true }); document.body.append(a); a.click(); a.remove();
 }
 
+/** Shown as a voice note only when it was sent as one AND its content really is clean audio. */
+const isVoice = (m) => m.file?.kind === 'voice' && m.file.url && m.file.playable === 'audio' && m.file.blob;
+
+/** Frees a message's file: stops its voice player if one is playing, then revokes the blob URL. */
+function dropFileUrl(m) {
+  const u = m.file?.url; if (!u) return;
+  PLAYERS.get(u)?.stop(); PLAYERS.delete(u); URL.revokeObjectURL(u);
+}
+
 function richText(m, cid) {
   return h('div.text', linkify(m.text).map((seg) => (seg.type === 'text' ? seg.text
     : h(`button.inlink.risk-${seg.analysis.risk}`, { type: 'button', 'data-testid': 'link', onclick: () => checkLink(seg, cid, m.dir) }, seg.text))));
@@ -1038,11 +1064,16 @@ function bubble(m, key = S.viewArgs?.[0]) {
   if (m.file) {
     const sf = m.file.safety;
     if (m.file.url && sf?.inline) body.push(h('img.attach', { src: m.file.url, alt: m.file.name }));
-    if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': m.file.kind === 'voice' ? 'voice-clip' : 'audio' }));
+    // A voice note is a message, not a file: player only — no name, no size, no Save.
+    if (isVoice(m)) {
+      if (!PLAYERS.has(m.file.url)) PLAYERS.set(m.file.url, voicePlayer({ blob: m.file.blob, url: m.file.url }));
+      body.push(PLAYERS.get(m.file.url));
+    } else if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': 'audio' }));
     if (m.file.url && m.file.playable === 'video') body.push(h('video.attach', { controls: true, playsinline: true, preload: 'metadata', src: m.file.url, 'data-testid': 'video' }));
     if (sf && sf.verdict !== 'ok') body.push(h(`p.filewarn.${sf.verdict}`, { 'data-testid': 'file-warning' }, icon('alert', 14), ` ${sf.reasons[0]}`));
-    if (!m.file.url && m.file.stored && !m.file.missing) body.push(h('p.hint', 'Loading…'));
-    body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`, h('span.save', 'Save')) : h('span.file', m.file.name));
+    if (!m.file.url && m.file.stored && !m.file.missing) body.push(h('p.hint', m.file.kind === 'voice' ? 'Loading voice message…' : 'Loading…'));
+    if (isVoice(m)) { /* nothing else to show */ } else if (!m.file.url && m.file.kind === 'voice') body.push(h('p.hint', icon('mic', 14), ' Voice message'));
+    else body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`, h('span.save', 'Save')) : h('span.file', m.file.name));
   }
   return h(`div.msg.${m.dir}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
     ...body,
@@ -1217,76 +1248,6 @@ async function prepareOutgoing(file) {
     } catch { /* browser can't decode it: fall back to byte-level cleaning */ }
   }
   return cleanOriginal();
-}
-
-// ---- walkie-talkie: press and hold to talk, release to send ----
-// Gestures (touch and mouse):
-//   hold, talk, lift            → finished (review or send)
-//   quick tap                   → recording stays on ("locked"); tap again to finish
-//   hold and slide far away     → cancelled
-// NOTE: touchscreens fire pointerleave right AFTER pointerup. Treating that as "cancel" threw
-// every iPhone clip away (the browser tests used a mouse, which doesn't). Cancel is now
-// decided by distance, with pointer capture, never by pointerleave.
-const VOICE_LOCK_MS = 600, VOICE_CANCEL_PX = 90;
-function voiceButton(onClip, disabled) {
-  const btn = h('button.icon.mic', { type: 'button', disabled, 'aria-label': 'Hold to talk, or tap to start and tap again to stop', 'data-testid': 'voice', title: 'Hold to talk · tap to lock' }, icon('mic'));
-  let rec = null, stream = null, held = false, cancelled = false, locked = false, started = 0, timer = 0, busy = false, sx = 0, sy = 0;
-  // Every way out (stop, cancel, error, exception) goes through here, so the button can never get stuck.
-  const reset = () => {
-    clearTimeout(timer); stream?.getTracks().forEach((t) => t.stop());
-    rec = null; stream = null; busy = false; locked = false; btn.classList.remove('rec', 'locked');
-  };
-  const stop = () => { clearTimeout(timer); if (rec && rec.state !== 'inactive') { try { rec.stop(); } catch { reset(); } } };
-  const cancel = () => { if (rec) { cancelled = true; setStatusLine('Cancelled'); } held = false; stop(); };
-  const lock = () => { locked = true; btn.classList.add('locked'); setStatusLine('● Recording… tap the mic again to finish'); };
-  btn.addEventListener('pointerdown', async (e) => {
-    e.preventDefault(); if (btn.disabled) return;
-    if (rec && locked) { held = false; stop(); return; } // second tap finishes a locked recording
-    if (busy) return;
-    busy = true; held = true; cancelled = false; locked = false; sx = e.clientX; sy = e.clientY;
-    try { btn.setPointerCapture?.(e.pointerId); } catch { /* synthetic or already released */ }
-    try {
-      try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-      catch { toast('Microphone access is off for Murmur (allow it in Settings → Safari/browser)', 'error', 6000); reset(); return; }
-      const type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'].find((t) => globalThis.MediaRecorder?.isTypeSupported?.(t)) || '';
-      const chunks = [];
-      // Deliberately NO bitrate option and NO timeslice: WebKit ignores bitrates, and Safari 26 emits
-      // EMPTY chunks for short timeslices (WebKit bug 301507). One blob at stop() works everywhere.
-      const r = rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
-      r.ondataavailable = (ev) => { if (ev.data?.size) chunks.push(ev.data); };
-      r.onerror = (ev) => { toast(`Recording failed: ${ev.error?.message || 'unknown error'}`, 'error', 6000); cancelled = true; };
-      r.onstop = () => {
-        const mime = (r.mimeType || type || 'audio/webm').split(';')[0];
-        const dur = Date.now() - started; const bytes = chunks.reduce((n, c) => n + c.size, 0);
-        reset(); setStatusLine('');
-        if (cancelled) return;
-        if (dur <= 500) { toast('Too short — hold the mic while you talk, or tap it once to start'); return; }
-        if (!bytes) { toast('Your phone gave Murmur no sound. Close other apps using the microphone and try again.', 'error', 7000); return; }
-        onClip(new File(chunks, `voice-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : 'webm'}`, { type: mime }), dur);
-      };
-      started = Date.now(); r.start(); btn.classList.add('rec');
-      setStatusLine('● Recording… lift to finish · slide away to cancel');
-      timer = setTimeout(stop, 120_000); // 2 minutes max
-      if (!held) lock(); // finger lifted while the mic was starting (e.g. first-time permission): keep recording, tap to stop
-    } catch (err) {
-      toast(`Couldn’t start recording: ${err.message}`, 'error', 6000); reset(); setStatusLine('');
-    }
-  });
-  btn.addEventListener('pointermove', (e) => {
-    if (held && rec && !locked && Math.hypot(e.clientX - sx, e.clientY - sy) > VOICE_CANCEL_PX) cancel();
-  });
-  btn.addEventListener('pointerup', (e) => {
-    if (!held) return;
-    held = false;
-    if (!rec) return; // still starting: the start code locks it
-    if (Math.hypot(e.clientX - sx, e.clientY - sy) > VOICE_CANCEL_PX) { cancel(); return; }
-    if (Date.now() - started < VOICE_LOCK_MS) { lock(); return; } // a tap, not a hold
-    stop();
-  });
-  // The system took the touch (call, notification, gesture): keep what was said — the review step lets you delete it.
-  btn.addEventListener('pointercancel', () => { if (held && rec && !locked) { held = false; stop(); } });
-  btn.addEventListener('contextmenu', (e) => e.preventDefault());
-  return btn;
 }
 
 // ---- location ----
@@ -1707,7 +1668,7 @@ function redrawBubble(key, m) {
   persistHistory(key).catch(() => {});
 }
 function wipeContent(m) {
-  if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  dropFileUrl(m);
   for (const k of ['text', 'file', 'loc', 'sos']) delete m[k];
   m.deleted = true; delete m.edited;
 }
@@ -1771,7 +1732,7 @@ async function editMessage(key, m) {
 function deleteForMe(key, m) {
   const list = S.chats.get(key) || [];
   const i = list.indexOf(m); if (i >= 0) list.splice(i, 1);
-  if (m.file?.url) URL.revokeObjectURL(m.file.url);
+  dropFileUrl(m);
   document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`)?.remove();
   persistHistory(key).catch(() => {});
 }
@@ -1943,33 +1904,58 @@ VIEWS.groupinfo = (gid) => {
 
 // ---- shared composer (1:1 chats and groups) ----
 function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
-  const input = h('textarea#compose', { rows: 1, placeholder, disabled, maxlength: MAX_TEXT, 'data-testid': 'compose', 'aria-label': 'Message' });
+  // The screen is redrawn whenever something changes (relay reconnects, a new profile photo…).
+  // The draft lives in S.drafts so a redraw never wipes what you're typing. Memory only.
+  const input = h('textarea#compose', { rows: 1, placeholder, disabled, maxlength: MAX_TEXT, 'data-testid': 'compose', 'aria-label': 'Message', value: S.drafts.get(key) || '' });
   const fileIn = h('input', { type: 'file', hidden: true, 'data-testid': 'file-input' });
   const send = async () => {
     const text = input.value; if (!text.trim() || disabled) return;
-    input.value = ''; input.style.height = '';
-    try { await onText(text); } catch (e) { toast(e.message, 'error'); input.value = text; }
+    input.value = ''; input.style.height = ''; S.drafts.delete(key);
+    // Re-read the box after the send: a redraw during the await replaced this element.
+    try { await onText(text); } catch (e) { toast(e.message, 'error'); S.drafts.set(key, text); const box = document.getElementById('compose'); if (box) box.value = text; }
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); } });
-  input.addEventListener('input', () => { input.style.height = ''; input.style.height = `${Math.min(140, input.scrollHeight)}px`; });
+  input.addEventListener('input', () => {
+    if (input.value) S.drafts.set(key, input.value); else S.drafts.delete(key);
+    input.style.height = ''; input.style.height = `${Math.min(140, input.scrollHeight)}px`;
+  });
+  if (input.value) requestAnimationFrame(() => { input.style.height = `${Math.min(140, input.scrollHeight)}px`; });
   const sendFile = async (f, kind) => {
     if (f.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
     try {
-      const prep = kind === 'voice' ? { file: f } : await prepareOutgoing(f);
-      // Nothing leaves the phone on a mis-tap: photos/files always, voice unless set to send on release.
-      const review = kind !== 'voice' || S.settings.voiceSend !== 'release';
-      if (review && !(await reviewBeforeSend(prep, kind))) return;
-      if (prep.note && !review) toast(prep.note, prep.warn ? 'error' : 'success');
+      const prep = await prepareOutgoing(f);
+      // Nothing leaves the phone on a mis-tap: photos, videos and files always show a preview first.
+      // (Voice notes are reviewed inside the composer bar instead — see ui/voice.js.)
+      if (!(await reviewBeforeSend(prep, kind))) return;
       await onFile(prep.file, kind);
     } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
   };
   fileIn.addEventListener('change', () => { const f = fileIn.files[0]; fileIn.value = ''; if (f) sendFile(f); });
-  return h('form.composer', { onsubmit: (e) => { e.preventDefault(); send(); } },
+  // One recorder per chat, kept across re-renders (see render()).
+  if (S.voiceRec?.key !== key) {
+    S.voiceRec?.discard();
+    const vr = { key, form: null };
+    Object.assign(vr, voiceRecorder({
+      disabled,
+      reviewFirst: () => S.settings.voiceSend !== 'release',
+      onState: (st) => vr.form?.setAttribute('data-voice', st),
+      onSend: async (clip) => {
+        if (clip.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
+        try { await vr.onFile(clip, 'voice'); } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
+      },
+    }));
+    S.voiceRec = vr;
+  }
+  const vr = S.voiceRec;
+  vr.onFile = onFile; vr.button.disabled = !!disabled;
+  const form = h('form.composer', { onsubmit: (e) => { e.preventDefault(); send(); }, 'data-voice': vr.state() },
     h('button.icon', { type: 'button', onclick: () => fileIn.click(), disabled, 'aria-label': 'Attach photo, video or file', 'data-testid': 'attach' }, icon('clip')),
     h('button.icon', { type: 'button', onclick: onLocation, disabled, 'aria-label': 'Share location', 'data-testid': 'share-location' }, icon('pin')),
-    input, fileIn,
-    voiceButton((clip) => sendFile(clip, 'voice'), disabled),
+    input, fileIn, vr.bar,
+    vr.button,
     h('button.icon.send', { type: 'submit', disabled, 'aria-label': 'Send', 'data-testid': 'send' }, icon('send')));
+  vr.form = form;
+  return form;
 }
 /** Show exactly what is about to be sent (the cleaned copy) and wait for an explicit Send. */
 async function reviewBeforeSend(prep, kind) {
@@ -1982,7 +1968,7 @@ async function reviewBeforeSend(prep, kind) {
     const f = cur.file, type = f.type || '';
     if (url) URL.revokeObjectURL(url);
     url = URL.createObjectURL(f);
-    clear(box).append(kind === 'voice' || type.startsWith('audio/')
+    clear(box).append(type.startsWith('audio/')
       ? h('audio', { controls: true, src: url, preload: 'metadata', 'data-testid': 'review-audio' })
       : isImg(type) ? h('img.review', { src: url, alt: f.name, 'data-testid': 'review-image' })
       : type.startsWith('video/') ? h('video.review', { controls: true, playsinline: true, src: url, preload: 'metadata', 'data-testid': 'review-video' })
@@ -1998,11 +1984,10 @@ async function reviewBeforeSend(prep, kind) {
   try {
     const t = (cur.file.type || '');
     const choice = await modal({
-      title: kind === 'voice' ? 'Send this voice message?' : `Send ${t.startsWith('image/') ? 'this photo' : t.startsWith('video/') ? 'this video' : 'this file'}?`,
+      title: `Send ${t.startsWith('image/') ? 'this photo' : t.startsWith('video/') ? 'this video' : 'this file'}?`,
       body: [box, info, note, hd].filter(Boolean),
-      actions: [[kind === 'voice' ? 'Delete' : 'Cancel', 'cancel'], ['Send', 'send', 'primary']],
+      actions: [['Cancel', 'cancel'], ['Send', 'send', 'primary']],
     });
-    if (choice !== 'send' && kind === 'voice') toast('Voice message deleted');
     if (choice === 'send') prep.file = cur.file; // what you saw is what is sent
     return choice === 'send';
   } finally { if (url) URL.revokeObjectURL(url); }
@@ -2108,9 +2093,12 @@ VIEWS.shared = (id, tab = 'media') => {
       : empty('No photos or videos yet.');
   } else if (tab === 'docs') {
     body = k.docs.length ? h('ul.doclist', { 'data-testid': 'shared-docs' }, k.docs.map((m) => h('li',
-      h('div.docinfo', icon(m.file.kind === 'voice' ? 'mic' : 'clip', 18), h('div', h('strong', m.file.kind === 'voice' ? 'Voice message' : m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
-      m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
-      m.file.url ? h('button', { type: 'button', onclick: () => saveFile(m, id) }, 'Save') : h('span.hint', 'Loading…'))))
+      isVoice(m)
+        ? [h('div.docinfo', icon('mic', 18), h('div', h('strong', 'Voice message'), h('small', `${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
+          voicePlayer({ blob: m.file.blob, url: m.file.url, compact: true })]
+        : [h('div.docinfo', icon('clip', 18), h('div', h('strong', m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
+          m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
+          m.file.url ? h('button', { type: 'button', onclick: () => saveFile(m, id) }, 'Save') : h('span.hint', 'Loading…')])))
       : empty('No files or voice messages yet.');
   } else {
     body = k.links.length ? h('ul.linklist', { 'data-testid': 'shared-links' }, k.links.map(({ m, seg }) => h('li',

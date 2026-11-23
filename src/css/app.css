@@ -251,7 +251,6 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .callbtn.accept svg { background: #22c55e; }
 .callscreen[data-state="ringing"] .callbtn.accept svg { animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { box-shadow: 0 0 0 14px #22c55e33; } }
-button.mic.locked { outline: 3px solid var(--danger); outline-offset: 3px; }
 
 /* ---- chat header: photo + name, tap for contact info ---- */
 .titlebtn { display: flex; align-items: center; gap: 0.6rem; background: none; border: 0; padding: 0; color: inherit; min-width: 0; flex: 1; text-align: left; cursor: pointer; }
@@ -286,3 +285,44 @@ button.mic.locked { outline: 3px solid var(--danger); outline-offset: 3px; }
 .tile.wide svg { grid-row: span 2; }
 .tile.wide small { grid-column: 2; }
 .hint.pad { padding: 0 1rem; }
+
+/* ---- voice messages (WhatsApp-style) — see src/js/ui/voice.js ---- */
+/* While recording or reviewing, the bar takes over the composer: no pop-up over the chat. */
+.composer[data-voice="holding"] > :not(.voicebar):not(.mic),
+.composer[data-voice="locked"] > :not(.voicebar),
+.composer[data-voice="review"] > :not(.voicebar) { display: none !important; }
+.composer[data-voice]:not([data-voice="idle"]) { align-items: center; }
+.voicebar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0.35rem; min-height: 48px; }
+.voicebar > * { display: none; }
+.voicebar[data-state="holding"] > :is(.vrec, .vhint),
+.voicebar[data-state="locked"] > :is(.vtrash, .vrec, .vstop, .vsend),
+.voicebar[data-state="review"] > :is(.vtrash, .vslot, .vsend) { display: flex; }
+.vrec, .vslot { flex: 1; min-width: 0; align-items: center; gap: 0.5rem; }
+.vrec { background: var(--bg3); border-radius: 22px; padding: 0 0.8rem; height: 44px; }
+.vslot { background: var(--bg3); border-radius: 22px; padding: 0 0.6rem 0 0.2rem; height: 48px; }
+.vdot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); flex: none; animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: 0.25; } }
+.vtimer { font-variant-numeric: tabular-nums; font-size: 0.95rem; min-width: 2.6em; }
+.vrec .vwave { flex: 1; height: 24px; }
+.vhint { color: var(--fg2); font-size: 0.8rem; white-space: nowrap; padding-right: 0.2rem; flex: none; }
+.voicebar[data-state="holding"] .vwave { max-width: 110px; }
+.voicebar .vtrash { color: var(--danger); }
+.voicebar .vstop { color: var(--fg); background: var(--bg3); border-radius: 50%; }
+.voicebar .vsend { background: var(--accent); color: var(--accent-ink); border-radius: 50%; width: 46px; height: 46px; justify-content: center; border: 0; flex: none; }
+
+.voice { display: flex; align-items: center; gap: 0.45rem; width: min(260px, 68vw); margin: 0.15rem 0; }
+.voice audio { display: none; }
+.vplay { width: 40px; height: 40px; min-height: 40px; padding: 0; border: 0; border-radius: 50%; background: transparent; justify-content: center; flex: none; color: var(--fg); }
+.vplay svg path, .voicebar .vstop svg path { fill: currentColor; stroke-width: 1; }
+.vmid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.vwave { display: flex; align-items: center; gap: 2px; height: 30px; min-width: 0; overflow: hidden; touch-action: pan-y; cursor: pointer; }
+.vwave span { flex: 1; min-width: 1px; max-width: 4px; border-radius: 2px; background: var(--fg2); opacity: 0.55; transition: height 90ms linear; }
+.vwave span.on { background: var(--accent); opacity: 1; }
+.vrec .vwave span { background: var(--fg); opacity: 0.8; }
+.vtime { font-size: 0.75rem; color: var(--fg2); font-variant-numeric: tabular-nums; }
+.vspeed { min-height: 28px; padding: 0 0.55rem; border-radius: 14px; font-size: 0.75rem; font-weight: 600; border: 0; background: var(--bg3); flex: none; }
+.voice.compact { width: 100%; }
+.voice.compact .vmid { flex-direction: row; align-items: center; gap: 0.5rem; }
+.voice.compact .vwave { flex: 1; }
+.doclist .voice { width: 100%; }
+@media (prefers-reduced-motion: reduce) { .vdot { animation: none; } .vwave span { transition: none; } }
