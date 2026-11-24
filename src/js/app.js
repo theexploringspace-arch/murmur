@@ -20,6 +20,7 @@ import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
 import { voicePlayer, voiceRecorder, stopAllVoice } from './ui/voice.js';
 import { spotlightMenu } from './ui/menu.js';
+import { openSheet, closeSheet } from './ui/sheet.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 import * as BK from './core/backup.js';
 import { readBox, writeBox } from './core/relaybox.js';
@@ -27,7 +28,7 @@ import { Call, readSignal, callDecision, callButtons, formatDuration } from './c
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
 import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
 import { BUBBLES, WALLS, cleanLook, effectiveLook, bubbleVars, inkOn } from './core/color.js';
-import { readStatus, statusTag, readStatusId, cleanAudience, audience, live, statusRows, showFor, ago, expiresAt, STATUS_BGS, STATUS_FONTS, MAX_STATUS_TEXT, MAX_CAPTION } from './core/status.js';
+import { readStatus, statusTag, readStatusId, cleanAudience, audience, live, statusRows, showFor, ago, expiresAt, STATUS_BGS, STATUS_FONTS, MAX_STATUS_TEXT, MAX_CAPTION, needsSend, deliveryState, RESEND_MS } from './core/status.js';
 import { msgMeta, quoteOf, resolveQuote, kindOf, kindLabel, forwardHops, forwardLabel, receiptsOn, toConfirm, readIds, statusAfter, typeLabel } from './core/meta.js';
 
 const $app = document.getElementById('app');
@@ -778,10 +779,11 @@ async function chooseUsername() {
   }
 }
 
-function header(title, { back, actions = [], lead = null, onTitle = null } = {}) {
+function header(title, { back, actions = [], lead = null, onTitle = null, sub = null } = {}) {
+  const name = sub ? h('div.titlewrap', h('h1', title), sub) : h('h1', title);
   return h('header.bar',
     back ? h('button.icon', { onclick: back, 'aria-label': 'Back', 'data-testid': 'back' }, icon('back')) : h('div.logo.sm', icon('shield', 20)),
-    onTitle ? h('button.titlebtn', { type: 'button', onclick: onTitle, 'data-testid': 'chat-title' }, lead, h('h1', title)) : [lead, h('h1', title)],
+    onTitle ? h('button.titlebtn', { type: 'button', onclick: onTitle, 'data-testid': 'chat-title' }, lead, name) : [lead, name],
     h('div.actions', actions));
 }
 
@@ -1245,7 +1247,7 @@ VIEWS.chat = (id) => {
   let typingSent = false, typingTimer = 0;
   const comp = composer({
     key: id, disabled: !online,
-    placeholder: live ? 'Message' : online ? (S.relayOnline ? 'Message (via internet)' : 'Message — sends when you’re online') : hasRemote(id) ? 'Waiting for their first message…' : 'Reconnect to send',
+    placeholder: online ? (live || S.relayOnline ? 'Message' : 'Message · sends when online') : hasRemote(id) ? 'Waiting for their first message…' : 'Reconnect to send',
     onText: async (text, tags) => {
       await sendTextTo(id, text, tags);
       if (typingSent) { S.convs.get(id)?.setTyping(false); typingSent = false; }
@@ -1259,15 +1261,18 @@ VIEWS.chat = (id) => {
     clearTimeout(typingTimer); typingTimer = setTimeout(() => { if (typingSent) { conv?.setTyping(false); typingSent = false; } }, 2500);
   });
 
-  const ttlSel = h('select', { 'aria-label': 'Disappearing messages', 'data-testid': 'ttl', onchange: async (e) => { c.ttl = +e.target.value; await persistContacts(); toast(c.ttl ? `New messages disappear after ${TTL_OPTIONS.find(([v]) => v === c.ttl)[1]}` : 'Disappearing messages off'); } },
-    TTL_OPTIONS.map(([v, l]) => h('option', { value: v, selected: c.ttl === v }, l)));
+  // Under the name, like WhatsApp's "online": how you're connected, plus the timer when it's on.
+  const ttlLabel = c.ttl ? TTL_OPTIONS.find(([v]) => v === c.ttl)?.[1] : null;
+  const sub = h('span.sub', { 'data-online': live, 'data-kind': linkState(id)[1], 'data-testid': 'conn-state' },
+    linkState(id)[0], ttlLabel ? h('span.subttl', { title: 'Disappearing messages' }, ' · ', icon('timer', 12), ` ${ttlLabel}`) : null);
 
   const view = h('div.screen.chat',
     header(displayName(c), {
       back: () => go('home'),
       lead: avatar(c, { size: 'sm', online: live }),
       onTitle: () => go('contact', id),
-      actions: [h('span.pill', { 'data-online': live, 'data-kind': linkState(id)[1], 'data-testid': 'conn-state' }, linkState(id)[0]),
+      sub,
+      actions: [
         ...(online ? [
           callButtons(c).voice ? h('button.icon', { onclick: () => startCall(id, false), 'aria-label': 'Voice call', 'data-testid': 'call-voice' }, icon('phone')) : null,
           callButtons(c).video ? h('button.icon', { onclick: () => startCall(id, true), 'aria-label': 'Video call', 'data-testid': 'call-video' }, icon('video')) : null] : []),
@@ -1282,18 +1287,24 @@ VIEWS.chat = (id) => {
     !c.request && c.remote && !c.verified ? h('div.banner', { 'data-testid': 'verify-banner' },
       h('p', icon('shield', 14), ' Not verified yet. Call them and compare safety numbers to be sure nobody swapped the invite.'),
       h('button', { onclick: () => go('contact', id) }, 'Compare numbers')) : null,
-    live || (hasRemote(id) && c.hideNearby) ? null : h(`div.reconnect${hasRemote(id) ? '.compact' : ''}`, { 'data-testid': 'nearby-card' },
-      hasRemote(id) ? h('button.icon.small.dismiss', { type: 'button', 'aria-label': 'Hide this', title: 'Hide — it’s also in contact info', 'data-testid': 'nearby-dismiss',
-        onclick: async () => { c.hideNearby = true; await persistContacts(); render(); toast('Hidden. Connect nearby any time from contact info (tap their name).'); } }, icon('close', 16)) : null,
-      h('p', hasRemote(id) ? 'Together without internet? Connect nearby:' : 'Meet up on the same Wi-Fi or hotspot to reconnect:'),
-      h('div.share',
-        h('button.primary', { onclick: () => go('invite', id), 'data-testid': 'reconnect-invite' }, icon('qr', 18), ' Show my code'),
-        h('button', { onclick: () => go('join', id), 'data-testid': 'reconnect-join' }, icon('scan', 18), ' Scan theirs'))),
+    live || (hasRemote(id) && c.hideNearby) ? null : hasRemote(id)
+      // Already reachable over the internet: one slim line, so the chat keeps the screen.
+      ? h('div.reconnect.slim', { 'data-testid': 'nearby-card' },
+        h('span.slimtext', { title: 'Same Wi-Fi or hotspot? Connect directly — no internet needed' }, icon('qr', 15), ' Nearby'),
+        h('button.chip', { onclick: () => go('invite', id), 'data-testid': 'reconnect-invite' }, 'Show code'),
+        h('button.chip', { onclick: () => go('join', id), 'data-testid': 'reconnect-join' }, 'Scan'),
+        h('button.icon.small.dismiss', { type: 'button', 'aria-label': 'Hide this', title: 'Hide — it’s also in contact info', 'data-testid': 'nearby-dismiss',
+          onclick: async () => { c.hideNearby = true; await persistContacts(); render(); toast('Hidden. Connect nearby any time from contact info (tap their name).'); } }, icon('close', 16)))
+      // No other way to reach them: the full card.
+      : h('div.reconnect', { 'data-testid': 'nearby-card' },
+        h('p', 'Meet up on the same Wi-Fi or hotspot to reconnect:'),
+        h('div.share',
+          h('button.primary', { onclick: () => go('invite', id), 'data-testid': 'reconnect-invite' }, icon('qr', 18), ' Show my code'),
+          h('button', { onclick: () => go('join', id), 'data-testid': 'reconnect-join' }, icon('scan', 18), ' Scan theirs'))),
     liveBanner(id),
     log,
     h('p#typing.typing', { hidden: !S.typing.get(id) }, `${displayName(c)} is typing…`),
     h('p#chatstatus.chatstatus', { hidden: true }),
-    h('div.chattools', h('label.ttlwrap', { title: 'Disappearing messages' }, icon('timer', 16), ttlSel)),
     comp);
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; if (online) input.focus(); });
   confirmReads(id);
@@ -1544,7 +1555,7 @@ async function onAppMessage(cid, m) {
       break;
     }
     case 'edit': case 'del': applyEditOrDelete(cid, m); break;
-    case 'status': case 'status-del': case 'status-seen': onStatusMessage(cid, c, m); break;
+    case 'status': case 'status-del': case 'status-seen': case 'status-got': onStatusMessage(cid, c, m); break;
     case 'read': {
       // Reciprocal: with receipts off for this contact we don't show theirs either.
       if (!receiptsOn(S.settings, c)) return;
@@ -2291,6 +2302,12 @@ VIEWS.contact = (id) => {
       h('p.hint', c.calls && !c.calls.voice && !c.calls.video ? `${displayName(c)} doesn’t accept calls right now.` : ''),
       h('button.setrow', { type: 'button', onclick: () => go('look', id), 'data-testid': 'contact-look' },
         h('span.seticon', icon('palette', 20)), h('span.settext', h('strong', 'Chat colour & wallpaper'), h('small', c.look ? 'Custom for this chat' : 'Same as all chats')), icon('chevron', 18)),
+      h('h2', 'Disappearing messages'),
+      h('select', { 'aria-label': 'Disappearing messages', 'data-testid': 'ttl', onchange: async (e) => {
+        c.ttl = +e.target.value; await persistContacts();
+        toast(c.ttl ? `New messages disappear after ${TTL_OPTIONS.find(([v]) => v === c.ttl)[1]}` : 'Disappearing messages off');
+      } }, TTL_OPTIONS.map(([v, l]) => h('option', { value: v, selected: (c.ttl || 0) === v }, l))),
+      h('p.hint', 'Applies to new messages you send in this chat. Their phone deletes them too. (Shown next to their name when on.)'),
       h('h2', 'Read receipts'),
       h('select', { 'data-testid': 'contact-receipts', 'aria-label': 'Read receipts for this contact', onchange: async (e) => {
         if (e.target.value === 'default') delete c.receipts; else c.receipts = e.target.value;
@@ -2870,22 +2887,34 @@ async function sendStatusTo(cid, s) {
   if (s.kind === 'text') await deliver(cid, { t: 'status', id: s.id, ts: s.ts, kind: 'text', text: s.text, bg: s.bg, font: s.font });
   else await deliverFile(cid, new File([s.blob], 'status.jpg', { type: s.blob.type || 'image/jpeg' }), 0, () => {}, { st: { id: s.id, ts: s.ts, cap: s.cap || '' } });
 }
-/** Send my live statuses to everyone in my audience who doesn't have them yet. */
-async function syncStatuses(only) {
-  if (!S.vault || !S.statuses) return;
-  const people = audience(S.settings.statusAudience, [...S.contacts.values()]);
-  let dirty = false;
-  for (const s of live(myStatuses())) {
-    s.sentTo ||= [];
-    for (const cid of people) {
-      if ((only && !only.includes(cid)) || s.sentTo.includes(cid) || !reachable(cid)) continue;
-      try { await sendStatusTo(cid, s); s.sentTo.push(cid); dirty = true; } catch (e) { console.warn('status send:', e.message); }
+/**
+ * Send my live statuses to everyone in my audience who hasn't CONFIRMED them yet (see needsSend in
+ * core/status.js): sent ≠ received. Runs on posting, when a contact comes online, when the relay
+ * reconnects, and every RESEND_MS while Murmur is open. One run at a time.
+ */
+let statusSync = Promise.resolve();
+function syncStatuses(only) {
+  statusSync = statusSync.then(async () => {
+    if (!S.vault || !S.statuses) return;
+    const people = audience(S.settings.statusAudience, [...S.contacts.values()]);
+    let dirty = false;
+    for (const s of live(myStatuses())) {
+      s.sentTo ||= []; s.sentAt ||= {}; s.gotBy ||= [];
+      for (const cid of people) {
+        if ((only && !only.includes(cid)) || !needsSend(s, cid) || !reachable(cid)) continue;
+        try {
+          await sendStatusTo(cid, s);
+          s.sentAt[cid] = Date.now(); if (!s.sentTo.includes(cid)) s.sentTo.push(cid); dirty = true;
+        } catch (e) { console.warn('status send:', e.message); }
+      }
     }
-  }
-  if (dirty) persistStatuses();
+    if (dirty) persistStatuses();
+  }).catch((e) => console.warn('status sync:', e.message));
+  return statusSync;
 }
+setInterval(() => { if (S.vault) syncStatuses(); }, RESEND_MS);
 async function postStatus(s) {
-  Object.assign(s, { id: newId(), by: S.myCid, ts: Date.now(), views: {}, sentTo: [] });
+  Object.assign(s, { id: newId(), by: S.myCid, ts: Date.now(), views: {}, sentTo: [], sentAt: {}, gotBy: [] });
   s.exp = expiresAt(s.ts);
   if (s.kind === 'photo') await S.vault.putRecord(STATUS_PHOTO(s.id), { b64: toB64u(new Uint8Array(await s.blob.arrayBuffer())), mime: s.blob.type });
   addStatus(s);
@@ -2905,15 +2934,28 @@ function onStatusMessage(cid, c, m) {
   if (m.t === 'status') {
     const s = readStatus(m); if (!s) return;
     addStatus({ ...s, by: cid, seen: false });
+    confirmStatus(cid, s.id);
   } else if (m.t === 'status-del') {
     const id = readStatusId(m); const s = (S.statuses.get(cid) || []).find((x) => x.id === id);
     if (s) { dropStatus(s); persistStatuses(); rerenderIf('status'); rerenderIf('home'); }
   } else if (m.t === 'status-seen') {
     const id = readStatusId(m); const s = myStatuses().find((x) => x.id === id);
     // Counted only if we really sent it to them, and only while our own receipts are on for them (reciprocal).
-    if (!s || !(s.sentTo || []).includes(cid) || !receiptsOn(S.settings, c)) return;
-    if (!s.views[cid]) { s.views[cid] = Date.now(); persistStatuses(); rerenderIf('status'); }
+    if (!s || !(s.sentTo || []).includes(cid)) return;
+    gotStatus(s, cid); // looking at it proves it arrived — whatever the receipt settings
+    if (!receiptsOn(S.settings, c)) return;
+    if (!s.views[cid]) { s.views[cid] = Date.now(); persistStatuses(); rerenderIf('status'); refreshViewedBy(); }
+  } else if (m.t === 'status-got') {
+    const id = readStatusId(m); const s = myStatuses().find((x) => x.id === id);
+    if (s && (s.sentTo || []).includes(cid)) gotStatus(s, cid);
   }
+}
+/** "I have it" — sent for every valid status received, duplicates included (the first may be lost). */
+const confirmStatus = (cid, id) => deliver(cid, { t: 'status-got', id }).catch(() => {});
+function gotStatus(s, cid) {
+  s.gotBy ||= [];
+  if (s.gotBy.includes(cid)) return;
+  s.gotBy.push(cid); persistStatuses(); refreshViewedBy();
 }
 async function onStatusPhoto(cid, st, name, mime, bytes) {
   const c = S.contacts.get(cid); if (!c || c.request) return;
@@ -2922,8 +2964,45 @@ async function onStatusPhoto(cid, st, name, mime, bytes) {
   if (!safety.inline) return; // only real, displayable images become a status photo
   const blob = new Blob([bytes], { type: safety.realType });
   const s = { ...tag, by: cid, kind: 'photo', blob, url: URL.createObjectURL(blob), seen: false };
-  if (!addStatus(s)) { URL.revokeObjectURL(s.url); return; }
+  if (!addStatus(s)) { URL.revokeObjectURL(s.url); confirmStatus(cid, tag.id); return; } // a re-send we already have
   await S.vault.putRecord(STATUS_PHOTO(s.id), { b64: toB64u(bytes), mime: safety.realType });
+  confirmStatus(cid, tag.id); // only once it's safely stored
+}
+
+// -- "Viewed by": a sheet that slides up over the status (the status stays paused behind it)
+let viewedBy = null; // { s, body } while the sheet is open — refreshed live as views arrive
+let viewerShowing = null; // the status on screen in the viewer, for the live eye count
+function viewedByBody(s) {
+  const views = Object.entries(s.views || {}).sort((a, b) => b[1] - a[1]);
+  const people = audience(S.settings.statusAudience, [...S.contacts.values()]).filter((c) => (s.sentTo || []).includes(c) || needsSend(s, c));
+  const { waiting } = deliveryState(s, people);
+  const person = (cid, right) => h('li.vbrow', avatar(S.contacts.get(cid), { size: 'sm' }), h('span.vbname', displayName(S.contacts.get(cid)) || 'Someone'), h('small', right));
+  return [
+    views.length ? h('ul.vblist', { 'data-testid': 'viewed-by-list' }, views.map(([cid, t]) => person(cid, ago(t))))
+      : h('p.hint', { 'data-testid': 'viewed-by-empty' }, 'No views yet.'),
+    S.settings.readReceipts === false ? h('p.hint', icon('eye', 14), ' Your read receipts are off, so you don’t see who viewed (and they don’t see when you view theirs).') : null,
+    waiting.length ? h('div.vbwait', { 'data-testid': 'status-waiting' },
+      h('h3', 'Not received yet'),
+      h('ul.vblist', waiting.map((cid) => person(cid, 'waiting'))),
+      h('p.hint', 'It’ll reach them the next time their Murmur is open and online — Murmur keeps trying for 24 hours.')) : null,
+  ];
+}
+function openViewedBy(s, pause, resume) {
+  pause();
+  const n = Object.keys(s.views || {}).length;
+  const body = h('div', viewedByBody(s));
+  openSheet({ title: `Viewed by ${n}`, body: [body], testid: 'viewed-by', onClose: () => { viewedBy = null; resume(); } });
+  viewedBy = { s, body };
+}
+/** A view or delivery arrived: update the open sheet and the eye count in place. */
+function refreshViewedBy() {
+  if (viewedBy) {
+    viewedBy.body.replaceChildren(...viewedByBody(viewedBy.s).filter(Boolean));
+    const t = document.querySelector('[data-testid="viewed-by"] h2'); if (t) t.textContent = `Viewed by ${Object.keys(viewedBy.s.views || {}).length}`;
+  }
+  const count = document.querySelector('[data-testid="status-seen-count"]');
+  const cur = viewedBy?.s || viewerShowing;
+  if (count && cur) count.textContent = String(Object.keys(cur.views || {}).length);
 }
 
 // -- the Status screen
@@ -2944,16 +3023,18 @@ VIEWS.status = () => {
   const row = (r) => h('li', h('button.contact.statusrow', { type: 'button', onclick: () => openStatusViewer(rows.map((x) => x.cid), r.cid), 'data-testid': `status-${displayName(S.contacts.get(r.cid))}` },
     statusRing(r.cid, r.statuses), h('span.settext', h('strong', displayName(S.contacts.get(r.cid))), h('small', `${ago(r.latest)}${r.statuses.length > 1 ? ` · ${r.statuses.length} updates` : ''}`))));
   return h('div.screen.full.tabbed',
-    header('Status', { actions: [
-      h('button.icon', { onclick: () => openTextStatusComposer(), 'aria-label': 'New text status', 'data-testid': 'status-new-text' }, icon('pencil')),
-      h('button.icon', { onclick: () => photoIn.click(), 'aria-label': 'New photo status', 'data-testid': 'status-new-photo' }, icon('camera'))] }),
+    header('Status'),
     h('div.panel',
-      h('ul.contacts', h('li', h('button.contact.statusrow', { type: 'button', 'data-testid': 'status-mine', onclick: () => (mine.length ? openStatusViewer([S.myCid], S.myCid) : openTextStatusComposer()) },
-        mine.length ? statusRing(S.myCid, mine) : h('span.avatar.md.addring', myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase(), h('span.plus', icon('plus', 14))),
-        h('span.settext', h('strong', 'My status'), h('small', mine.length ? `${mine.length} ${mine.length === 1 ? 'update' : 'updates'} · ${ago(mine[mine.length - 1].ts)}` : 'Tap to add a status update'))))),
-      h('div.share.statusadd',
-        h('button', { onclick: () => openTextStatusComposer(), 'data-testid': 'status-add-text' }, icon('text', 18), ' Text'),
-        h('button', { onclick: () => photoIn.click(), 'data-testid': 'status-add-photo' }, icon('camera', 18), ' Photo')),
+      // One row, like the apps people already know: your picture (with a + when there's nothing
+      // yet), "Add status / Disappears after 24 hours", and round camera + pencil buttons.
+      h('div.mystatus',
+        h('button.contact.statusrow', { type: 'button', 'data-testid': 'status-mine', 'aria-label': mine.length ? 'View my status' : 'Add a photo status',
+          onclick: () => (mine.length ? openStatusViewer([S.myCid], S.myCid) : photoIn.click()) },
+          mine.length ? statusRing(S.myCid, mine) : h('span.avatar.md.addring', myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase(), h('span.plus', icon('plus', 14))),
+          h('span.settext', h('strong', mine.length ? 'My status' : 'Add status'),
+            h('small', mine.length ? `${mine.length} ${mine.length === 1 ? 'update' : 'updates'} · ${ago(mine[mine.length - 1].ts)}` : 'Disappears after 24 hours'))),
+        h('button.roundicon', { type: 'button', onclick: () => photoIn.click(), 'aria-label': 'New photo status', title: 'Photo', 'data-testid': 'status-new-photo' }, icon('camera', 20), h('span.roundplus', icon('plus', 10))),
+        h('button.roundicon', { type: 'button', onclick: () => openTextStatusComposer(), 'aria-label': 'New text status', title: 'Text', 'data-testid': 'status-new-text' }, icon('pencil', 20))),
       photoIn,
       fresh.length ? [h('h2', 'Recent'), h('ul.contacts', fresh.map(row))] : null,
       seen.length ? [h('h2', 'Viewed'), h('ul.contacts', seen.map(row))] : null,
@@ -3026,7 +3107,7 @@ function openStatusViewer(order, startCid) {
     h('div.sttop', h('button.icon', { onclick: () => close(), 'aria-label': 'Close', 'data-testid': 'status-close' }, icon('close')), h('div.stwho', who, when), h('span.grow')),
     stage, bottom);
   const listOf = (cid) => live(S.statuses.get(cid) || []).sort((a, b) => a.ts - b.ts);
-  const close = () => { clearTimeout(timer); ov.remove(); document.removeEventListener('keydown', keys); rerenderIf('status'); rerenderIf('home'); };
+  const close = () => { clearTimeout(timer); closeSheet(); viewerShowing = null; ov.remove(); document.removeEventListener('keydown', keys); rerenderIf('status'); rerenderIf('home'); };
   ov.stop = () => { clearTimeout(timer); document.removeEventListener('keydown', keys); };
   const pause = () => { if (paused) return; paused = true; clearTimeout(timer); left -= Date.now() - started; ov.classList.add('paused'); };
   const resume = () => { if (!paused) return; paused = false; started = Date.now(); timer = setTimeout(next, left); ov.classList.remove('paused'); };
@@ -3038,10 +3119,13 @@ function openStatusViewer(order, startCid) {
     const cid = order[oi], list = listOf(cid), s = list[si];
     if (!s) { close(); return; }
     const mineNow = cid === S.myCid;
+    viewerShowing = s;
     who.textContent = mineNow ? 'My status' : displayName(S.contacts.get(cid));
     when.textContent = ago(s.ts);
     bars.replaceChildren(...list.map((_, i) => h(`span.stbar${i < si ? '.done' : i === si ? '.now' : ''}`, { style: { '--dur': `${showFor(s)}ms` } }, h('i'))));
     stage.className = s.kind === 'text' ? `ststage stbg-${s.bg} stfont-${s.font}` : 'ststage';
+    // The whole screen takes the status's colour (not just a band between the bars), edge to edge.
+    ov.className = `stoverlay viewer${s.kind === 'text' ? ` stbg-${s.bg}` : ''}${paused ? ' paused' : ''}`;
     // replaceChildren takes nodes as separate arguments — an array would be turned into the text
     // "[object HTMLImageElement]…" (it was, until the e2e test looked at the screen).
     stage.replaceChildren(...(s.kind === 'text' ? [h('p.stshow', { 'data-testid': 'status-shown' }, s.text)]
@@ -3053,14 +3137,11 @@ function openStatusViewer(order, startCid) {
       if (c && receiptsOn(S.settings, c)) deliver(cid, { t: 'status-seen', id: s.id }).catch(() => {});
     }
     if (mineNow) {
-      const viewers = Object.entries(s.views || {});
+      const viewers = Object.keys(s.views || {});
       bottom.replaceChildren(
-        h('button.stseen', { 'data-testid': 'status-seen-by', onclick: () => {
-          pause();
-          modal({ title: viewers.length ? `Seen by ${viewers.length}` : 'No views yet', body: viewers.length
-            ? [h('ul.picklist', viewers.sort((a, b) => b[1] - a[1]).map(([vc, t]) => h('li', h('span', displayName(S.contacts.get(vc)) || 'Someone'), h('small', ago(t)))))]
-            : ['Views show here when people with read receipts on look at it.'], actions: [['Close', true]] }).then(resume);
-        } }, icon('eye', 18), ` ${viewers.length}`),
+        // Tap — or swipe up anywhere on the status — to see who viewed it, in a sheet from below.
+        h('button.stseen', { 'data-testid': 'status-seen-by', 'aria-label': `Viewed by ${viewers.length}. Show who`, onclick: () => openViewedBy(s, pause, resume) },
+          h('span.stseen-up', icon('chevron', 14)), icon('eye', 18), h('span', { 'data-testid': 'status-seen-count' }, String(viewers.length))),
         h('span.grow'),
         h('button.icon', { 'aria-label': 'Delete this status', 'data-testid': 'status-delete', onclick: async () => {
           pause();
@@ -3080,10 +3161,13 @@ function openStatusViewer(order, startCid) {
     }
     left = showFor(s); started = Date.now(); timer = setTimeout(next, left);
   }
-  // Tap the right two-thirds → next, left third → back; press and hold → pause.
-  let downAt = 0;
-  stage.addEventListener('pointerdown', () => { downAt = Date.now(); pause(); });
+  // Tap the right two-thirds → next, left third → back; press and hold → pause;
+  // swipe up on your own status → who viewed it (like pulling the sheet up).
+  let downAt = 0, downY = 0;
+  stage.addEventListener('pointerdown', (e) => { downAt = Date.now(); downY = e.clientY; pause(); });
   stage.addEventListener('pointerup', (e) => {
+    const s = listOf(order[oi])[si];
+    if (order[oi] === S.myCid && s && downY - e.clientY > 60) { openViewedBy(s, () => {}, resume); return; }
     const held = Date.now() - downAt > 300;
     if (held) { resume(); return; }
     const r = stage.getBoundingClientRect();
@@ -3175,16 +3259,19 @@ async function setWallPhoto(scope, file) {
   await saveLook(scope, { wall: 'photo' });
 }
 /** Paint a chat screen with its look: bubble colours (with readable text) and the wallpaper. */
+// The wallpaper goes on the whole chat screen — behind the frosted header and composer, like
+// WhatsApp — so the chat fills the screen instead of sitting in a band between two bars.
+// (logEl is kept in the signature for the preview, which has no separate screen.)
 function applyLook(screenEl, logEl, key) {
   const look = lookFor(key);
   for (const [k, v] of Object.entries(bubbleVars(look.bubble))) screenEl.style.setProperty(k, v);
-  for (const w of WALLS) logEl.classList.remove(`wall-${w.id}`);
-  logEl.classList.remove('wall-photo', 'wall-dim');
-  logEl.classList.add(`wall-${look.wall}`);
-  if (look.dim) logEl.classList.add('wall-dim');
+  for (const w of WALLS) screenEl.classList.remove(`wall-${w.id}`);
+  screenEl.classList.remove('wall-photo', 'wall-dim');
+  screenEl.classList.add(`wall-${look.wall}`);
+  if (look.dim) screenEl.classList.add('wall-dim');
   screenEl.dataset.wall = look.wall;
   if (look.wall === 'photo') {
-    wallUrl(wallPhotoScope(key)).then((url) => { if (url) logEl.style.setProperty('--wall-img', `url("${url}")`); }).catch(() => {});
+    wallUrl(wallPhotoScope(key)).then((url) => { if (url) screenEl.style.setProperty('--wall-img', `url("${url}")`); }).catch(() => {});
   }
 }
 

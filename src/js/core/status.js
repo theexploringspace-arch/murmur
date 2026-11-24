@@ -95,3 +95,26 @@ export function ago(ts, now = Date.now()) {
   if (m < 60) return `${m}m ago`;
   return `${Math.floor(m / 60)}h ago`;
 }
+
+// ---------------------------------------------------------------- delivery (sent ≠ received)
+// A status used to be marked "sent to Bob" the moment it left this phone, and was never sent
+// again. If Bob's phone dropped it (e.g. it was still on an older Murmur that didn't know
+// statuses yet), Bob never saw it and nothing ever noticed. Now the receiver CONFIRMS each status
+// (`status-got`, also implied by `status-seen`), and the sender re-sends to anyone who hasn't
+// confirmed: whenever they come back online, and every RESEND_MS while Murmur is open — until it
+// expires. Receivers drop duplicates by id, so a re-send is harmless.
+export const RESEND_MS = 5 * 60_000;
+
+/** Should status `s` go (again) to `cid` now? Confirmed → never; sent recently → wait; else yes. */
+export function needsSend(s, cid, now = Date.now()) {
+  if ((s.gotBy || []).includes(cid)) return false;
+  const last = s.sentAt?.[cid];
+  return !(Number.isFinite(last) && now - last < RESEND_MS && now >= last);
+}
+
+/** For the owner's "Viewed by" sheet: who has it, who doesn't yet. */
+export function deliveryState(s, audienceIds) {
+  const got = new Set([...(s.gotBy || []), ...Object.keys(s.views || {})]);
+  const delivered = audienceIds.filter((c) => got.has(c));
+  return { delivered, waiting: audienceIds.filter((c) => !got.has(c)) };
+}

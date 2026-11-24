@@ -32,7 +32,7 @@ export const APP_VERSION = '1.0.0';
 
 export const newId = () => toHex(random(8));
 /** Message types handled by the app layer (location, SOS, groups); everything else unknown is ignored. */
-export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call', 'read', 'status', 'status-del', 'status-seen']);
+export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call', 'read', 'status', 'status-del', 'status-seen', 'status-got']);
 /** Optional file tags: which group a file belongs to, whether it is a voice clip, reply/forward (meta.js). */
 export function fileExtra(m) {
   const out = msgMeta(m);

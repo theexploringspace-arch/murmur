@@ -111,3 +111,11 @@ Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the mess
    hint, name the most likely cause and the one line you'd check first.
 4. Put a bug back on purpose: delete `.tabbar` from `app.css` and run `npm test`. Read the failure.
    Then write down one other class of mistake a test like this could catch for you.
+
+## Exercise 15 — "sent" vs "received"
+1. In `core/status.js`, read `needsSend`. Why does the receiver confirm *duplicates* too? Describe the
+   exact sequence of lost messages that would make the author re-send forever if it didn't.
+2. Find one other place in Murmur where the sender decides something is "done" on its own. Is it a
+   problem there? (Hint: message ticks — what does ✓ mean versus ✓✓?)
+3. Threat model: the relay can't read statuses, but it can count envelopes. What can it learn from a
+   re-send every 5 minutes, and why does the 24-hour expiry bound that?

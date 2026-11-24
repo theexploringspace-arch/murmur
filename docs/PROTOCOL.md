@@ -350,7 +350,14 @@ or only some — a pending stranger never). Contacts who were offline get it whe
 | `status` | `id`, `ts`, `kind:'text'`, `text` (≤ 700), `bg` ∈ 8 names, `font` ∈ 4 names | unknown `bg`/`font` → defaults; only known CSS classes are ever applied |
 | file + `st: { id, ts, cap ≤ 200 }` | a photo status | must pass the image content check (`inspectFile` → `inline`); otherwise dropped |
 | `status-del` | `id` | the author deleted it → removed everywhere it was sent |
-| `status-seen` | `id` | the viewer looked at it. Sent only if the viewer's read receipts are on for the author, and counted only if the author's are on for the viewer (reciprocal, like §14) and it was really sent to them |
+| `status-got` | `id` | "I have it" — sent for every valid status received, **duplicates included** (an earlier confirmation may have been lost). The author stops re-sending to that person |
+| `status-seen` | `id` | the viewer looked at it (also counts as received). Sent only if the viewer's read receipts are on for the author, and counted only if the author's are on for the viewer (reciprocal, like §14) and it was really sent to them |
+
+**Delivery is confirmed, not assumed.** The author re-sends a status to every audience member who
+hasn't confirmed it (`needsSend`: never sent, or sent ≥ `RESEND_MS` = 5 min ago without a `status-got`)
+whenever that contact comes online, when the relay reconnects, and every 5 minutes while Murmur is
+open — until it expires. Receivers ignore duplicate ids. This covers a phone that was closed (the
+relay also holds messages), offline, or running an older Murmur that silently dropped the type.
 
 Validation (`readStatus` / `statusTag`): a `ts` more than 5 minutes in the future is refused (it
 would outlive 24 h), as is anything already expired. A contact can have at most 30 live statuses on

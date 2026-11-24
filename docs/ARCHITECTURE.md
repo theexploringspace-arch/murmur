@@ -206,6 +206,23 @@ and when a "flaky" test fails the same way twice, it is usually a real bug weari
 The waveform is computed on each phone from the decrypted audio (`decodeAudioData`), never sent:
 a sender can't make a clip look different from what it sounds like, and the protocol didn't change.
 
+## Lesson: sent is not received
+A user posted a status from one phone and the other never showed it; posting from the second phone
+worked. Reproducing it over the relay (two phones, invite link, one closed) showed delivery itself
+was fine — the relay holds messages. The flaw was bookkeeping: the author marked a status "sent to
+Bob" the moment it left, and never offered it again. If Bob's phone dropped it — most likely it was
+still on the previous Murmur, which didn't know the `status` type and discarded it without a word —
+nothing could ever notice. Now receivers confirm (`status-got`, duplicates included), and the author
+re-sends to whoever hasn't confirmed until it expires (`needsSend`, unit-tested; the e2e test closes
+one phone, checks the owner sees *Not received yet*, reopens it and watches the sheet clear by
+itself). Lesson: any "done" flag you set on the sender's side for something the receiver must act
+on is a guess — make the receiver say so.
+
+And a platform note: iOS 26 leaves a strip under viewport-sized `position: fixed` layers in
+home-screen apps (Apple lists the fix in Safari 26.1, bug 158055568). The status viewer and photo
+viewer size to the large viewport (`100lvh`) and paint their background past the bottom edge, and
+the status bars no longer add the top safe area twice.
+
 ## Lesson: code that was never run
 Status, Settings sections, chat colours and the new menu were first written in one long session
 that ended before any of it was tested. Running it found four defects that reading had not:

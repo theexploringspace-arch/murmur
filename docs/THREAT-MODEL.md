@@ -144,6 +144,7 @@ differ from the real passphrase, and changing either passphrase to match the oth
 | A status stays forever | **Not on any honest phone** | Every phone deletes it 24 h after posting and refuses one dated in the future. A recipient can still screenshot it — no app can stop that |
 | A contact floods you with statuses | **Capped** | 30 live statuses per person; strangers (unaccepted) can't send any |
 | "Seen by" reveals that you looked | **Only if your read receipts are on** for them — and then you see theirs too (reciprocal) |
+| Re-sending reveals more to the relay | **A little** | An unconfirmed status is re-sent at most every 5 minutes, only while your Murmur is open and only until it's confirmed or 24 h pass. The relay sees a few more padded ciphertext envelopes — never which is a status. Confirmations (`status-got`) are ordinary encrypted messages |
 | A booby-trapped "photo" status | **Dropped** | The bytes must be a real image (content check), or the status is discarded |
 | Your wallpaper photo leaks | **No** | Downscaled and re-drawn (no location/camera data), stored encrypted in the vault, shown via a local blob: URL, never sent |
 | The theme reveals the duress (decoy) vault | **No** | The theme is stored per device, not per vault, on purpose: the lock screen looks the same whichever vault was used last |

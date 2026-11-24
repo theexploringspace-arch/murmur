@@ -920,33 +920,33 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     await A.page.click(tid('bubble-violet')); // saved to the encrypted vault, then the page re-draws
     await A.page.waitForFunction((s) => getComputedStyle(document.querySelector(s)).backgroundColor === 'rgb(91, 58, 140)', `${tid('look-preview')} .msg.out`, { timeout: 5000 });
     await A.page.click(tid('wall-aurora'));
-    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-aurora`);
+    await A.page.waitForSelector(`${tid('look-preview')}.wall-aurora`);
     await shot(A.page, 'n02-appearance');
     await leaveSettings(A.page); await A.page.click(tid('contact-Bob'));
     await A.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
     await send(A, 'hi in violet');
     assert.equal(await outBg(A), 'rgb(91, 58, 140)', 'sent bubbles use the chosen colour');
-    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-aurora')), true);
+    assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-aurora')), true);
     // …and ONE chat gets its own look (contact info → Chat colour & wallpaper), including a photo.
     await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
     await A.page.click(tid('bubble-rose'));
     await A.page.waitForSelector(`${tid('bubble-rose')}.on`);
     await A.page.setInputFiles(tid('wall-photo-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
     await A.page.waitForFunction(() => /Wallpaper set/.test(document.body.textContent), null, { timeout: 15000 });
-    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-photo`);
+    await A.page.waitForSelector(`${tid('look-preview')}.wall-photo`);
     await A.page.check(tid('wall-dim'));
-    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-dim`);
+    await A.page.waitForSelector(`${tid('look-preview')}.wall-dim`);
     await A.page.click(tid('back')); await A.page.click(tid('back'));
     assert.equal(await outBg(A), 'rgb(155, 47, 74)', 'this chat: rose');
-    await A.page.waitForFunction(() => /^url\("blob:/.test(getComputedStyle(document.getElementById('log')).getPropertyValue('--wall-img').trim()), null, { timeout: 10000 });
-    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-photo') && e.classList.contains('wall-dim')), true);
+    await A.page.waitForFunction(() => /^url\("blob:/.test(getComputedStyle(document.querySelector('.screen.chat')).getPropertyValue('--wall-img').trim()), null, { timeout: 10000 });
+    assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-photo') && e.classList.contains('wall-dim')), true);
     await shot(A.page, 'n03-chat-photo-wallpaper');
     // Carol's chat still follows the default (violet + aurora).
     await A.page.click(tid('back')); await A.page.click(tid('contact-Carol'));
-    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-aurora')), true);
+    assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-aurora')), true);
     // The look is private: Bob's phone is untouched.
     await inLog(B, /hi in violet/);
-    assert.equal(await B.page.$eval('#log', (e) => e.classList.contains('wall-none')), true);
+    assert.equal(await B.page.$eval('.screen.chat', (e) => e.classList.contains('wall-none')), true);
     // Reset brings Bob's chat back to the default.
     await A.page.click(tid('back')); await A.page.click(tid('contact-Bob')); await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
     await A.page.click(tid('look-reset'));
@@ -996,15 +996,40 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     await B.page.waitForFunction(() => /Reply sent/.test(document.body.textContent));
     await B.page.click(tid('status-close'));
     await B.page.waitForSelector(`${tid('status-Alice')} .ring:not(.unseen)`); // now under "Viewed"
-    // Alice sees who viewed it.
+    // Alice sees who viewed it — the status fills the whole screen…
     await A.page.click(tid('status-mine'));
-    await A.page.waitForFunction(() => document.querySelector('[data-testid="status-seen-by"]')?.textContent.trim() === '1', null, { timeout: 20000 });
+    await A.page.waitForFunction(() => document.querySelector('[data-testid="status-seen-count"]')?.textContent === '1', null, { timeout: 20000 });
+    const full = await A.page.$eval(`${tid('status-viewer')} .ststage`, (e) => { const r = e.getBoundingClientRect(); return [r.top, r.left, Math.round(r.width) === innerWidth, Math.round(r.height) >= innerHeight]; });
+    assert.deepEqual(full, [0, 0, true, true], 'status is edge to edge, bars and buttons float on it');
+    // …and "Viewed by" slides up from the BOTTOM (not a box in the middle), pausing the status.
+    await A.page.click(tid('status-seen-by'));
+    await A.page.waitForFunction(() => { const sh = document.querySelector('[data-testid="viewed-by"]'); if (!sh) return false; const r = sh.getBoundingClientRect(); return Math.abs(r.bottom - innerHeight) < 2 && r.top > innerHeight * 0.25; }, null, { timeout: 3000 });
+    assert.equal(await A.page.textContent(`${tid('viewed-by')} h2`), 'Viewed by 1');
+    await A.page.waitForTimeout(300); await shot(A.page, 'n10-viewed-by-sheet');
+    assert.match(await A.page.textContent(tid('viewed-by-list')), /Bob/);
+    assert.equal(await A.page.$$eval(tid('status-waiting'), (e) => e.length), 0, 'Bob confirmed he has it — nobody is waiting');
+    assert.equal(await A.page.$eval(tid('status-viewer'), (e) => e.classList.contains('paused')), true, 'the status waits while the sheet is up');
+    await A.page.keyboard.press('Escape'); // closes the sheet only…
+    await A.page.waitForFunction(() => !document.querySelector('[data-testid="viewed-by"]'));
+    assert.equal(await A.page.$$eval(tid('status-viewer'), (e) => e.length), 1, '…the status is still open');
+    // Swiping up on your own status opens it too; tapping the dimmed area closes it.
+    await A.page.$eval(`${tid('status-viewer')} .ststage`, (el) => {
+      const o = { pointerId: 5, isPrimary: true, bubbles: true, clientX: innerWidth / 2, clientY: innerHeight * 0.7, pointerType: 'touch' };
+      el.dispatchEvent(new PointerEvent('pointerdown', o)); el.dispatchEvent(new PointerEvent('pointerup', { ...o, clientY: innerHeight * 0.4 }));
+    });
+    await A.page.waitForSelector(tid('viewed-by'));
+    await A.page.click(tid('viewed-by-scrim'), { position: { x: 20, y: 20 } });
+    await A.page.waitForFunction(() => !document.querySelector('[data-testid="viewed-by"]'));
     await A.page.click(tid('status-close'));
     await A.page.click(tid('tab-chats')); await A.page.click(tid('contact-Bob'));
     await inLog(A, /enjoy!/);
     assert.match(await A.page.textContent(`${tid('msg-in')}:has-text("enjoy!") ${tid('quote')}`), /Status: Beach day/);
     // Carol (not in the audience) has nothing.
     await C.page.click(tid('back')); await C.page.click(tid('tab-status'));
+    // Her own row is the familiar one: + on her picture, "Disappears after 24 hours", camera + pencil.
+    assert.match(await C.page.textContent(tid('status-mine')), /Add status\s*Disappears after 24 hours/);
+    await shot(C.page, 'n13-status-add-row');
+    for (const b of ['status-new-photo', 'status-new-text']) assert.equal(await C.page.$eval(tid(b), (e) => e.closest('.mystatus') !== null && e.textContent.trim() === ''), true, `${b}: an icon button in the row`);
     await C.page.waitForTimeout(1500);
     assert.equal(await C.page.$$eval(tid('status-Alice'), (e) => e.length), 0, 'not shared with Carol — never sent to her phone');
 
@@ -1037,6 +1062,68 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     assert.equal(await C.page.evaluate(() => document.documentElement.dataset.theme), 'light');
     assert.equal(await css(C, 'body', 'background-color'), 'rgb(246, 247, 249)');
     for (const p of [A, B, C]) assert.deepEqual(p.errors, [], `${p.name}: no page errors`);
+  } finally { await browser.close(); }
+});
+
+test('Status over the internet: reaches a phone that was closed, confirmed back to the owner ("Not received yet" until then)', { timeout: 300000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME });
+  const C = await profile(browser, 'carol-sr'), D = await profile(browser, 'dave-sr');
+  const DPASS = 'tr0ub4dor & 3 bananas';
+  try {
+    await onboard(C, 'Carol', 'correct horse battery staple');
+    await onboard(D, 'Dave', DPASS);
+    await C.page.waitForFunction(() => /connected to the relay|Far away/.test(document.body.textContent));
+    // Connected ONLY through the internet relay (invite link) — like two phones far apart.
+    await C.page.click(tid('link-invite'));
+    await C.page.waitForFunction((s) => /#i=/.test(document.querySelector(s)?.value || ''), tid('invite-link'));
+    const link = await C.page.$eval(tid('invite-link'), (e) => e.value);
+    await C.page.click(tid('back'));
+    await D.page.goto('about:blank'); await D.page.goto(link);
+    await userReady(D.page); await D.page.fill(tid('unlock-pass'), DPASS); await D.page.click(tid('unlock'));
+    await D.page.waitForSelector(tid('join-invite')); await D.page.click(tid('join-invite'));
+    await send(D, 'hello carol');
+    await C.page.waitForSelector(tid('contact-Dave'), { timeout: 20000 }); await C.page.click(tid('contact-Dave'));
+    await C.page.click(tid('accept-request'));
+    await send(C, 'hi dave');
+    await D.page.waitForFunction(() => /hi dave/.test(document.body.textContent), null, { timeout: 20000 });
+
+    // The chat keeps the screen: connection state under the name, a slim nearby line, no timer row.
+    assert.match(await C.page.textContent(`header.bar ${tid('conn-state')}`), /internet/);
+    assert.equal(await C.page.$eval(tid('nearby-card'), (e) => e.classList.contains('slim')), true);
+    assert.equal(await C.page.$$eval(`.screen.chat ${tid('ttl')}`, (e) => e.length), 0, 'disappearing messages moved to contact info');
+    await C.page.click(tid('contact-info'));
+    await C.page.selectOption(tid('ttl'), '3600');
+    await C.page.click(tid('back'));
+    await C.page.waitForFunction((s) => /1 hour/.test(document.querySelector(s)?.textContent || ''), `header.bar ${tid('conn-state')}`, { timeout: 5000 });
+    await shot(C.page, 'n11-chat-relay');
+
+    // Dave's phone is CLOSED. Carol posts a status.
+    const dctx = D.page.context();
+    await D.page.close();
+    await C.page.click(tid('back')); await C.page.click(tid('tab-status'));
+    await C.page.click(tid('status-new-text'));
+    await C.page.fill(tid('status-text'), 'posted while Dave was away');
+    await C.page.click(tid('status-post'));
+    // Carol can see it hasn't reached him yet.
+    await C.page.click(tid('status-mine'));
+    await C.page.click(tid('status-seen-by'));
+    await C.page.waitForSelector(tid('status-waiting'));
+    await C.page.waitForTimeout(300); await shot(C.page, 'n12-waiting-sheet');
+    assert.match(await C.page.textContent(tid('status-waiting')), /Not received yet\s*D?Dave\s*waiting/);
+
+    // Dave opens Murmur later: the relay held it; his phone shows it and confirms back.
+    const D2 = await dctx.newPage();
+    await D2.goto(ORIGIN + '/'); await userReady(D2); await D2.fill(tid('unlock-pass'), DPASS); await D2.click(tid('unlock'));
+    await D2.click(tid('tab-status'));
+    await D2.waitForSelector(`${tid('status-Carol')} .ring.unseen`, { timeout: 20000 });
+    // Carol's open sheet updates by itself — no longer waiting for Dave.
+    await C.page.waitForFunction(() => !document.querySelector('[data-testid="status-waiting"]'), null, { timeout: 20000 });
+    // Dave views it → Carol's "Viewed by" (still open) shows him.
+    await D2.click(tid('status-Carol'));
+    await D2.waitForSelector(tid('status-shown'));
+    await C.page.waitForFunction(() => /Dave/.test(document.querySelector('[data-testid="viewed-by-list"]')?.textContent || ''), null, { timeout: 20000 });
+    assert.equal(await C.page.textContent(`${tid('viewed-by')} h2`), 'Viewed by 1');
+    assert.deepEqual(C.errors, []);
   } finally { await browser.close(); }
 });
 

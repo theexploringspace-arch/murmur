@@ -77,3 +77,24 @@ test('ago', () => {
   assert.equal(ago(NOW - 3 * 3600000, NOW), '3h ago');
   assert.equal(ago(NOW + 99999, NOW), 'just now', 'a fast sender clock never shows negative time');
 });
+
+import { needsSend, deliveryState, RESEND_MS } from '../../src/js/core/status.js';
+
+test('delivery: a status is re-sent until the other phone CONFIRMS it (sent ≠ received)', () => {
+  const s = { id: ID, sentAt: {}, gotBy: [] };
+  assert.equal(needsSend(s, B, NOW), true, 'never sent → send');
+  s.sentAt[B] = NOW;
+  assert.equal(needsSend(s, B, NOW + 1000), false, 'just sent → give it time');
+  assert.equal(needsSend(s, B, NOW + RESEND_MS - 1), false);
+  assert.equal(needsSend(s, B, NOW + RESEND_MS), true, 'no confirmation after a while → send again (it may have been dropped)');
+  s.gotBy.push(B);
+  assert.equal(needsSend(s, B, NOW + 10 * RESEND_MS), false, 'confirmed → never again');
+  assert.equal(needsSend({ id: ID, sentAt: { [B]: NOW + 60_000 } }, B, NOW), true, 'a clock that went backwards doesn’t stall it');
+  assert.equal(needsSend({ id: ID, sentTo: [B] }, B, NOW), true, 'statuses saved before this change (no sentAt) are re-offered once');
+});
+
+test('deliveryState: who has it (confirmed or viewed) and who is still waiting', () => {
+  const s = { gotBy: [B], views: { [C]: NOW } };
+  assert.deepEqual(deliveryState(s, [A, B, C]), { delivered: [B, C], waiting: [A] });
+  assert.deepEqual(deliveryState({}, [A]), { delivered: [], waiting: [A] });
+});
