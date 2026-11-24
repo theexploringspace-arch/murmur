@@ -1,16 +1,39 @@
 /* Murmur — mobile-first, system fonts only (nothing fetched from anywhere). */
 :root {
-  --bg: #0e1116; --bg2: #161b22; --bg3: #1f2630; --line: #2a3340;
-  --fg: #e8edf3; --fg2: #9aa7b4; --accent: #5eead4; --accent2: #2dd4bf; --accent-ink: #052e2b;
-  --danger: #f87171; --warn: #fbbf24; --ok: #4ade80;
-  --out: #134e4a; --in: #1f2630; --read: #53bdeb;
+  /* Midnight Blue + Electric Teal — the default theme. Every pair below is checked against WCAG
+     contrast in test/unit/color.test.mjs (text ≥ 4.5:1, icons and large text ≥ 3:1). */
+  --bg: #101c2c;        /* primary background (midnight blue) */
+  --bg2: #17263a;       /* secondary background: panels, headers, cards */
+  --bg3: #1f3149;       /* controls: buttons, inputs, chips */
+  --line: #2c415c;      /* hairlines and borders */
+  --fg: #ffffff;        /* primary text */
+  --fg2: #b8c6d8;       /* secondary text */
+  --accent: #43e6c1;    /* Electric Teal: interactive elements, active states, security indicators */
+  --accent2: #2fd0ac;   /* pressed / hover teal */
+  --accent-ink: #0a1622; /* text on teal */
+  --danger: #ff5c70;    /* error states */
+  --danger-ink: #ff95a2; /* error text inside message bubbles (same red, lightened for 4.5:1) */
+  --warn: #ffc857;
+  --ok: #43e6c1;        /* success states */
+  --in: #26364b;        /* received bubbles */
+  --out: #164e49;       /* sent bubbles (chat colour can override per chat) */
+  --out-ink: #ffffff; --out-ink2: #c5d3d2; --out-read: #7cd0ff; --read: #7cd0ff;
   --r: 14px; --safe-b: env(safe-area-inset-bottom, 0px); --safe-t: env(safe-area-inset-top, 0px);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   color-scheme: dark;
 }
+/* The light theme, unchanged: chosen in Settings → Appearance, or "Match phone" on a light phone. */
+:root[data-theme="light"] {
+  --bg: #f6f7f9; --bg2: #fff; --bg3: #eef1f4; --line: #d8dee5; --fg: #0f172a; --fg2: #5b6675;
+    --accent: #0d9488; --accent2: #0f766e; --accent-ink: #fff; --out: #ccfbf1; --in: #fff; --read: #0a7cd8;
+    --out-ink: #0f172a; --out-ink2: #3f5a57; --out-read: #0a6ac0; --danger-ink: #b42335; color-scheme: light;
+}
 @media (prefers-color-scheme: light) {
-  :root { --bg: #f6f7f9; --bg2: #fff; --bg3: #eef1f4; --line: #d8dee5; --fg: #0f172a; --fg2: #5b6675;
-    --accent: #0d9488; --accent2: #0f766e; --accent-ink: #fff; --out: #ccfbf1; --in: #fff; --read: #0a7cd8; color-scheme: light; }
+  :root[data-theme="system"] {
+    --bg: #f6f7f9; --bg2: #fff; --bg3: #eef1f4; --line: #d8dee5; --fg: #0f172a; --fg2: #5b6675;
+    --accent: #0d9488; --accent2: #0f766e; --accent-ink: #fff; --out: #ccfbf1; --in: #fff; --read: #0a7cd8;
+    --out-ink: #0f172a; --out-ink2: #3f5a57; --out-read: #0a6ac0; --danger-ink: #b42335; color-scheme: light;
+  }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
@@ -109,7 +132,7 @@ video.cam { width: 100%; height: 100%; object-fit: cover; display: block; }
 .reticle { position: absolute; inset: 14%; border: 3px solid var(--accent); border-radius: 18px; box-shadow: 0 0 0 999px rgba(0,0,0,.35); pointer-events: none; }
 .status { text-align: center; color: var(--accent); font-weight: 600; min-height: 1.4em; }
 .big-instruction { text-align: center; font-size: 1.15rem; font-weight: 700; margin-top: 1rem; }
-.spinner { width: 36px; height: 36px; border: 3px solid #ccc; border-top-color: #0d9488; border-radius: 50%; animation: spin 0.8s linear infinite; }
+.spinner { width: 36px; height: 36px; border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .chat { display: flex; flex-direction: column; height: 100vh; height: 100dvh; padding: 0; max-width: 760px; }
@@ -117,7 +140,10 @@ video.cam { width: 100%; height: 100%; object-fit: cover; display: block; }
 .reconnect p { margin: 0 0 0.25rem; color: var(--fg2); }
 .log { flex: 1; overflow-y: auto; padding: 0.75rem; display: flex; flex-direction: column; gap: 0.35rem; }
 .msg { max-width: 82%; padding: 0.55rem 0.75rem; border-radius: 16px; line-height: 1.4; word-wrap: break-word; white-space: pre-wrap; }
-.msg.out { align-self: flex-end; background: var(--out); border-bottom-right-radius: 4px; }
+.msg.out { align-self: flex-end; background: var(--out); color: var(--out-ink); border-bottom-right-radius: 4px; }
+.msg.out .meta, .msg.out .fwd, .msg.out .qtext, .msg.out .docmeta small, .msg.out .vtime { color: var(--out-ink2); }
+.msg.out .vwave span { background: var(--out-ink2); }
+.msg .filewarn { color: var(--danger-ink); }
 .msg.in { align-self: flex-start; background: var(--in); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
 .msg .meta { font-size: 0.68rem; color: var(--fg2); margin-top: 0.2rem; display: flex; gap: 0.4rem; justify-content: flex-end; align-items: center; }
 .msg .ttl { display: inline-flex; gap: 0.15rem; align-items: center; color: var(--warn); }
@@ -233,7 +259,7 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .modal textarea.edit { width: 100%; box-sizing: border-box; font: inherit; }
 
 /* ---- calls ---- */
-.callscreen { position: fixed; inset: 0; z-index: 60; background: #05070a; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: space-between;
+.callscreen { position: fixed; inset: 0; z-index: 60; background: #0a1422; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: space-between;
   padding: calc(var(--safe-t) + 2.5rem) 1rem calc(var(--safe-b) + 1.5rem); box-sizing: border-box; }
 .callscreen video.remote { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
 .callscreen[data-video="false"] video.remote { width: 1px; height: 1px; opacity: 0; } /* voice: plays audio, shows nothing */
@@ -241,16 +267,16 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .callscreen[data-video="true"][data-state="connected"] .callwho h2 { display: none; }
 .callwho { position: relative; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.4rem; text-shadow: 0 1px 4px #000; }
 .callwho h2 { color: #fff; font-size: 1.5rem; text-transform: none; letter-spacing: 0; margin: 0.6rem 0 0; }
-.callstatus, .calltimer { margin: 0; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+.callstatus, .calltimer { margin: 0; color: #b8c6d8; font-variant-numeric: tabular-nums; }
 .callscreen video.local { position: absolute; right: 1rem; top: calc(var(--safe-t) + 1rem); width: 28vw; max-width: 160px; aspect-ratio: 3/4; object-fit: cover; border-radius: 12px; border: 2px solid #ffffff55; transform: scaleX(-1); background: #111; }
 .callcontrols { position: relative; display: flex; gap: 1.1rem; flex-wrap: wrap; justify-content: center; }
 .callbtn { display: flex; flex-direction: column; align-items: center; gap: 0.35rem; background: none; border: 0; color: #fff; font-size: 0.75rem; padding: 0; }
 .callbtn svg { width: 64px; height: 64px; padding: 19px; box-sizing: border-box; border-radius: 50%; background: #ffffff26; backdrop-filter: blur(8px); }
 .callbtn.on svg { background: #fff; color: #000; }
-.callbtn.end svg { background: #ef4444; transform: none; }
-.callbtn.accept svg { background: #22c55e; }
+.callbtn.end svg { background: var(--danger); transform: none; }
+.callbtn.accept svg { background: var(--accent); color: var(--accent-ink); }
 .callscreen[data-state="ringing"] .callbtn.accept svg { animation: pulse 1.2s infinite; }
-@keyframes pulse { 50% { box-shadow: 0 0 0 14px #22c55e33; } }
+@keyframes pulse { 50% { box-shadow: 0 0 0 14px rgba(67, 230, 193, 0.22); } }
 
 /* ---- chat header: photo + name, tap for contact info ---- */
 .titlebtn { display: flex; align-items: center; gap: 0.6rem; background: none; border: 0; padding: 0; color: inherit; min-width: 0; flex: 1; text-align: left; cursor: pointer; }
@@ -334,8 +360,8 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .msg.swiping[data-armed="1"]::before { opacity: 1; color: var(--accent); }
 .msg.flash { animation: flash 1.2s ease; }
 @keyframes flash { 0%, 40% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
-.msg .meta .status { color: var(--fg2); font-weight: 600; text-align: right; min-height: 0; letter-spacing: -0.12em; }
-.msg .meta .status[data-st="read"] { color: var(--read); }
+.msg .meta .status { color: inherit; font-weight: 600; text-align: right; min-height: 0; letter-spacing: -0.12em; }
+.msg .meta .status[data-st="read"] { color: var(--out-read); }
 .msg .meta .status[data-st="failed"] { color: var(--danger); }
 
 .msg.media { padding: 3px; }
@@ -393,3 +419,165 @@ button.linkish { background: none; border: 0; padding: 0.4rem 0; min-height: 0; 
 /* Things that can pop up over the viewer (a dangerous-file warning, a toast) must stay on top of it. */
 .viewer-screen ~ .modal-backdrop, body > .modal-backdrop { z-index: 1050; }
 #toasts { z-index: 1100; }
+
+/* ---- message spotlight menu (ui/menu.js) ---- */
+.spot { position: fixed; inset: 0; z-index: 900; }
+.spot-backdrop { position: absolute; inset: 0; background: rgba(8, 15, 26, 0.62); -webkit-backdrop-filter: blur(6px) saturate(0.9); backdrop-filter: blur(6px) saturate(0.9); animation: spot-fade 0.14s ease both; }
+.spot-lifted { position: fixed; margin: 0; z-index: 1; pointer-events: none; box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45), 0 0 0 1.5px var(--accent); animation: spot-lift 0.16s ease both; }
+.spot-card { position: fixed; z-index: 2; width: 232px; max-width: calc(100vw - 24px); padding: 0.35rem; border-radius: 16px; background: var(--bg2); border: 1px solid var(--line); box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5); animation: spot-pop 0.16s cubic-bezier(0.2, 0.9, 0.3, 1.2) both; }
+.spot-item { display: flex; align-items: center; gap: 0.7rem; width: 100%; min-height: 44px; padding: 0.45rem 0.7rem; border: 0; border-radius: 11px; background: none; color: var(--fg); text-align: left; font-size: 0.95rem; }
+.spot-item svg { color: var(--accent); flex: none; }
+.spot-item:hover, .spot-item:focus-visible { background: var(--bg3); outline: none; }
+.spot-item:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+.spot-item.danger, .spot-item.danger svg { color: var(--danger); }
+.spot-label { flex: 1; }
+.spot-hint { color: var(--fg2); font-size: 0.72rem; font-variant-numeric: tabular-nums; }
+.spot-sep { height: 1px; margin: 0.3rem 0.55rem; background: var(--line); }
+.spot-note { margin: 0.25rem 0.7rem 0.35rem; font-size: 0.72rem; color: var(--fg2); line-height: 1.35; }
+.spot.closing .spot-card, .spot.closing .spot-lifted, .spot.closing .spot-backdrop { animation: spot-fade 0.12s ease reverse both; }
+@keyframes spot-fade { from { opacity: 0; } }
+@keyframes spot-pop { from { opacity: 0; transform: scale(0.92); } }
+@keyframes spot-lift { from { transform: scale(0.98); box-shadow: none; } to { transform: scale(1.02); } }
+.spot-lifted { transform: scale(1.02); }
+@media (prefers-reduced-motion: reduce) { .spot-backdrop, .spot-lifted, .spot-card { animation: none !important; } }
+
+/* ======================================================================================
+   Tab bar · Settings hub · Status · Chat colour & wallpaper
+   Every class the app uses must have a style here: test/unit/css-coverage.test.mjs fails
+   the build if JS references a class that app.css never styles (it happened once).
+   ====================================================================================== */
+
+/* ---- bottom tab bar (Chats · Status · Settings) ---- */
+.screen.tabbed { padding-bottom: calc(76px + var(--safe-b)); }
+.tabbar {
+  position: fixed; left: 50%; bottom: calc(10px + var(--safe-b)); transform: translateX(-50%); z-index: 20;
+  display: flex; gap: 0.25rem; padding: 0.3rem; width: min(420px, calc(100% - 1.5rem));
+  background: color-mix(in srgb, var(--bg2) 92%, transparent); backdrop-filter: blur(14px);
+  border: 1px solid var(--line); border-radius: 22px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+.tab { flex: 1; flex-direction: column; gap: 0.1rem; padding: 0.35rem 0.2rem; min-height: 52px; border: 0; border-radius: 17px; background: none; color: var(--fg2); font-size: 0.72rem; font-weight: 600; }
+.tab.on { background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+.tabicon { position: relative; display: grid; place-items: center; }
+.tabdot { position: absolute; top: -2px; right: -5px; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); border: 2px solid var(--bg2); }
+
+/* ---- Settings: a home of plain-language sections ---- */
+.mecard { width: 100%; margin: 1rem 0 0.75rem; padding: 0.9rem; gap: 0.9rem; border-radius: 18px; background: var(--bg2); text-align: left; }
+.mecard .avatar.lg { width: 60px; height: 60px; }
+.mecard .avatar img, .avatar img { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+input.setsearch { width: 100%; margin: 0 0 0.25rem; padding: 0.65rem 0.9rem; border-radius: 12px; background: var(--bg3); border: 1px solid var(--line); }
+.setgroups { display: grid; gap: 0.9rem; margin-top: 0.75rem; }
+.setlist { list-style: none; margin: 0.75rem 0 0; padding: 0; background: var(--bg2); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.setgroups .setlist { margin: 0; }
+.setlist li + li { border-top: 1px solid var(--line); }
+.setrow { width: 100%; gap: 0.85rem; padding: 0.75rem 0.85rem; border: 0; border-radius: 0; background: none; text-align: left; min-height: 60px; }
+.setrow:hover:not(:disabled) { background: var(--bg3); }
+.setrow > svg:last-child { color: var(--fg2); flex: none; }
+.seticon { flex: none; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); }
+.settext { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+.settext strong { font-weight: 600; }
+.settext small { color: var(--fg2); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.setrow.danger { color: var(--danger); }
+.setrow.danger .seticon { background: color-mix(in srgb, var(--danger) 14%, transparent); color: var(--danger); }
+/* Segmented control (Theme) and radio rows (status audience) */
+.seg { display: flex; gap: 0.25rem; padding: 0.25rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 14px; }
+.seg button { flex: 1; justify-content: center; border: 0; border-radius: 10px; background: none; color: var(--fg2); font-size: 0.88rem; min-height: 40px; padding: 0.4rem; }
+.seg button.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+label.radio { display: flex; align-items: center; gap: 0.75rem; margin: 0; padding: 0.7rem 0.2rem; font-weight: 500; border-bottom: 1px solid var(--line); }
+label.radio input { width: 22px; height: 22px; accent-color: var(--accent); flex: none; }
+label.radio span { display: flex; flex-direction: column; }
+label.radio small { color: var(--fg2); font-weight: 400; font-size: 0.8rem; }
+
+/* ---- Status list: rings around avatars, one segment per update; teal = new, grey = seen ---- */
+.statusrow { text-align: left; }
+.ring { --seg: calc(360deg / var(--n, 1)); --gap: 5deg; flex: none; padding: 3px; border-radius: 50%; display: grid; place-items: center;
+  background: repeating-conic-gradient(from calc(var(--gap) / 2), var(--fg2) 0 calc(var(--seg) - var(--gap)), transparent calc(var(--seg) - var(--gap)) var(--seg)); }
+.ring[data-count="1"] { background: var(--fg2); }
+.ring.unseen { background: repeating-conic-gradient(from calc(var(--gap) / 2), var(--accent) 0 calc(var(--seg) - var(--gap)), transparent calc(var(--seg) - var(--gap)) var(--seg)); }
+.ring.unseen[data-count="1"] { background: var(--accent); }
+.ring .avatar { border: 2px solid var(--bg); }
+.avatar.md { width: 46px; height: 46px; }
+.addring { position: relative; overflow: visible; }
+.addring .plus { position: absolute; right: -2px; bottom: -2px; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-ink); border: 2px solid var(--bg); }
+.statusadd button { flex: 1; justify-content: center; }
+
+/* ---- Status full-screen: composer and viewer ---- */
+.stoverlay { position: fixed; inset: 0; z-index: 900; display: flex; flex-direction: column; background: #000; color: #fff; padding: var(--safe-t) 0 var(--safe-b); }
+.stoverlay .icon { color: #fff; }
+.sttop { display: flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.5rem; }
+.stwho { display: flex; flex-direction: column; line-height: 1.2; }
+.stwho small { color: #c9d4e2; font-size: 0.78rem; }
+.ststage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 1.25rem; position: relative; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+.stoverlay.photo .ststage, .stoverlay.viewer .ststage:not([class*="stbg-"]) { padding: 0; }
+textarea.sttext { width: 100%; max-height: 70%; background: none; border: 0; color: #fff; text-align: center; font-size: 1.7rem; line-height: 1.3; resize: none; outline: none; padding: 0; }
+textarea.sttext::placeholder { color: rgba(255, 255, 255, 0.65); }
+.stshow { margin: 0; text-align: center; font-size: clamp(1.3rem, 6vw, 2.1rem); line-height: 1.3; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 100%; overflow: auto; }
+.stimg { width: 100%; height: 100%; object-fit: contain; } /* small photos scale up to the screen */
+.stcapshow { position: absolute; left: 0; right: 0; bottom: 0; margin: 0; padding: 1rem 1.2rem; text-align: center; background: linear-gradient(transparent, rgba(0, 0, 0, 0.7)); }
+.stbottom { display: flex; align-items: center; gap: 0.5rem; padding: 0.6rem 0.75rem 0.8rem; }
+.stbottom small { color: #c9d4e2; }
+.stcount { font-variant-numeric: tabular-nums; }
+input.stcap, input.streply { flex: 1; background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.2); color: #fff; border-radius: 22px; padding: 0.65rem 1rem; }
+input.stcap::placeholder, input.streply::placeholder { color: rgba(255, 255, 255, 0.7); }
+button.round { width: 48px; height: 48px; min-height: 48px; padding: 0; border-radius: 50%; justify-content: center; flex: none; }
+.stseen { background: rgba(255, 255, 255, 0.12); border-color: transparent; color: #fff; border-radius: 22px; }
+/* progress bars: one per update, the current one fills over its display time */
+.stbars { display: flex; gap: 4px; padding: calc(0.5rem + var(--safe-t)) 0.6rem 0; }
+.stbar { flex: 1; height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.3); overflow: hidden; }
+.stbar i { display: block; height: 100%; width: 0; background: #fff; }
+.stbar.done i { width: 100%; }
+.stbar.now i { animation: stfill var(--dur, 5s) linear forwards; }
+.stoverlay.paused .stbar.now i { animation-play-state: paused; }
+@keyframes stfill { to { width: 100%; } }
+/* Text-status backgrounds. Colours mirror STATUS_BG in core/color.js; the unit test checks
+   white text reaches 4.5:1 on BOTH ends of every gradient, and that these classes exist. */
+.stbg-teal { background: linear-gradient(160deg, #0f5c55, #0b3d4a); }
+.stbg-midnight { background: linear-gradient(160deg, #1b2c46, #0b1424); }
+.stbg-violet { background: linear-gradient(160deg, #5a2d91, #2c1a5c); }
+.stbg-sunset { background: linear-gradient(160deg, #a63d2a, #6b1f4f); }
+.stbg-rose { background: linear-gradient(160deg, #9c2b55, #5c1638); }
+.stbg-forest { background: linear-gradient(160deg, #1f5f3a, #10372a); }
+.stbg-ocean { background: linear-gradient(160deg, #1d5487, #0e2c52); }
+.stbg-graphite { background: linear-gradient(160deg, #3b4350, #1a1e25); }
+.stfont-sans { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.stfont-serif { font-family: Georgia, "Times New Roman", serif; }
+.stfont-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; letter-spacing: -0.02em; }
+.stfont-bold { font-family: system-ui, -apple-system, sans-serif; font-weight: 800; letter-spacing: -0.02em; text-transform: uppercase; }
+.stfont-serif textarea.sttext, .stfont-serif .stshow { font-family: inherit; }
+.ststage[class*="stfont-"] textarea.sttext { font: inherit; font-size: 1.7rem; }
+
+/* ---- Chat colour & wallpaper picker ---- */
+.swatches { display: grid; grid-template-columns: repeat(auto-fill, minmax(46px, 1fr)); gap: 0.6rem; }
+.swatch { width: 46px; height: 46px; min-height: 46px; padding: 0; border-radius: 50%; justify-content: center; border: 2px solid transparent; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12); }
+.swatch.on { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent); }
+.swatch.default { width: auto; padding: 0 0.7rem; border-radius: 23px; background: var(--bg3); font-size: 0.8rem; }
+.walltiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 0.6rem; }
+.walltile { position: relative; height: 108px; padding: 0; border-radius: 14px; border: 2px solid var(--line); overflow: hidden; align-items: flex-end; justify-content: center; background-color: var(--bg); }
+.walltile span { width: 100%; padding: 0.25rem 0.3rem; font-size: 0.75rem; font-weight: 600; background: color-mix(in srgb, var(--bg) 78%, transparent); }
+.walltile.on { border-color: var(--accent); }
+.walltile.photo, .walltile.default { flex-direction: column; align-items: center; justify-content: center; gap: 0.3rem; background: var(--bg3); }
+.walltile.photo span, .walltile.default span { background: none; }
+.lookpreview { border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.lookpreview .log { min-height: 150px; padding: 0.9rem 0.7rem; display: flex; flex-direction: column; gap: 0.4rem; }
+.lookpreview .msg { max-width: 75%; }
+
+/* Wallpapers (on the chat's #log). CSS-drawn, so nothing is downloaded; a photo wallpaper uses
+   --wall-img, a blob: URL of the encrypted-at-rest image. Bubbles keep their own solid colours,
+   so text stays readable on any wallpaper; "Dim" darkens it further for the time stamps & notes. */
+.wall-none { background: none; }
+.wall-dusk { background: linear-gradient(170deg, #1b2a48 0%, #2a2350 55%, #3a2340 100%); }
+.wall-aurora { background: radial-gradient(120% 80% at 10% 0%, rgba(67, 230, 193, 0.28), transparent 60%), radial-gradient(90% 70% at 100% 30%, rgba(122, 92, 255, 0.25), transparent 60%), #0e1a2b; }
+.wall-deep { background: linear-gradient(180deg, #0b2a3d 0%, #0a1a2c 60%, #07101c 100%); }
+.wall-grid { background-color: #0f1d33; background-image: linear-gradient(rgba(67, 230, 193, 0.08) 1px, transparent 1px), linear-gradient(90deg, rgba(67, 230, 193, 0.08) 1px, transparent 1px); background-size: 24px 24px; }
+.wall-dots { background-color: #101c2c; background-image: radial-gradient(rgba(184, 198, 216, 0.16) 1.4px, transparent 1.6px); background-size: 18px 18px; }
+.wall-ember { background: radial-gradient(130% 90% at 50% 110%, rgba(255, 120, 60, 0.3), transparent 60%), #1a1420; }
+.wall-photo { background: var(--wall-img, none) center / cover no-repeat, var(--bg); }
+.walltile.wall-photo { background: var(--bg3); }
+/* Dim: an inset shadow paints over the wallpaper but under the messages, and doesn't scroll away. */
+.wall-dim { box-shadow: inset 0 0 0 100vmax rgba(5, 10, 18, 0.45); }
+/* On a wallpaper, system notes and the day line get a chip so they stay legible. */
+[class*="wall-"]:not(.wall-none) .sysmsg { background: color-mix(in srgb, var(--bg) 80%, transparent); border-radius: 10px; padding: 0.2rem 0.6rem; width: fit-content; margin-left: auto; margin-right: auto; }
+:root[data-theme="light"] .wall-dots { background-color: #eef2f7; }
+:root[data-theme="light"] .wall-grid { background-color: #eef4f8; background-image: linear-gradient(rgba(13, 148, 136, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(13, 148, 136, 0.1) 1px, transparent 1px); }
+@media (prefers-reduced-motion: reduce) { .stbar.now i { animation: none; width: 100%; } }
+.grow { flex: 1; }
+.spot-noicon { width: 19px; flex: none; }

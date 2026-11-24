@@ -101,3 +101,13 @@ Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the mess
 4. Debugging task: a message shows grey ✓✓ forever even though the other phone opened the chat.
    List three places in the code you'd look, in order (hint: `confirmReads`, `receiptsOn`, the
    `read` case in `onAppMessage`).
+
+## Exercise 14 — status, looks and "code that was never run"
+1. Open `core/status.js` → `readStatus`. Why is a status dated 10 minutes in the future refused,
+   when a message dated in the future is fine? (Hint: what decides when it disappears?)
+2. "Seen by" is reciprocal, like read receipts. Trace a `status-seen` from the viewer's phone to
+   the author's: find the two places `receiptsOn` is checked, and say what each one protects.
+3. Debugging task: a feature works over the relay but not nearby. Using `app-types.test.mjs` as a
+   hint, name the most likely cause and the one line you'd check first.
+4. Put a bug back on purpose: delete `.tabbar` from `app.css` and run `npm test`. Read the failure.
+   Then write down one other class of mistake a test like this could catch for you.

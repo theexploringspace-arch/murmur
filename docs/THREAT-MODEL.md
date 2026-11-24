@@ -135,6 +135,19 @@ version that leaked it as a record name). Tested in `test/unit/duress.test.mjs`.
 the same screen appears and "succeeds", but it can't touch slot A. The duress passcode must
 differ from the real passphrase, and changing either passphrase to match the other is refused.
 
+## Status, chat looks, theme — added threats
+
+| Threat | Outcome | Why |
+|---|---|---|
+| The relay (or anyone) collects everyone's statuses | **No** | A status is sent end-to-end encrypted to each person in your audience, like a message. There is no status server; the relay carries only padded ciphertext |
+| Someone outside your audience sees your status | **No** | It is never sent to them — not hidden in the app, absent from their phone. Proven in the e2e test (*only Bob* → Carol's phone has nothing) |
+| A status stays forever | **Not on any honest phone** | Every phone deletes it 24 h after posting and refuses one dated in the future. A recipient can still screenshot it — no app can stop that |
+| A contact floods you with statuses | **Capped** | 30 live statuses per person; strangers (unaccepted) can't send any |
+| "Seen by" reveals that you looked | **Only if your read receipts are on** for them — and then you see theirs too (reciprocal) |
+| A booby-trapped "photo" status | **Dropped** | The bytes must be a real image (content check), or the status is discarded |
+| Your wallpaper photo leaks | **No** | Downscaled and re-drawn (no location/camera data), stored encrypted in the vault, shown via a local blob: URL, never sent |
+| The theme reveals the duress (decoy) vault | **No** | The theme is stored per device, not per vault, on purpose: the lock screen looks the same whichever vault was used last |
+
 ## Replies, forwards, read receipts — added threats
 
 | Threat | Outcome | Why |

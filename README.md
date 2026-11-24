@@ -51,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 148 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, voice waveforms, replies/forwards/receipts, scam checks, media, groups, QR, build
+npm test            # 166 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, voice waveforms, replies/forwards/receipts, status, theme contrast audit, CSS coverage, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -185,6 +185,11 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 | Text, receipts, disappearing | ✅ | ✅ | ✓ sent · grey ✓✓ delivered · **blue ✓✓ read**. Read receipts: Settings → *Messages* (everyone) and contact info (one person). Reciprocal like WhatsApp: off means you neither send nor see them. Groups show delivery only |
 | Reply | ✅ | ✅ | **Swipe a bubble right** (or long-press → Reply, or Reply in the photo viewer). The quote shows who wrote it and a preview (photo thumbnail, “Voice message”, file name…); tap it to jump to the original. Works for text, photos, voice, files, in groups too |
 | Forward | ✅ | ✅ | Long-press → Forward (or from the photo viewer) to up to **5** chats or groups. Sent as a fresh encrypted copy marked *Forwarded* (*Forwarded many times* after 5 hops) — never who it came from |
+| Status (24 h) | ✅ | ✅ | **Status** tab: post a **text** update (8 backgrounds, 4 type faces) or a **photo** with caption. Contacts see a ring around your photo (teal = new); tap to view — progress bars, tap right/left to move, hold to pause, reply privately. **Seen by** shows who looked (only people with read receipts on — reciprocal). Who can see it: Settings → Privacy → *My contacts / except… / only…*. Sent end-to-end encrypted to each person, never posted anywhere; every phone deletes it after **24 hours**; deleting yours removes it from theirs |
+| Chat colour & wallpaper | — | — | Settings → Appearance (all chats), or a chat's info → *Chat colour & wallpaper* (just that chat). 12 colours, each checked for readable text; 7 drawn wallpapers or **your own photo** (downscaled, metadata removed, stored encrypted on the phone); a *Dim* switch. Only you see it — nothing is sent |
+| Message menu | — | — | Long-press (or right-click) a message: it lifts out over a blurred chat and a compact card of actions appears beside it — Reply, Forward, Copy, Open, Edit (time left), and Delete in red below a line. Works with the keyboard (↑/↓/Enter/Esc) and screen readers |
+| Settings | — | — | Organised into plain sections — **Account · Appearance · Chats · Privacy · Security · Calls · Backups & new phone · Internet mode · Help & about** — each row says what's inside, and **Search settings** finds things by everyday words (“blue ticks”, “backup”, “lock”) |
+| Theme | — | — | **Midnight Blue + Electric Teal** by default (#101C2C · #43E6C1), every text colour checked against WCAG AA in a unit test. **Light** and **Match my phone** in Settings → Appearance |
 | Photos & videos | ✅ | ✅ (512 KiB chunks) | WhatsApp-style bubbles: just the picture with the time on its corner — no file name, size or Save button. **Tap** → full screen with what it really is (*JPEG · 199 KB · 1600×1200*, from the file's bytes, not its name) and **Reply · Forward · Save** (Save opens the share sheet → Save Image). Documents get a compact card (type badge, name, *PDF · size*). Photos go at **standard size** (longest side 1600 px) with an **Original quality** switch; hidden location/camera data removed; you preview and tap **Send** first |
 | Voice messages | ✅ | ✅ | WhatsApp-style. **Hold** the mic, talk, lift; **tap once** for hands-free (⏸ stop and listen · ➤ send now · 🗑 delete); slide far away to cancel (2 min max). The listen-first step happens **inside the composer bar** — no pop-up. Bubbles show ▶, a thin WhatsApp-style waveform you can tap or drag to seek, the length, and 1× / 1.5× / 2× — no file name, size or Save button. Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
 | Voice & video calls | ✅ | ✅ | Peer-to-peer, end-to-end encrypted (DTLS-SRTP keyed through the authenticated chat). Mute, camera off, flip camera. **Hide my IP** (default on) routes internet calls through TURN. Rings only while Murmur is open on their phone. One-to-one only |
@@ -259,6 +264,7 @@ murmur/
 | Calls in two browsers with fake camera/mic: nearby and via the relay, media both ways, mute, decline, permissions | Calls between two iPhones on mobile data (needs TURN switched on); earpiece vs. speaker can't be chosen by a web app on iPhone |
 | Edit/delete, profile photo, username login, duress passcode | Real iPhone voice recording after the recorder fix (WebKit bugs 301507/234784) |
 | Replies (menu, swipe, photo), forwarding to another person, read receipts on/off (global, per contact, reciprocal, over nearby and relay), photo/document bubbles and viewer — three browsers | How swipe-to-reply feels under a real thumb; share-sheet Save from the new viewer on iPhone |
+| Status text + photo between three browsers (audience *only…* proven to exclude), seen-by, reply-to-status, delete propagating, 24 h expiry; theme default/light/remembered; every Settings section + search; chat colour + per-chat photo wallpaper; compact menu position, focus and keyboard | How Status, the menu and wallpapers feel on a real iPhone |
 
 ## License
 

@@ -394,7 +394,7 @@ test('host injects a script into index.html: offline install is refused AND the 
     await page.click(tid('get-started'));
     await page.fill(tid('name'), 'Eve'); await page.fill(tid('username'), 'eve_test'); await page.fill(tid('pass1'), 'correct horse battery staple'); await page.fill(tid('pass2'), 'correct horse battery staple');
     await page.click(tid('create')); await page.waitForSelector(tid('settings'));
-    await page.click(tid('settings'));
+    await openSetting(page, 'help');
     assert.match(await page.$eval(tid('offline-status'), (e) => e.textContent), /altered \.\/index\.html/);
   } finally { await browser.close(); bad.kill(); }
 });
@@ -416,7 +416,8 @@ test('updates: a new build is verified, announced with its fingerprint, and appl
     await page.goto(`http://localhost:${port}/`);
     await onboard({ page }, 'Uma', 'correct horse battery staple');
     await page.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 30000 });
-    await page.click(tid('settings'));
+    await openSetting(page, 'help');
+    await page.waitForFunction((s) => /^[0-9a-f]{4}(-[0-9a-f]{4}){7}$/.test(document.querySelector(s)?.textContent || ''), tid('build-fp'), { timeout: 10000 }); // loads async
     assert.equal(await page.textContent(tid('build-fp')), fpA);
     assert.equal(await page.$$eval(tid('update-banner'), (e) => e.length), 0, 'no banner without an update');
 
@@ -429,16 +430,17 @@ test('updates: a new build is verified, announced with its fingerprint, and appl
     await page.click(tid('check-update'));
     await page.waitForSelector(tid('update-banner'), { timeout: 30000 });
     assert.match(await page.textContent(tid('update-banner')), new RegExp(fpB));
-    assert.equal(await page.textContent(tid('build-fp')), fpA, 'still running the old build until the person agrees');
+    await page.waitForFunction(([s, fp]) => document.querySelector(s)?.textContent === fp, [tid('build-fp'), fpA], { timeout: 10000 }); // still the old build until the person agrees
 
     // One tap: the verified build takes over and the page reloads into it.
     await Promise.all([page.waitForEvent('load', { timeout: 30000 }), page.click(tid('apply-update'))]);
     await page.waitForSelector(tid('unlock-pass'), { timeout: 30000 }); // vault survived; it's locked after a restart
     await userReady(page); await page.fill(tid('unlock-pass'), 'correct horse battery staple');
     await page.click(tid('unlock'));
-    await page.click(tid('settings'));
+    await openSetting(page, 'help');
     await page.waitForFunction(([s, fp]) => document.querySelector(s)?.textContent === fp, [tid('build-fp'), fpB], { timeout: 10000 });
     assert.equal(await page.$$eval(tid('update-banner'), (e) => e.length), 0, 'banner gone once updated');
+    await page.click(tid('back')); await page.click(tid('settings-account'));
     assert.match(await page.inputValue('input[aria-label="Display name"]'), /Uma/, 'profile kept across the update');
   } finally { await browser.close(); srv.kill(); rmSync(abs, { recursive: true, force: true }); }
 });
@@ -458,7 +460,7 @@ test('duress passcode: opens an empty decoy, real chats untouched; optional eras
     await A.page.waitForSelector(tid('contact-Bob'));
 
     // Set it up from the real vault.
-    await A.page.click(tid('settings'));
+    await openSetting(A.page, 'security');
     assert.equal(await A.page.textContent(tid('duress-status')), 'Off');
     await A.page.fill(tid('duress-pass'), REAL); await A.page.fill(tid('duress-pass2'), REAL);
     await A.page.click(tid('duress-save'));
@@ -466,30 +468,31 @@ test('duress passcode: opens an empty decoy, real chats untouched; optional eras
     await A.page.fill(tid('duress-pass'), DURESS); await A.page.fill(tid('duress-pass2'), DURESS);
     await A.page.click(tid('duress-save'));
     await A.page.waitForFunction((s) => document.querySelector(s)?.textContent === 'On', tid('duress-status'), { timeout: 30000 });
-    await A.page.click(tid('back'));
+    await leaveSettings(A.page);
 
     // Forced to unlock: the duress passcode opens an ordinary, empty Murmur.
     await lockAndUnlock(DURESS);
     await A.page.waitForSelector(tid('invite'), { timeout: 30000 });
     assert.equal(await A.page.$$eval(tid('contact-Bob'), (e) => e.length), 0, 'real contact hidden');
     assert.match(await A.page.textContent('body'), /No contacts yet/);
-    await A.page.click(tid('settings'));
+    await openSetting(A.page, 'security');
     assert.equal(await A.page.textContent(tid('duress-status')), 'Off', 'the decoy looks like a phone with no duress passcode');
+    await A.page.click(tid('back')); await A.page.click(tid('settings-account'));
     assert.equal(await A.page.inputValue('input[aria-label="Display name"]'), 'Alice', 'same name: nothing looks off');
-    await A.page.click(tid('back'));
+    await leaveSettings(A.page);
 
     // Back to the real passphrase: everything is still there.
     await lockAndUnlock(REAL);
     await A.page.waitForSelector(tid('contact-Bob'), { timeout: 30000 });
 
     // Now with "erase real chats": one use of the duress passcode destroys them.
-    await A.page.click(tid('settings'));
+    await openSetting(A.page, 'security');
     await A.page.fill(tid('duress-pass'), DURESS); await A.page.fill(tid('duress-pass2'), DURESS);
     await A.page.check(tid('duress-erase'));
     await A.page.click(tid('duress-save'));
     await A.page.click(tid('modal-yes'));
     await A.page.waitForFunction((s) => /erases/.test(document.querySelector(s)?.textContent || ''), tid('duress-status'), { timeout: 30000 });
-    await A.page.click(tid('back'));
+    await leaveSettings(A.page);
     await lockAndUnlock(DURESS);
     await A.page.waitForSelector(tid('invite'), { timeout: 30000 });
     assert.equal(await A.page.evaluate(() => /eras|wip|delet|destroy/i.test([...document.querySelectorAll('.toast')].map((x) => x.textContent).join(' '))), false, 'no hint on screen that anything was erased');
@@ -517,7 +520,7 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
   const bubbleMenu = async (p, text, dir = 'out') => {
     const el = p.page.locator(`${tid(`msg-${dir}`)}:has-text("${text}")`).last();
     await el.click({ button: 'right' });
-    await p.page.waitForSelector('.modal');
+    await p.page.waitForSelector(tid('message-menu'));
   };
   try {
     await onboard(A, 'Alice', PASS); await onboard(B, 'Bob', 'another long passphrase');
@@ -529,7 +532,7 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     await B.page.$eval(tid('compose'), (t) => t.setSelectionRange(4, 4));
 
     // --- profile photo + @username reach the contact ---
-    await A.page.click(tid('back')); await A.page.click(tid('settings'));
+    await A.page.click(tid('back')); await openSetting(A.page, 'account');
     await A.page.setInputFiles(tid('pic-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
     await A.page.waitForFunction(() => /Profile photo updated/.test(document.body.textContent), null, { timeout: 15000 });
     await B.page.waitForFunction(() => !!document.querySelector('.screen [data-testid="avatar"] img'), null, { timeout: 20000 }); // the chat WAS re-drawn
@@ -552,13 +555,13 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     await B.page.click(tid('back'));
 
     // --- edit (both phones update, marked "edited") ---
-    await A.page.click(tid('back')); await A.page.click(tid('contact-Bob'));
+    await leaveSettings(A.page); await A.page.click(tid('contact-Bob'));
     await A.page.waitForFunction((t) => document.querySelector('[data-testid="log"]')?.textContent.includes(t), draft, { timeout: 15000 });
     await send(A, 'helo wrld');
     await B.page.waitForFunction(() => /helo wrld/.test(document.querySelector('[data-testid="log"]')?.textContent || ''), null, { timeout: 15000 });
     await bubbleMenu(A, 'helo wrld');
-    assert.match(await A.page.textContent('.modal'), /Edit \(1[45] min left\)/);
-    await A.page.click(tid('modal-edit'));
+    assert.match(await A.page.textContent(tid('menu-edit')), /Edit\s*1[45] min/);
+    await A.page.click(tid('menu-edit'));
     await A.page.fill(tid('edit-text'), 'hello world');
     await A.page.click(tid('modal-save'));
     await B.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /hello world/.test(m.textContent) && m.querySelector('[data-testid="edited"]')), null, { timeout: 15000 });
@@ -568,7 +571,7 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     await send(A, 'oops wrong chat');
     await B.page.waitForFunction(() => /oops wrong chat/.test(document.querySelector('[data-testid="log"]').textContent), null, { timeout: 15000 });
     await bubbleMenu(A, 'oops wrong chat');
-    await A.page.click(tid('modal-all'));
+    await A.page.click(tid('menu-all'));
     await A.page.click(tid('modal-true'));
     await B.page.waitForFunction(() => /This message was deleted/.test(document.querySelector('[data-testid="log"]').textContent), null, { timeout: 15000 });
     assert.equal(await B.page.evaluate(() => /oops wrong chat/.test(document.body.textContent)), false, 'gone from their phone');
@@ -576,9 +579,9 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
 
     // --- the receiver can only delete for themselves ---
     await bubbleMenu(B, 'hello world', 'in');
-    assert.equal(await B.page.$$eval(tid('modal-all'), (e) => e.length), 0, 'no "delete for everyone" on someone else’s message');
-    assert.equal(await B.page.$$eval(tid('modal-edit'), (e) => e.length), 0);
-    await B.page.click(tid('modal-me'));
+    assert.equal(await B.page.$$eval(tid('menu-all'), (e) => e.length), 0, 'no "delete for everyone" on someone else’s message');
+    assert.equal(await B.page.$$eval(tid('menu-edit'), (e) => e.length), 0);
+    await B.page.click(tid('menu-me'));
     assert.equal(await B.page.evaluate(() => /hello world/.test(document.querySelector('[data-testid="log"]').textContent)), false);
     assert.match(await A.page.textContent(tid('log')), /hello world/, 'still on the sender’s phone');
 
@@ -642,7 +645,7 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await logHas(B, 'before backup');
 
     // --- 1. backup file ---
-    await A.page.click(tid('back')); await A.page.click(tid('settings'));
+    await A.page.click(tid('back')); await openSetting(A.page, 'backups');
     await A.page.click(tid('backup-file'));
     await A.page.fill(tid('confirm-pass'), PASS);
     const [dl] = await Promise.all([A.page.waitForEvent('download', { timeout: 60000 }), A.page.click(tid('modal-ok'))]);
@@ -650,7 +653,7 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     const file = join(mkdtempSync(join(tmpdir(), 'murmur-bk-')), dl.suggestedFilename());
     await dl.saveAs(file); // downloads vanish with the browser profile, and this "phone" is about to be lost
     // The conversation moves on after the backup, then the old phone is lost.
-    await A.page.click(tid('back')); await openBob(A);
+    await leaveSettings(A.page); await openBob(A);
     await send(A, 'after the backup');
     await logHas(B, 'after the backup');
     await send(B, 'reply after backup');
@@ -672,7 +675,7 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await logHas(C, 'welcome back');
 
     // --- 2. online backup → log in on another phone with just username + passphrase ---
-    await C.page.click(tid('back')); await C.page.click(tid('settings'));
+    await C.page.click(tid('back')); await openSetting(C.page, 'backups');
     await C.page.click(tid('online-toggle'));
     await C.page.fill(tid('confirm-pass'), PASS); await C.page.click(tid('modal-ok'));
     await C.page.waitForFunction(() => /^On — last backup/.test(document.querySelector('[data-testid="online-status"]')?.textContent || ''), null, { timeout: 60000 });
@@ -692,7 +695,7 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await logHas(D, 'got it');
 
     // --- 3. move to a new phone: exact copy, then the old phone erases itself ---
-    await D.page.click(tid('back')); await D.page.click(tid('settings'));
+    await D.page.click(tid('back')); await openSetting(D.page, 'backups');
     await D.page.click(tid('move-start'));
     await D.page.fill(tid('confirm-pass'), PASS); await D.page.click(tid('modal-ok'));
     await D.page.waitForFunction(() => document.querySelector('[data-testid="move-code"]')?.value.startsWith('murmur-move:'), null, { timeout: 60000 });
@@ -719,7 +722,7 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
   const A = await profile(browser, 'alice-wa'), B = await profile(browser, 'bob-wa'), C = await profile(browser, 'carol-wa');
   const inLog = (p, re, sel = 'msg-in') => p.page.waitForFunction(([s, r]) => [...document.querySelectorAll(`[data-testid="${s}"]`)].some((m) => new RegExp(r).test(m.textContent)), [sel, re.source], { timeout: 20000 });
   const bubbleOf = (text, dir) => `${tid(`msg-${dir}`)}:has-text("${text}")`;
-  const openMenu = async (p, text, dir) => { await p.page.locator(bubbleOf(text, dir)).last().click({ button: 'right' }); await p.page.waitForSelector('.modal'); };
+  const openMenu = async (p, text, dir) => { await p.page.locator(bubbleOf(text, dir)).last().click({ button: 'right' }); await p.page.waitForSelector(tid('message-menu')); };
   const statusOf = (p, text) => p.page.$eval(`${bubbleOf(text, 'out')} .status`, (e) => e.dataset.st);
   try {
     await onboard(A, 'Alice', 'correct horse battery staple');
@@ -750,8 +753,9 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
       const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 3, isPrimary: true, bubbles: true, clientX: r.x + 30, clientY: r.y + 30 };
       el.dispatchEvent(new PointerEvent('pointerdown', o)); setTimeout(() => el.dispatchEvent(new PointerEvent('pointerup', o)), 700);
     });
-    await B.page.waitForSelector(tid('modal-forward'), { timeout: 5000 });
-    await B.page.click(tid('modal-false'));
+    await B.page.waitForSelector(tid('menu-forward'), { timeout: 5000 });
+    await B.page.keyboard.press('Escape');
+    await B.page.waitForFunction(() => !document.querySelector('.spot'), null, { timeout: 3000 });
     assert.equal(await B.page.$$eval(tid('viewer'), (v) => v.length), 0, 'a long-press is not also a tap');
 
     // --- a document is a compact card: type badge, name, "PDF · size" — no Save chip ---
@@ -766,7 +770,7 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
     await send(A, 'lunch at 1?');
     await inLog(B, /lunch at 1\?/);
     await openMenu(B, 'lunch at 1?', 'in');
-    await B.page.click(tid('modal-reply'));
+    await B.page.click(tid('menu-reply'));
     await B.page.waitForSelector(`${tid('reply-bar')}:not([hidden])`);
     assert.match(await B.page.textContent(tid('reply-bar')), /Alice.*lunch at 1\?/s);
     await shot(B.page, 'wa-1-replybar');
@@ -809,7 +813,7 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
 
     // --- forward Bob's message to Carol: a fresh copy, tagged "Forwarded", no quote, no trace of Bob ---
     await openMenu(A, 'see you there', 'in');
-    await A.page.click(tid('modal-forward'));
+    await A.page.click(tid('menu-forward'));
     await A.page.check(tid('fwd-Carol'));
     await A.page.click(tid('modal-send'));
     await A.page.waitForFunction(() => /Forwarded to Carol/.test(document.body.textContent), null, { timeout: 15000 });
@@ -845,9 +849,9 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
     // Global switch: per-contact back to default, then everything off in Settings.
     await B.page.click(tid('contact-info'));
     await B.page.selectOption(tid('contact-receipts'), 'default');
-    await B.page.click(tid('back')); await B.page.click(tid('back')); await B.page.click(tid('settings'));
+    await B.page.click(tid('back')); await B.page.click(tid('back')); await openSetting(B.page, 'privacy');
     await B.page.uncheck(tid('read-receipts'));
-    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice'));
+    await leaveSettings(B.page); await B.page.click(tid('contact-Alice'));
     await send(A, 'global off check');
     await inLog(B, /global off check/);
     await A.page.waitForTimeout(2000);
@@ -862,6 +866,176 @@ test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe,
     await A.page.click(tid('contact-Bob'));
     await A.page.waitForSelector(`${bubbleOf('see you there', 'in')} ${tid('quote')}`);
     assert.equal(await statusOf(A, 'read receipt check'), 'read');
+    for (const p of [A, B, C]) assert.deepEqual(p.errors, [], `${p.name}: no page errors`);
+  } finally { await browser.close(); }
+});
+
+test('Midnight theme, Settings sections, compact message menu, chat colour & wallpaper, and 24-hour Status', { timeout: 360000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const A = await profile(browser, 'alice-st'), B = await profile(browser, 'bob-st'), C = await profile(browser, 'carol-st');
+  const css = (p, sel, prop) => p.page.$eval(sel, (e, pr) => getComputedStyle(e).getPropertyValue(pr).trim(), prop);
+  const outBg = (p) => p.page.$eval(`${tid('msg-out')}:not(.media)`, (e) => getComputedStyle(e).backgroundColor);
+  const inLog = (p, re, sel = 'msg-in') => p.page.waitForFunction(([s, r]) => [...document.querySelectorAll(`[data-testid="${s}"]`)].some((m) => new RegExp(r).test(m.textContent)), [sel, re.source], { timeout: 20000 });
+  try {
+    await onboard(A, 'Alice', 'correct horse battery staple');
+    await onboard(B, 'Bob', 'another long passphrase');
+    await onboard(C, 'Carol', 'yet another long passphrase');
+
+    // --- the default theme is Midnight Blue + Electric Teal ---
+    assert.equal(await A.page.evaluate(() => document.documentElement.dataset.theme), 'dark');
+    assert.equal(await css(A, 'body', 'background-color'), 'rgb(16, 28, 44)');   // #101C2C
+    assert.equal(await css(A, ':root', '--accent'), '#43e6c1');
+    assert.equal(await A.page.$eval('meta[name="theme-color"]', (m) => m.content), '#101c2c', 'the phone’s status bar matches');
+
+    await pairByText(A, B);
+    await A.page.click(tid('back')); await pairByText(A, C, {});
+    await A.page.click(tid('back')); await A.page.click(tid('contact-Bob'));
+    await B.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
+
+    // --- Settings is a hub of plain-language sections, with search ---
+    await A.page.click(tid('back')); await A.page.click(tid('settings'));
+    await shot(A.page, 'n01-settings-hub');
+    for (const s of ['account', 'appearance', 'chats', 'privacy', 'security', 'calls', 'backups', 'internet', 'help']) {
+      await A.page.click(tid(`settings-${s}`));
+      await A.page.waitForSelector(tid(`settings-page-${s}`));
+      await A.page.click(tid('back'));
+    }
+    await A.page.fill(tid('settings-search'), 'blue ticks');
+    await A.page.waitForSelector(`${tid('settings-results')} ${tid('settings-privacy')}`);
+    await A.page.fill(tid('settings-search'), 'backup');
+    await A.page.click(`${tid('settings-results')} ${tid('settings-backups')}`);
+    await A.page.waitForSelector(tid('backup-file'));
+    await A.page.click(tid('back'));
+    await A.page.fill(tid('settings-search'), 'zzzz');
+    await A.page.waitForFunction(() => /No setting matches/.test(document.body.textContent));
+    await A.page.fill(tid('settings-search'), '');
+    // Theme switch: Light is preserved (the reload check is at the end — a reload drops the nearby link).
+    await A.page.click(tid('settings-appearance'));
+    await A.page.click(tid('theme-light'));
+    assert.equal(await css(A, 'body', 'background-color'), 'rgb(246, 247, 249)');
+    await A.page.click(tid('theme-dark'));
+    assert.equal(await css(A, 'body', 'background-color'), 'rgb(16, 28, 44)');
+
+    // --- chat colour & wallpaper for ALL chats (Appearance), with a live preview ---
+    await A.page.click(tid('bubble-violet')); // saved to the encrypted vault, then the page re-draws
+    await A.page.waitForFunction((s) => getComputedStyle(document.querySelector(s)).backgroundColor === 'rgb(91, 58, 140)', `${tid('look-preview')} .msg.out`, { timeout: 5000 });
+    await A.page.click(tid('wall-aurora'));
+    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-aurora`);
+    await shot(A.page, 'n02-appearance');
+    await leaveSettings(A.page); await A.page.click(tid('contact-Bob'));
+    await A.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
+    await send(A, 'hi in violet');
+    assert.equal(await outBg(A), 'rgb(91, 58, 140)', 'sent bubbles use the chosen colour');
+    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-aurora')), true);
+    // …and ONE chat gets its own look (contact info → Chat colour & wallpaper), including a photo.
+    await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
+    await A.page.click(tid('bubble-rose'));
+    await A.page.waitForSelector(`${tid('bubble-rose')}.on`);
+    await A.page.setInputFiles(tid('wall-photo-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await A.page.waitForFunction(() => /Wallpaper set/.test(document.body.textContent), null, { timeout: 15000 });
+    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-photo`);
+    await A.page.check(tid('wall-dim'));
+    await A.page.waitForSelector(`${tid('look-preview')} .log.wall-dim`);
+    await A.page.click(tid('back')); await A.page.click(tid('back'));
+    assert.equal(await outBg(A), 'rgb(155, 47, 74)', 'this chat: rose');
+    await A.page.waitForFunction(() => /^url\("blob:/.test(getComputedStyle(document.getElementById('log')).getPropertyValue('--wall-img').trim()), null, { timeout: 10000 });
+    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-photo') && e.classList.contains('wall-dim')), true);
+    await shot(A.page, 'n03-chat-photo-wallpaper');
+    // Carol's chat still follows the default (violet + aurora).
+    await A.page.click(tid('back')); await A.page.click(tid('contact-Carol'));
+    assert.equal(await A.page.$eval('#log', (e) => e.classList.contains('wall-aurora')), true);
+    // The look is private: Bob's phone is untouched.
+    await inLog(B, /hi in violet/);
+    assert.equal(await B.page.$eval('#log', (e) => e.classList.contains('wall-none')), true);
+    // Reset brings Bob's chat back to the default.
+    await A.page.click(tid('back')); await A.page.click(tid('contact-Bob')); await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
+    await A.page.click(tid('look-reset'));
+    await A.page.waitForSelector(`${tid('bubble-default')}.on`);
+    await A.page.click(tid('back')); await A.page.click(tid('back'));
+    assert.equal(await outBg(A), 'rgb(91, 58, 140)');
+
+    // --- the message menu is a compact card beside the message, not a full-width dialog ---
+    await A.page.locator(`${tid('msg-out')}:has-text("hi in violet")`).click({ button: 'right' });
+    await A.page.waitForSelector(tid('message-menu'));
+    const box = await A.page.$eval(tid('message-menu'), (e) => { const r = e.getBoundingClientRect(); return { w: r.width, vw: innerWidth, right: innerWidth - r.right }; });
+    assert.ok(box.w < box.vw * 0.75, `menu is compact (${Math.round(box.w)} of ${box.vw}px)`);
+    assert.ok(box.right < box.vw / 2, 'my message → the menu sits on the right, beside it');
+    assert.equal(await A.page.evaluate(() => document.activeElement?.dataset.testid), 'menu-reply', 'focus is in the menu (keyboard / screen readers)');
+    await shot(A.page, 'n04-message-menu');
+    await A.page.keyboard.press('ArrowDown');
+    assert.equal(await A.page.evaluate(() => document.activeElement?.dataset.testid), 'menu-forward');
+    assert.equal(await A.page.$eval(tid('menu-me'), (e) => e.classList.contains('danger')), true, 'destructive actions are red');
+    await A.page.click(tid('menu-backdrop'), { position: { x: 12, y: 12 } }); // tap empty space
+    await A.page.waitForFunction(() => !document.querySelector('.spot'));
+
+    // --- Status: Alice shares a text update with "only Bob" → Bob sees it, Carol never receives it ---
+    await A.page.click(tid('back')); await openSetting(A.page, 'privacy');
+    await shot(A.page, 'n09-privacy');
+    await A.page.check(tid('status-aud-only'));
+    await A.page.check(tid('status-aud-Bob'));
+    await leaveSettings(A.page);
+    await A.page.click(tid('tab-status'));
+    await A.page.click(tid('status-new-text'));
+    await A.page.fill(tid('status-text'), 'Beach day 🌊');
+    await A.page.click(tid('status-bg')); // cycle the background colour
+    await shot(A.page, 'n05-status-composer');
+    await A.page.click(tid('status-post'));
+    await A.page.waitForFunction(() => /Status posted — 1 contact can see it/.test(document.body.textContent), null, { timeout: 15000 });
+    await B.page.click(tid('back'));
+    await B.page.waitForSelector(tid('tabdot-status'), { timeout: 20000 }); // a dot on the Status tab
+    await B.page.click(tid('tab-status'));
+    await B.page.waitForSelector(`${tid('status-Alice')} .ring.unseen`);
+    await shot(B.page, 'n06-status-list');
+    await B.page.click(tid('status-Alice'));
+    await shot(B.page, 'n07-status-viewer');
+    assert.equal(await B.page.textContent(tid('status-shown')), 'Beach day 🌊');
+    assert.equal(await B.page.$eval(`${tid('status-viewer')} .ststage`, (e) => e.className), 'ststage stbg-midnight stfont-sans', 'the background Alice chose');
+    // Bob replies to the status → it arrives in their chat, quoting the status.
+    await B.page.fill(tid('status-reply'), 'enjoy!');
+    await B.page.click(tid('status-reply-send'));
+    await B.page.waitForFunction(() => /Reply sent/.test(document.body.textContent));
+    await B.page.click(tid('status-close'));
+    await B.page.waitForSelector(`${tid('status-Alice')} .ring:not(.unseen)`); // now under "Viewed"
+    // Alice sees who viewed it.
+    await A.page.click(tid('status-mine'));
+    await A.page.waitForFunction(() => document.querySelector('[data-testid="status-seen-by"]')?.textContent.trim() === '1', null, { timeout: 20000 });
+    await A.page.click(tid('status-close'));
+    await A.page.click(tid('tab-chats')); await A.page.click(tid('contact-Bob'));
+    await inLog(A, /enjoy!/);
+    assert.match(await A.page.textContent(`${tid('msg-in')}:has-text("enjoy!") ${tid('quote')}`), /Status: Beach day/);
+    // Carol (not in the audience) has nothing.
+    await C.page.click(tid('back')); await C.page.click(tid('tab-status'));
+    await C.page.waitForTimeout(1500);
+    assert.equal(await C.page.$$eval(tid('status-Alice'), (e) => e.length), 0, 'not shared with Carol — never sent to her phone');
+
+    // --- a photo status, then deleting it removes it from Bob's phone too ---
+    await A.page.click(tid('back')); await A.page.click(tid('tab-status'));
+    await A.page.setInputFiles(tid('status-photo-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await A.page.fill(tid('status-caption'), 'sunset');
+    await A.page.click(tid('status-post'));
+    await B.page.waitForSelector(`${tid('status-Alice')} .ring.unseen`, { timeout: 20000 });
+    await B.page.click(tid('status-Alice'));
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="status-shown-photo"]')?.naturalWidth > 0, null, { timeout: 10000 });
+    assert.match(await B.page.textContent(tid('status-viewer')), /sunset/);
+    await shot(B.page, 'n08-status-photo');
+    await B.page.keyboard.press('Escape');
+    await A.page.click(tid('status-mine'));
+    await A.page.keyboard.press('ArrowRight'); // to the photo (newest)
+    await A.page.click(tid('status-delete')); await A.page.click(tid('modal-true'));
+    await A.page.waitForFunction(() => /removed from your contacts’ phones/.test(document.body.textContent), null, { timeout: 10000 });
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="status-Alice"]')?.textContent.includes('Alice') && !/2 updates/.test(document.querySelector('[data-testid="status-Alice"]').textContent), null, { timeout: 20000 });
+    // Statuses survive a lock / unlock (stored encrypted), then expire on their own after 24 h.
+    await B.page.click(tid('tab-chats')); await B.page.click(tid('lock'));
+    await userReady(B.page); await B.page.fill(tid('unlock-pass'), 'another long passphrase'); await B.page.click(tid('unlock'));
+    await B.page.click(tid('tab-status'));
+    await B.page.waitForSelector(tid('status-Alice'));
+    await B.page.evaluate(() => { const real = Date.now; Date.now = () => real() + 24 * 3600 * 1000 + 60_000; });
+    await B.page.waitForFunction(() => !document.querySelector('[data-testid="status-Alice"]'), null, { timeout: 70_000 }); // the minute sweep removes it
+    // The theme is remembered across a reload — already on the lock screen, before unlocking.
+    await C.page.click(tid('settings')); await C.page.click(tid('settings-appearance')); await C.page.click(tid('theme-light'));
+    await C.page.reload(); await userReady(C.page);
+    assert.equal(await C.page.evaluate(() => document.documentElement.dataset.theme), 'light');
+    assert.equal(await css(C, 'body', 'background-color'), 'rgb(246, 247, 249)');
     for (const p of [A, B, C]) assert.deepEqual(p.errors, [], `${p.name}: no page errors`);
   } finally { await browser.close(); }
 });
@@ -902,11 +1076,11 @@ test('voice & video calls: ring, accept, media flows both ways, mute, hang up, d
     await logHas(A, 'Voice call — declined');
 
     // --- permissions: Bob turns video calls off → Alice's video button disappears (voice stays) ---
-    await B.page.click(tid('back')); await B.page.click(tid('settings'));
+    await B.page.click(tid('back')); await openSetting(B.page, 'calls');
     await B.page.uncheck(tid('allow-video'));
     await A.page.waitForFunction(() => !document.querySelector('[data-testid="call-video"]') && !!document.querySelector('[data-testid="call-voice"]'), null, { timeout: 15000 });
     // …and blocks Alice entirely → no call buttons at all
-    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice')); await B.page.click(tid('contact-info'));
+    await leaveSettings(B.page); await B.page.click(tid('contact-Alice')); await B.page.click(tid('contact-info'));
     await B.page.uncheck(tid('allow-calls-from'));
     await A.page.waitForFunction(() => !document.querySelector('[data-testid="call-voice"]') && !document.querySelector('[data-testid="call-video"]'), null, { timeout: 15000 });
     for (const p of [A, B]) assert.deepEqual(p.errors, []);
@@ -1023,6 +1197,10 @@ const touchHold = async (page, selector, ms) => {
   await page.waitForTimeout(ms);
   await page.$eval(selector, (el) => { el.dispatchEvent(new PointerEvent('pointerup', el.__o)); el.dispatchEvent(new PointerEvent('pointerleave', el.__o)); });
 };
+// Settings is a hub of sections (Account, Appearance, Chats, Privacy, Security, Calls, Backups,
+// Internet, Help). openSetting() goes straight to one; leaveSettings() returns to the chat list.
+const openSetting = async (page, section) => { await page.click(tid('settings')); await page.click(tid(`settings-${section}`)); };
+const leaveSettings = async (page) => { await page.click(tid('back')); await page.click(tid('tab-chats')); };
 // SHOTS=dir saves screenshots of the voice UI states (for eyeballing the design; off in CI).
 const shot = async (page, name) => { if (process.env.SHOTS) await page.screenshot({ path: `${process.env.SHOTS}/${name}.png` }); };
 const holdButton = async (page, selector, ms) => {
@@ -1197,12 +1375,19 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
     await C.click(tid('voice-send-now'));
     await D.waitForFunction((s) => document.querySelectorAll(s).length === 2, tid('voice-clip'), { timeout: 30000 });
     // Real walkie-talkie mode (Settings): sends the moment you let go, no question asked.
-    await C.click(tid('back')); await C.click(tid('settings'));
+    await C.click(tid('back')); await openSetting(C, 'chats');
     await C.selectOption(tid('voice-send'), 'release');
-    await C.click(tid('back')); await C.click(tid('contact-Dave'));
+    await leaveSettings(C); await C.click(tid('contact-Dave'));
     await holdButton(C, tid('voice'), 1600);
     await D.waitForFunction((s) => document.querySelectorAll(s).length === 3, tid('voice-clip'), { timeout: 30000 });
     assert.equal(await C.$$eval(tid('voice-review'), (e) => e.length), 0, 'no review step in walkie-talkie mode');
+    // Voice notes are media, not documents: they're listed under Media (with a player), never Docs.
+    await C.click(tid('chat-title')); await C.click(tid('open-shared'));
+    assert.deepEqual(await C.$$eval('.tabs button', (b) => b.map((x) => x.textContent)), ['Media 5', 'Docs 0', 'Links 0'], '2 photos + 3 voice notes; no docs');
+    assert.equal(await C.$$eval(`${tid('shared-voice')} ${tid('voice-clip')}`, (e) => e.length), 3);
+    await C.click(tid('tab-docs'));
+    assert.equal(await C.$$eval(tid('shared-docs'), (e) => e.length), 0);
+    await C.click(tid('back')); await C.click(tid('back'));
 
     // --- a video call between phones that are NOT nearby: every signal goes through the relay mailbox ---
     assert.equal(await P.Carol.page.getAttribute(tid('conn-state'), 'data-online'), 'false', 'internet link, not a nearby one');

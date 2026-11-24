@@ -22,6 +22,7 @@ import { sdpFingerprint } from './sdp.js';
 import { toB64u, fromB64u, random, toHex, equal } from './bytes.js';
 import { sha256 } from './crypto.js';
 import { msgMeta } from './meta.js';
+import { statusTag } from './status.js';
 
 export const MAX_TEXT = 8000;
 export const MAX_FILE = 25 * 1024 * 1024;
@@ -31,10 +32,11 @@ export const APP_VERSION = '1.0.0';
 
 export const newId = () => toHex(random(8));
 /** Message types handled by the app layer (location, SOS, groups); everything else unknown is ignored. */
-export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call', 'read']);
+export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call', 'read', 'status', 'status-del', 'status-seen']);
 /** Optional file tags: which group a file belongs to, whether it is a voice clip, reply/forward (meta.js). */
 export function fileExtra(m) {
   const out = msgMeta(m);
+  if (m?.st) { const st = statusTag(m.st); if (st) out.st = { id: st.id, ts: st.ts, cap: st.cap }; } // a status photo (status.js)
   if (typeof m?.gid === 'string' && /^[0-9a-f]{32}$/.test(m.gid)) out.gid = m.gid;
   if (m?.kind === 'voice') out.kind = 'voice';
   return out;

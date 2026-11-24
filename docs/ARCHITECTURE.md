@@ -169,6 +169,10 @@ Rule of thumb: whatever other code uses as a "ready" flag must be assigned **las
 | `core/call.js` — WebRTC call engine + signal validation + `callDecision()` | engine needs a browser | `test/unit/call.test.mjs` + e2e "voice & video calls" and the relay call in "phase 1" |
 | `core/waveform.js` — bar heights, live mic level, clock text, speeds, seek maths | yes | `test/unit/waveform.test.mjs` |
 | `core/meta.js` — reply quotes, forward hops, read-receipt rules, status ordering, file-type labels | yes | `test/unit/meta.test.mjs` |
+| `core/status.js` — status validation, 24 h life, audience, list order, display time | yes | `test/unit/status.test.mjs` |
+| `core/color.js` — WCAG contrast, chat colours, wallpapers, looks; **theme audit read from app.css** | yes | `test/unit/color.test.mjs` |
+| `ui/menu.js` — the lifted-message action menu (positioning, focus, keyboard) | browser only | e2e "Midnight theme…" |
+| every CSS class used in JS has a style · every handled message type is allowed through the nearby link | yes | `css-coverage.test.mjs`, `app-types.test.mjs` |
 | `ui/voice.js` — voice bubble player + recorder bar (needs MediaRecorder/WebAudio) | browser only | e2e "phase 1" voice section |
 | `relay/src/router.js` `/v1/turn` | — | `test/unit/relay.test.mjs` (fake Cloudflare API, port-53 filter, Origin check, rate limit, STUN fallback) |
 
@@ -201,6 +205,28 @@ and when a "flaky" test fails the same way twice, it is usually a real bug weari
 
 The waveform is computed on each phone from the decrypted audio (`decodeAudioData`), never sent:
 a sender can't make a clip look different from what it sounds like, and the protocol didn't change.
+
+## Lesson: code that was never run
+Status, Settings sections, chat colours and the new menu were first written in one long session
+that ended before any of it was tested. Running it found four defects that reading had not:
+1. **No CSS** for the Settings hub, tab bar, Status screens or wallpapers — on a phone they'd have
+   been unstyled boxes. → `css-coverage.test.mjs`: every class created in JS must be styled.
+2. **Status never crossed a nearby link**: `status`, `status-del`, `status-seen` were handled by the
+   app but missing from `APP_TYPES`, the nearby allow-list, so they were dropped silently.
+   → `app-types.test.mjs` ties the two lists together.
+3. **Photo statuses showed "[object HTMLImageElement]"**: `replaceChildren([a, b])` stringifies an
+   array — it needs `replaceChildren(...[a, b])`.
+4. **The lifted message lost its chat colour** (the copy lives outside the chat's CSS variables).
+Each of the first three is now impossible to reintroduce without a red test; each test was checked
+by putting the bug back and watching it fail. Lesson: "it parses and the old tests pass" says
+nothing about new code. Only running it, and *looking at the screen*, does.
+
+A fifth finding came from the test runs themselves: `sitecheck.test.mjs` rebuilt the **shared**
+`dist/` folder with the production relay address. Run alongside the e2e suite, it swapped the app
+files under running browsers, and a page tried to open `wss://relay.princeisgenius.com` — which
+the test build's CSP blocked and the "no page errors" check reported. The app was right; the tests
+weren't isolated. Every unit test now builds into its own folder, and `dist/` is verified
+untouched after `npm test`. Lesson: tests that share a directory are tests that can lie.
 
 ## Lesson: one field name, two meanings
 Forwarding first wanted the field `fwd`. But groups already used `fwd` — "the creator relayed this

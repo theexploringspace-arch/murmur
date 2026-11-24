@@ -337,3 +337,22 @@ replace a message the other phone already confirmed (`statusAfter()`).
 
 **Forwarding** sends a brand-new message (new `id`, encrypted for each recipient as usual) carrying
 `fw`, with no `re` and nothing about the original sender. At most 5 chats per forward.
+
+## 15. Status updates (`status.js`)
+
+A status is **not posted anywhere**. The author's phone sends it, end-to-end encrypted like any
+message, to each contact in their audience (`audience()`: all accepted contacts, all except some,
+or only some — a pending stranger never). Contacts who were offline get it when next reachable
+(`syncStatuses`, triggered with profile sync). Each phone deletes it 24 h after `ts`.
+
+| `t` | fields | notes |
+|---|---|---|
+| `status` | `id`, `ts`, `kind:'text'`, `text` (≤ 700), `bg` ∈ 8 names, `font` ∈ 4 names | unknown `bg`/`font` → defaults; only known CSS classes are ever applied |
+| file + `st: { id, ts, cap ≤ 200 }` | a photo status | must pass the image content check (`inspectFile` → `inline`); otherwise dropped |
+| `status-del` | `id` | the author deleted it → removed everywhere it was sent |
+| `status-seen` | `id` | the viewer looked at it. Sent only if the viewer's read receipts are on for the author, and counted only if the author's are on for the viewer (reciprocal, like §14) and it was really sent to them |
+
+Validation (`readStatus` / `statusTag`): a `ts` more than 5 minutes in the future is refused (it
+would outlive 24 h), as is anything already expired. A contact can have at most 30 live statuses on
+your phone; requests (unaccepted invite-link contacts) can't send any. Replying to a status sends an
+ordinary message with `re: { k: 'status', … }` (§14), so it lands in your chat with them.

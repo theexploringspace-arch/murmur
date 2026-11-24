@@ -5,7 +5,7 @@
 //          id  the quoted message's id
 //          by  contact id (32 hex) of whoever WROTE the quoted message — absolute, so it means
 //              the same thing on every phone, including in groups
-//          k   what it was: text | photo | video | voice | file | loc | sos
+//          k   what it was: text | photo | video | voice | file | loc | sos | status (a reply to a status update)
 //          t   a short text preview (≤ 120 chars), shown only if this phone doesn't have the
 //              original (e.g. it disappeared, or you joined the group later)
 //   fw   FORWARDED: how many hops (1 = forwarded once). ≥ 5 shows "Forwarded many times".
@@ -15,7 +15,7 @@
 // never from the sender's preview. A sender can't make you appear to have said something you
 // didn't — the most they can do is quote an id you don't have, which shows their preview text.
 
-export const QUOTE_KINDS = ['text', 'photo', 'video', 'voice', 'file', 'loc', 'sos'];
+export const QUOTE_KINDS = ['text', 'photo', 'video', 'voice', 'file', 'loc', 'sos', 'status'];
 export const SNIPPET = 120;
 export const MANY_TIMES = 5;
 const HEX_ID = /^[0-9a-f]{8,32}$/;
@@ -42,7 +42,7 @@ export function kindOf(m) {
 
 /** The label a quote shows when there's no text (or alongside the icon). */
 export function kindLabel(k, name) {
-  return { photo: 'Photo', video: 'Video', voice: 'Voice message', file: name || 'File', loc: 'Location', sos: 'SOS' }[k] || '';
+  return { photo: 'Photo', video: 'Video', voice: 'Voice message', file: name || 'File', loc: 'Location', sos: 'SOS', status: 'Status' }[k] || '';
 }
 
 /** Build the `re` tag for replying to local message `m` in chat `key` (contact id or "g:…"). */

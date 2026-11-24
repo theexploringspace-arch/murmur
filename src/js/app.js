@@ -19,12 +19,15 @@ import { Scanner, decodeImageFile } from './qr/scanner.js';
 import { h, clear, icon, qrSvg, toast, fmtTime, fmtBytes } from './ui/dom.js';
 import { scriptUrl } from './ui/trusted.js';
 import { voicePlayer, voiceRecorder, stopAllVoice } from './ui/voice.js';
+import { spotlightMenu } from './ui/menu.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 import * as BK from './core/backup.js';
 import { readBox, writeBox } from './core/relaybox.js';
 import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
 import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
+import { BUBBLES, WALLS, cleanLook, effectiveLook, bubbleVars, inkOn } from './core/color.js';
+import { readStatus, statusTag, readStatusId, cleanAudience, audience, live, statusRows, showFor, ago, expiresAt, STATUS_BGS, STATUS_FONTS, MAX_STATUS_TEXT, MAX_CAPTION } from './core/status.js';
 import { msgMeta, quoteOf, resolveQuote, kindOf, kindLabel, forwardHops, forwardLabel, receiptsOn, toConfirm, readIds, statusAfter, typeLabel } from './core/meta.js';
 
 const $app = document.getElementById('app');
@@ -45,6 +48,7 @@ const S = {
   typing: new Map(),
   drafts: new Map(),     // chat key → unsent text (memory only, never stored)
   replyTo: new Map(),    // chat key → reply quote waiting in the composer (memory only)
+  statuses: new Map(),   // contact id → their live status updates (mine under my own id)
   view: null, viewArgs: null,
   scanner: null,
   lastActivity: Date.now(),
@@ -81,20 +85,39 @@ function go(view, ...args) {
 // Voice notes outlive re-renders of the SAME chat (the relay flickering re-draws it): a playing
 // clip keeps playing and a recording in progress keeps recording. Leaving the chat stops both.
 const PLAYERS = new Map(); // blob url → player element, reused by bubble()
-let lastScreen = '';
+let lastScreen = '', lastDrawn = '';
+const TEXTISH = (e) => (e.tagName === 'TEXTAREA' || (e.tagName === 'INPUT' && !/^(checkbox|radio|file|button|submit|range|color)$/.test(e.type)));
+const fieldKey = (e) => (e && TEXTISH(e) ? e.dataset.testid || e.id || e.getAttribute('aria-label') || e.placeholder || null : null);
+/** Text the user changed (value ≠ what the screen drew) in every field that has a stable name. */
+function typedValues() {
+  const out = new Map();
+  for (const e of $app.querySelectorAll('input, textarea')) { const k = fieldKey(e); if (k && e.value !== e.defaultValue && !out.has(k)) out.set(k, e.value); }
+  return out;
+}
+function restoreTyped(typed) {
+  for (const e of $app.querySelectorAll('input, textarea')) {
+    const k = fieldKey(e);
+    if (k && typed.has(k) && e.value === e.defaultValue) { e.value = typed.get(k); typed.delete(k); } // only where the new screen didn't set its own
+  }
+}
 function render() {
   const screen = `${S.view}:${S.viewArgs?.[0] ?? ''}`;
   if (screen !== lastScreen) {
     lastScreen = screen; stopAllVoice(); PLAYERS.clear(); closeViewer();
     if (S.voiceRec) { S.voiceRec.discard(); S.voiceRec = null; } // releases the microphone
   }
-  // Re-drawing the same chat must not steal the keyboard or move the cursor while you type.
-  const typing = document.activeElement?.id === 'compose' ? document.activeElement : null;
-  const sel = typing && [typing.selectionStart, typing.selectionEnd];
+  // Re-drawing the SAME screen (a relay reconnect, a new profile photo…) must not throw away what
+  // you're typing anywhere — a passphrase, a username, a message — nor steal the keyboard.
+  const same = screen === lastDrawn;
+  const typed = same ? typedValues() : null;
+  const act = same ? fieldKey(document.activeElement) : null;
+  const sel = act && [document.activeElement.selectionStart, document.activeElement.selectionEnd];
   const v = VIEWS[S.view];
   clear($app).append(v(...(S.viewArgs || [])));
-  const again = typing && document.getElementById('compose');
-  if (again) { again.focus(); try { again.setSelectionRange(...sel); } catch { /* value shorter now */ } return; }
+  lastDrawn = screen;
+  if (typed) restoreTyped(typed);
+  const again = act && [...$app.querySelectorAll('input, textarea')].find((e) => fieldKey(e) === act);
+  if (again) { again.focus({ preventScroll: true }); try { again.setSelectionRange(...sel); } catch { /* not a text field */ } return; }
   const focus = $app.querySelector('[autofocus]');
   if (focus) focus.focus();
 }
@@ -214,6 +237,7 @@ async function openVault(vault) {
   S.chats = new Map();
   S.myCid = await contactId(vault.identity.publicRaw);
   S.groups = new Map((await vault.getRecord('groups', [])).map((g) => [g.id, g]));
+  await loadStatuses(vault);
   for (const c of S.contacts.values()) {
     if (c.verified === undefined) c.verified = !c.remote; // contacts from before internet mode were all paired in person
     if (c.keepHistory) S.chats.set(c.id, (await vault.getRecord(`history/${c.id}`, [])).map((m) => (m.file ? { ...m, file: { ...m.file, stored: true } } : m)));
@@ -394,9 +418,12 @@ function lock(reason) {
   stopAllVoice(); if (S.voiceRec) { S.voiceRec.discard(); S.voiceRec = null; }
   for (const msgs of S.chats.values()) for (const m of msgs) dropFileUrl(m);
   for (const u of PIC_URLS.values()) URL.revokeObjectURL(u); PIC_URLS.clear();
+  for (const u of WALL_URLS.values()) URL.revokeObjectURL(u); WALL_URLS.clear(); // wallpapers are vault data too
+  for (const s of [...(S.statuses?.values() || [])].flat()) if (s.url) URL.revokeObjectURL(s.url);
+  closeStatusOverlay(); closeViewer();
   endCall('locked');
   S.vault?.lock();
-  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), replyTo: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
+  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), replyTo: new Map(), statuses: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
   go('unlock');
   if (reason) toast(reason);
@@ -760,11 +787,10 @@ function header(title, { back, actions = [], lead = null, onTitle = null } = {})
 
 VIEWS.home = () => {
   const list = [...S.contacts.values()].sort((a, b) => (isOnline(b.id) - isOnline(a.id)) || displayName(a).localeCompare(displayName(b)));
-  return h('div.screen.full',
+  return h('div.screen.full.tabbed',
     header('Murmur', {
       actions: [
         h('button.sos', { onclick: () => go('sos'), 'aria-label': 'Emergency SOS', 'data-testid': 'sos' }, 'SOS'),
-        h('button.icon', { onclick: () => go('settings'), 'aria-label': 'Settings', 'data-testid': 'settings' }, icon('gear')),
         h('button.icon', { onclick: () => lock(), 'aria-label': 'Lock', 'data-testid': 'lock' }, icon('lock')),
       ],
     }),
@@ -791,7 +817,8 @@ VIEWS.home = () => {
         ? h('ul.contacts', [...S.groups.values()].filter((g) => !g.removed).map((g) => h('li', h('button.contact', { onclick: () => { S.unread.delete(`g:${g.id}`); go('group', g.id); }, 'data-testid': `group-${g.name}` },
           h('span.avatar.group', icon('users', 18)), h('span.cname', g.name), h('span.cstate', `${g.members.length} people`),
           S.unread.get(`g:${g.id}`) ? h('span.badge', String(S.unread.get(`g:${g.id}`))) : null))))
-        : h('p.hint', 'No groups yet.')) : null);
+        : h('p.hint', 'No groups yet.')) : null,
+    tabBar('chats'));
 };
 
 // ---- invite by link (friends far away) ----
@@ -1096,18 +1123,23 @@ function whoWrote(by, key) {
   if (String(key).startsWith('g:')) return memberName(S.groups.get(String(key).slice(2)), by);
   const c = S.contacts.get(by); return c ? displayName(c) : 'Them';
 }
-const QUOTE_ICON = { photo: 'image', video: 'video', voice: 'mic', file: 'clip', loc: 'pin', sos: 'alert' };
+const QUOTE_ICON = { photo: 'image', video: 'video', voice: 'mic', file: 'clip', loc: 'pin', sos: 'alert', status: 'status' };
 /** The quoted message: who wrote it, an icon for its kind, a preview line, a thumbnail for photos. */
 function quoteContent(re, key) {
   const local = findMsg(key, re.id);
   const q = resolveQuote(re, local);
-  const text = q.t || kindLabel(q.k, local?.file?.name);
+  const text = q.k === 'status' ? `Status${q.t ? `: ${q.t}` : ''}` : q.t || kindLabel(q.k, local?.file?.name);
   return [h('span.qbody', h(`strong.qwho${q.by === S.myCid ? '.me' : ''}`, whoWrote(q.by, key)),
     h('span.qtext', QUOTE_ICON[q.k] && !q.gone ? icon(QUOTE_ICON[q.k], 14) : null, ' ', text)),
   local?.file?.url && local.file.safety?.inline && !q.gone ? h('img.qthumb', { src: local.file.url, alt: '' }) : null];
 }
 /** Scroll to a message and flash it (tap on a quote). */
-function jumpTo(key, mid) {
+function jumpTo(key, mid, k) {
+  if (k === 'status') { // a reply to a status: open it if it's still live (24 h)
+    const s = [...S.statuses.values()].flat().find((x) => x.id === mid && x.exp > Date.now());
+    if (s) openStatusViewer([s.by], s.by); else toast('That status has expired (they last 24 hours)');
+    return;
+  }
   const el = document.querySelector(`#log [data-mid="${CSS.escape(mid)}"]`);
   if (!el) { toast('The original message isn’t on this phone anymore'); return; }
   el.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -1127,7 +1159,7 @@ function bubble(m, key = S.viewArgs?.[0]) {
   const body = [];
   if (m.from && m.dir === 'in' && String(key).startsWith('g:')) body.push(h('div.sender', { 'data-testid': 'sender' }, memberName(S.groups.get(String(key).slice(2)), m.from)));
   if (m.fw) body.push(h('div.fwd', { 'data-testid': 'forwarded' }, icon('forward', 13), ` ${forwardLabel(m.fw)}`));
-  if (m.re) body.push(h('button.replyq', { type: 'button', 'data-testid': 'quote', 'data-qid': m.re.id, onclick: () => jumpTo(key, m.re.id) }, ...quoteContent(m.re, key)));
+  if (m.re) body.push(h('button.replyq', { type: 'button', 'data-testid': 'quote', 'data-qid': m.re.id, onclick: () => jumpTo(key, m.re.id, m.re.k) }, ...quoteContent(m.re, key)));
   if (m.sos) body.push(sosCard(m));
   if (m.loc) body.push(locCard(m));
   if (m.text != null) body.push(richText(m, cid));
@@ -1265,6 +1297,7 @@ VIEWS.chat = (id) => {
     comp);
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; if (online) input.focus(); });
   confirmReads(id);
+  applyLook(view, log, id);
   return view;
 };
 
@@ -1292,6 +1325,7 @@ async function deliverFile(cid, file, ttl, progress, extra = {}) {
 
 /** Every received file goes here: routes group files to their group, checks content, acks. */
 async function receivedFile(cid, base, name, mime, bytes, extra = {}) {
+  if (extra.st) return onStatusPhoto(cid, extra.st, name, mime, bytes); // a status photo, not a chat message
   let key = cid, from;
   if (extra.gid) {
     if (!isMember(S.groups.get(extra.gid), cid)) return; // not from a member: drop
@@ -1510,6 +1544,7 @@ async function onAppMessage(cid, m) {
       break;
     }
     case 'edit': case 'del': applyEditOrDelete(cid, m); break;
+    case 'status': case 'status-del': case 'status-seen': onStatusMessage(cid, c, m); break;
     case 'read': {
       // Reciprocal: with receipts off for this contact we don't show theirs either.
       if (!receiptsOn(S.settings, c)) return;
@@ -1571,6 +1606,7 @@ function syncProfiles(only) {
       try { await deliver(c.id, msg); c.profileSent = sig; dirty = true; } catch { /* retried on next connect */ }
     }
     if (dirty) await persistContacts();
+    await syncStatuses(only); // statuses posted while they were away
   }).catch((e) => console.warn('profile sync:', e.message));
   return syncing;
 }
@@ -1807,8 +1843,7 @@ function messageActions(log, key) {
   const open = (target) => {
     const el = target.closest?.('[data-mid]'); if (!el) return;
     const m = findMsg(key, el.dataset.mid); if (!m || m.system) return;
-    navigator.vibrate?.(15);
-    messageMenu(key, m);
+    messageMenu(key, m, el);
   };
   log.addEventListener('contextmenu', (e) => { if (e.target.closest('[data-mid]')) { e.preventDefault(); open(e.target); } });
   log.addEventListener('pointerdown', (e) => {
@@ -1822,23 +1857,23 @@ function messageActions(log, key) {
   log.addEventListener('pointermove', (e) => { if (Math.hypot(e.clientX - sx, e.clientY - sy) > 10) clearTimeout(timer); }, { passive: true });
 }
 
-async function messageMenu(key, m) {
-  const left = (ms) => { const min = minutesLeft(m, ms); return min > 1 ? `${min} min left` : 'less than a minute left'; };
-  const actions = [['Cancel', false]];
-  if (canReply(m)) actions.push(['Reply', 'reply']);
-  if (canForward(m)) actions.push(['Forward', 'forward']);
-  if (m.text != null && !m.deleted) actions.push(['Copy', 'copy']);
-  if (canEdit(m)) actions.push([`Edit (${left(EDIT_WINDOW)})`, 'edit']);
-  actions.push(['Delete for me', 'me']);
-  if (canDeleteAll(m)) actions.push([`Delete for everyone (${left(DELETE_WINDOW)})`, 'all', 'danger']);
-  const choice = await modal({ title: m.dir === 'out' ? 'Your message' : 'Message',
-    body: [m.text != null ? h('p.quote', m.text.length > 200 ? `${m.text.slice(0, 200)}…` : m.text) : h('p.hint', m.deleted ? 'Deleted message' : m.file ? m.file.name : m.loc ? 'Location' : 'Message'),
-      m.dir === 'out' && !canDeleteAll(m) && !m.deleted ? h('p.hint', 'Too late to delete this for everyone (1-hour limit) — you can still remove it from this phone.') : null].filter(Boolean),
-    actions });
+async function messageMenu(key, m, el) {
+  const left = (ms) => { const min = minutesLeft(m, ms); return min > 1 ? `${min} min` : '< 1 min'; };
+  const items = [];
+  if (canReply(m)) items.push({ value: 'reply', label: 'Reply', icon: 'reply' });
+  if (canForward(m)) items.push({ value: 'forward', label: 'Forward', icon: 'forward' });
+  if (m.text != null && !m.deleted) items.push({ value: 'copy', label: 'Copy', icon: 'copy' });
+  if (m.file?.url && !isVoice(m)) items.push({ value: 'open', label: 'Open', icon: 'image' }); // voice notes: no file view, no Save
+  if (canEdit(m)) items.push({ value: 'edit', label: 'Edit', icon: 'pencil', hint: left(EDIT_WINDOW) });
+  items.push({ value: 'me', label: 'Delete for me', icon: 'trash', danger: true, divider: items.length > 0 });
+  if (canDeleteAll(m)) items.push({ value: 'all', label: 'Delete for everyone', icon: 'trash', danger: true, hint: left(DELETE_WINDOW) });
+  const note = m.dir === 'out' && !canDeleteAll(m) && !m.deleted ? 'Too late to delete for everyone (1-hour limit).' : '';
+  const choice = await spotlightMenu(el || document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`), { items, note, side: m.dir === 'out' ? 'right' : 'left' });
   try {
     if (choice === 'reply') setReply(key, m);
     else if (choice === 'forward') await forwardMessage(key, m);
     else if (choice === 'copy') { await navigator.clipboard.writeText(m.text); toast('Copied'); }
+    else if (choice === 'open') openViewer(m, key);
     else if (choice === 'edit') await editMessage(key, m);
     else if (choice === 'me') deleteForMe(key, m);
     else if (choice === 'all') await deleteForEveryone(key, m);
@@ -2056,13 +2091,24 @@ VIEWS.group = (gid) => {
     onFile: (file, kind, tags) => groupFile(g, file, kind, tags),
     onLocation: () => shareLocation(key, () => recipients(S.groups.get(gid), S.myCid).filter((c) => S.contacts.has(c))),
   });
-  return h('div.screen.chat',
+  const view = h('div.screen.chat',
     header(g.name, { back: () => go('home'), actions: [
       h('span.pill', { 'data-testid': 'group-size' }, `${g.members.length} people`),
       h('button.icon', { onclick: () => go('groupinfo', gid), 'aria-label': 'Group info', 'data-testid': 'group-info' }, icon('info'))] }),
     liveBanner(key),
     g.members.some((m) => m.cid !== S.myCid && !S.contacts.has(m.cid)) ? h('div.banner', h('p', icon('shield', 14), ' Some members aren’t your contacts: their names come from the group creator, and their messages reach you only through people you know.')) : null,
     log, h('p#chatstatus.chatstatus', { hidden: true }), comp);
+  applyLook(view, log, key);
+  return view;
+};
+
+// One chat's own colour and wallpaper (from its info screen).
+VIEWS.look = (key) => {
+  const o = ownerOf(key); if (!o) return VIEWS.home();
+  const isGroup = String(key).startsWith('g:');
+  return h('div.screen.full',
+    header('Chat colour & wallpaper', { back: () => (isGroup ? go('groupinfo', key.slice(2)) : go('contact', key)) }),
+    h('div.panel', { 'data-testid': 'look-page' }, h('p.hint', isGroup ? o.name : displayName(o)), ...lookEditor(key)));
 };
 async function sendGroupText(g, text, tags = {}) {
   if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
@@ -2095,6 +2141,8 @@ VIEWS.groupinfo = (gid) => {
   const amAdmin = g.admin === S.myCid;
   return h('div.screen.full', header(g.name, { back: () => go('group', gid) }),
     h('div.settings',
+      h('button.setrow', { type: 'button', onclick: () => go('look', `g:${gid}`), 'data-testid': 'group-look' },
+        h('span.seticon', icon('palette', 20)), h('span.settext', h('strong', 'Chat colour & wallpaper'), h('small', g.look ? 'Custom for this group' : 'Same as all chats')), icon('chevron', 18)),
       h('h2', `Members (${g.members.length})`),
       h('ul.picklist', { 'data-testid': 'member-list' }, g.members.map((m) => {
         const c = S.contacts.get(m.cid);
@@ -2241,6 +2289,8 @@ VIEWS.contact = (id) => {
         toast(c.noCalls ? `${displayName(c)} can no longer call you` : `${displayName(c)} can call you again`);
       } }), ` Allow ${displayName(c)} to call me`),
       h('p.hint', c.calls && !c.calls.voice && !c.calls.video ? `${displayName(c)} doesn’t accept calls right now.` : ''),
+      h('button.setrow', { type: 'button', onclick: () => go('look', id), 'data-testid': 'contact-look' },
+        h('span.seticon', icon('palette', 20)), h('span.settext', h('strong', 'Chat colour & wallpaper'), h('small', c.look ? 'Custom for this chat' : 'Same as all chats')), icon('chevron', 18)),
       h('h2', 'Read receipts'),
       h('select', { 'data-testid': 'contact-receipts', 'aria-label': 'Read receipts for this contact', onchange: async (e) => {
         if (e.target.value === 'default') delete c.receipts; else c.receipts = e.target.value;
@@ -2288,18 +2338,20 @@ async function deleteContact(id) {
 }
 
 // ---- media, links and docs shared with one contact ----
+/** Media = photos, videos and voice notes (voice gets its own list under the grid); Docs = files. */
 function sharedItems(id) {
-  const media = [], docs = [], links = [];
+  const media = [], voice = [], docs = [], links = [];
   for (const m of S.chats.get(id) || []) {
     if (m.deleted) continue;
     if (m.file) {
+      if (m.file.kind === 'voice') { voice.push(m); continue; }
       const isMedia = m.file.safety?.inline || m.file.playable === 'video' || (!m.file.url && /^(image|video)\//.test(m.file.mime || ''));
       (isMedia ? media : docs).push(m);
     } else if (m.text) {
       for (const seg of linkify(m.text)) if (seg.type === 'link') links.push({ m, seg });
     }
   }
-  return { media: media.reverse(), docs: docs.reverse(), links: links.reverse() };
+  return { media: media.reverse(), voice: voice.reverse(), docs: docs.reverse(), links: links.reverse() };
 }
 // ---- full-screen viewer: the photo/video/file, what it really is, and what you can do with it ----
 function fileInfo(m, img) {
@@ -2344,23 +2396,23 @@ VIEWS.shared = (id, tab = 'media') => {
   const c = S.contacts.get(id);
   if (!c) return VIEWS.home();
   const k = sharedItems(id);
-  const tabs = [['media', 'Media', k.media.length], ['docs', 'Docs', k.docs.length], ['links', 'Links', k.links.length]];
+  const tabs = [['media', 'Media', k.media.length + k.voice.length], ['docs', 'Docs', k.docs.length], ['links', 'Links', k.links.length]];
   const when = (m) => new Date(m.ts).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
   const empty = (t) => h('p.empty', t);
   let body;
   if (tab === 'media') {
-    body = k.media.length ? h('div.mediagrid', { 'data-testid': 'shared-media' }, k.media.map((m) => h('button.thumb', { type: 'button', onclick: () => m.file.url && openViewer(m, id, { fromShared: true }), 'aria-label': kindLabel(kindOf(m)) },
-      !m.file.url ? h('span.hint', '…') : m.file.playable === 'video' ? [h('video', { src: m.file.url, preload: 'metadata', muted: true, playsinline: true }), h('span.play', '▶')] : h('img', { src: m.file.url, alt: '' }))))
-      : empty('No photos or videos yet.');
+    const grid = k.media.length ? h('div.mediagrid', { 'data-testid': 'shared-media' }, k.media.map((m) => h('button.thumb', { type: 'button', onclick: () => m.file.url && openViewer(m, id, { fromShared: true }), 'aria-label': kindLabel(kindOf(m)) },
+      !m.file.url ? h('span.hint', '…') : m.file.playable === 'video' ? [h('video', { src: m.file.url, preload: 'metadata', muted: true, playsinline: true }), h('span.play', '▶')] : h('img', { src: m.file.url, alt: '' })))) : null;
+    const voices = k.voice.length ? [h('h2', 'Voice messages'), h('ul.doclist.voicelist', { 'data-testid': 'shared-voice' }, k.voice.map((m) => h('li',
+      h('div.docinfo', icon('mic', 18), h('div', h('strong', m.dir === 'out' ? 'You' : displayName(c)), h('small', when(m)))),
+      m.file.url && m.file.blob ? voicePlayer({ blob: m.file.blob, url: m.file.url, compact: true }) : h('span.hint', 'Loading…'))))] : null;
+    body = grid || voices ? [grid, voices] : empty('No photos, videos or voice messages yet.');
   } else if (tab === 'docs') {
     body = k.docs.length ? h('ul.doclist', { 'data-testid': 'shared-docs' }, k.docs.map((m) => h('li',
-      isVoice(m)
-        ? [h('div.docinfo', icon('mic', 18), h('div', h('strong', 'Voice message'), h('small', `${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
-          voicePlayer({ blob: m.file.blob, url: m.file.url, compact: true })]
-        : [h('div.docinfo', icon('clip', 18), h('div', h('strong', m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
-          m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
-          m.file.url ? h('button', { type: 'button', onclick: () => openViewer(m, id, { fromShared: true }), 'data-testid': 'doc-open' }, 'Open') : h('span.hint', 'Loading…')])))
-      : empty('No files or voice messages yet.');
+      h('div.docinfo', h('span.docbadge', typeLabel(m.file.safety?.realType || m.file.mime, m.file.name)), h('div', h('strong', m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
+      m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
+      m.file.url ? h('button', { type: 'button', onclick: () => openViewer(m, id, { fromShared: true }), 'data-testid': 'doc-open' }, 'Open') : h('span.hint', 'Loading…'))))
+      : empty('No documents yet.');
   } else {
     body = k.links.length ? h('ul.linklist', { 'data-testid': 'shared-links' }, k.links.map(({ m, seg }) => h('li',
       h(`button.inlink.risk-${seg.analysis.risk}`, { type: 'button', onclick: () => checkLink(seg, id, m.dir) }, seg.text),
@@ -2485,7 +2537,7 @@ VIEWS.moveout = () => {
   const cancel = async () => {
     cancelled = true;
     if (keys) await readBox(RELAY_URL, keys.box, { ack: true }).catch(() => {});
-    if (S.vault) { await startRemote().catch(() => {}); go('settings'); toast('Move cancelled — nothing changed'); }
+    if (S.vault) { await startRemote().catch(() => {}); go('settings', 'backups'); toast('Move cancelled — nothing changed'); }
   };
   (async () => {
     stopRemote(); // freeze: from now on this phone's state must not move
@@ -2754,48 +2806,540 @@ function callToggle(kind, label) {
   } }), ` ${label}`);
 }
 
-VIEWS.settings = () => {
-  const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
-  const lockSel = h('select', { 'aria-label': 'Auto-lock' }, LOCK_OPTIONS.map(([v, l]) => h('option', { value: v, selected: S.settings.autoLockMin === v }, l)));
-  const wipeSel = h('select', { 'aria-label': 'Wipe after failed attempts' });
-  Vault.meta(SLOTS.a).then((m) => m?.wipeAfter ?? 0).then((n) => {
-    const opts = WIPE_OPTIONS.some(([v]) => v === n) ? WIPE_OPTIONS : [...WIPE_OPTIONS, [n, `After ${n} wrong tries`]]; // keep an older choice visible
-    for (const [v, l] of opts) wipeSel.append(h('option', { value: v, selected: n === v }, l));
-  });
-  const oldP = h('input', { type: 'password', placeholder: 'Current passphrase', autocomplete: 'current-password' });
-  const newP = h('input', { type: 'password', placeholder: `New passphrase (${MIN_PASSPHRASE}+ chars)`, autocomplete: 'new-password' });
-  const fp = h('code.small', { 'data-testid': 'build-fp' }, 'unavailable');
-  fetch('./build-info.json').then((r) => r.json()).then((b) => { fp.textContent = b.fingerprint; }).catch(() => {});
-  const myId = h('code.small', '…');
-  contactId(S.vault.identity.publicRaw).then((x) => { myId.textContent = x.match(/.{4}/g).slice(0, 4).join(' '); });
-  const sw = h('span', { 'data-testid': 'offline-status' }, navigator.serviceWorker?.controller ? 'Installed — works with no network'
-    : offlineError || 'Not installed yet (reload once while online)');
+// ---- Settings: a home screen of plain-language categories, each opening its own page ----
+// Every row says what's inside ("Name, photo, username"), and the search box finds a setting
+// by the words people actually use ("backup", "lock", "blue ticks") — no hunting through a long page.
+// ---------------------------------------------------------------- status (24-hour updates)
+// Rules and validation: core/status.js. A status is sent — end-to-end encrypted, like a message —
+// to each contact in your audience; nothing is posted to a server. People who were offline get
+// it when they're next reachable (syncProfiles → syncStatuses). Every phone drops it after 24 h.
+const STATUS_REC = 'statuses';
+const STATUS_PHOTO = (id) => `status/${id}`;
+const MAX_LIVE_PER_PERSON = 30; // a contact can't flood your phone with statuses
+let statusSaving = Promise.resolve();
+const myStatuses = () => S.statuses.get(S.myCid) || [];
+function statusAudienceLabel() {
+  const a = cleanAudience(S.settings?.statusAudience);
+  const people = (n) => `${n} ${n === 1 ? 'person' : 'people'}`;
+  return a.mode === 'all' ? 'all contacts' : a.mode === 'except' ? `all contacts except ${people(a.list.length)}` : `only ${people(a.list.length)}`;
+}
+async function loadStatuses(vault) {
+  const now = Date.now();
+  const all = live(await vault.getRecord(STATUS_REC, []), now);
+  S.statuses = new Map();
+  for (const s of all) { if (!S.statuses.has(s.by)) S.statuses.set(s.by, []); S.statuses.get(s.by).push(s); }
+  for (const s of all) if (s.kind === 'photo') {
+    const rec = await vault.getRecord(STATUS_PHOTO(s.id), null);
+    if (rec?.b64) { s.blob = new Blob([fromB64u(rec.b64)], { type: rec.mime || 'image/jpeg' }); s.url = URL.createObjectURL(s.blob); }
+  }
+}
+function persistStatuses() {
+  statusSaving = statusSaving.then(() => S.vault?.putRecord(STATUS_REC, [...S.statuses.values()].flat().map(({ blob: _b, url: _u, ...rest }) => rest)))
+    .catch((e) => console.warn('status save:', e.message));
+  return statusSaving;
+}
+function dropStatus(s) {
+  const list = S.statuses.get(s.by) || [];
+  S.statuses.set(s.by, list.filter((x) => x.id !== s.id));
+  if (!S.statuses.get(s.by).length) S.statuses.delete(s.by);
+  if (s.url) URL.revokeObjectURL(s.url);
+  if (s.kind === 'photo') S.vault?.deleteRecord(STATUS_PHOTO(s.id)).catch(() => {});
+}
+/** Every minute: statuses older than 24 h disappear from this phone. */
+function purgeStatuses() {
+  if (!S.vault || !S.statuses) return;
+  const now = Date.now(); let gone = 0;
+  for (const s of [...S.statuses.values()].flat()) if (s.exp <= now) { dropStatus(s); gone++; }
+  if (gone) { persistStatuses(); rerenderIf('status'); rerenderIf('home'); }
+}
+setInterval(purgeStatuses, 60_000);
+function addStatus(s) {
+  if (!S.statuses.has(s.by)) S.statuses.set(s.by, []);
+  const list = S.statuses.get(s.by);
+  if (list.some((x) => x.id === s.id)) return false;
+  list.push(s); list.sort((a, b) => a.ts - b.ts);
+  while (s.by !== S.myCid && list.length > MAX_LIVE_PER_PERSON) dropStatus(list[0]);
+  persistStatuses(); rerenderIf('status'); rerenderIf('home');
+  return true;
+}
+const hasUnseenStatus = () => statusRows(new Map([...(S.statuses || new Map())].filter(([cid]) => cid !== S.myCid))).some((r) => r.unseen);
 
-  return h('div.screen.full',
-    header('Settings', { back: () => go('home') }),
+// -- sending
+const reachable = (cid) => isOnline(cid) || (hasRemote(cid) && S.remote?.canSend(cid));
+async function sendStatusTo(cid, s) {
+  if (s.kind === 'text') await deliver(cid, { t: 'status', id: s.id, ts: s.ts, kind: 'text', text: s.text, bg: s.bg, font: s.font });
+  else await deliverFile(cid, new File([s.blob], 'status.jpg', { type: s.blob.type || 'image/jpeg' }), 0, () => {}, { st: { id: s.id, ts: s.ts, cap: s.cap || '' } });
+}
+/** Send my live statuses to everyone in my audience who doesn't have them yet. */
+async function syncStatuses(only) {
+  if (!S.vault || !S.statuses) return;
+  const people = audience(S.settings.statusAudience, [...S.contacts.values()]);
+  let dirty = false;
+  for (const s of live(myStatuses())) {
+    s.sentTo ||= [];
+    for (const cid of people) {
+      if ((only && !only.includes(cid)) || s.sentTo.includes(cid) || !reachable(cid)) continue;
+      try { await sendStatusTo(cid, s); s.sentTo.push(cid); dirty = true; } catch (e) { console.warn('status send:', e.message); }
+    }
+  }
+  if (dirty) persistStatuses();
+}
+async function postStatus(s) {
+  Object.assign(s, { id: newId(), by: S.myCid, ts: Date.now(), views: {}, sentTo: [] });
+  s.exp = expiresAt(s.ts);
+  if (s.kind === 'photo') await S.vault.putRecord(STATUS_PHOTO(s.id), { b64: toB64u(new Uint8Array(await s.blob.arrayBuffer())), mime: s.blob.type });
+  addStatus(s);
+  const n = audience(S.settings.statusAudience, [...S.contacts.values()]).length;
+  toast(n ? `Status posted — ${n} ${n === 1 ? 'contact' : 'contacts'} can see it for 24 hours` : 'Status posted (no contacts can see it yet — check Privacy → Status)', 'success', 4500);
+  syncStatuses().catch(() => {});
+}
+async function deleteMyStatus(s) {
+  for (const cid of s.sentTo || []) deliver(cid, { t: 'status-del', id: s.id }).catch(() => {});
+  dropStatus(s); persistStatuses(); rerenderIf('status'); rerenderIf('home');
+  toast('Status deleted — removed from your contacts’ phones too');
+}
+
+// -- receiving
+function onStatusMessage(cid, c, m) {
+  if (c.request) return; // a stranger's invite can't push statuses at you
+  if (m.t === 'status') {
+    const s = readStatus(m); if (!s) return;
+    addStatus({ ...s, by: cid, seen: false });
+  } else if (m.t === 'status-del') {
+    const id = readStatusId(m); const s = (S.statuses.get(cid) || []).find((x) => x.id === id);
+    if (s) { dropStatus(s); persistStatuses(); rerenderIf('status'); rerenderIf('home'); }
+  } else if (m.t === 'status-seen') {
+    const id = readStatusId(m); const s = myStatuses().find((x) => x.id === id);
+    // Counted only if we really sent it to them, and only while our own receipts are on for them (reciprocal).
+    if (!s || !(s.sentTo || []).includes(cid) || !receiptsOn(S.settings, c)) return;
+    if (!s.views[cid]) { s.views[cid] = Date.now(); persistStatuses(); rerenderIf('status'); }
+  }
+}
+async function onStatusPhoto(cid, st, name, mime, bytes) {
+  const c = S.contacts.get(cid); if (!c || c.request) return;
+  const tag = statusTag(st); if (!tag) return;
+  const safety = inspectFile(name, mime, bytes);
+  if (!safety.inline) return; // only real, displayable images become a status photo
+  const blob = new Blob([bytes], { type: safety.realType });
+  const s = { ...tag, by: cid, kind: 'photo', blob, url: URL.createObjectURL(blob), seen: false };
+  if (!addStatus(s)) { URL.revokeObjectURL(s.url); return; }
+  await S.vault.putRecord(STATUS_PHOTO(s.id), { b64: toB64u(bytes), mime: safety.realType });
+}
+
+// -- the Status screen
+function statusRing(cid, statuses, size = 'md') {
+  const n = statuses.length, unseen = statuses.filter((s) => !s.seen).length;
+  const c = cid === S.myCid ? null : S.contacts.get(cid);
+  return h(`span.ring.${size}${cid !== S.myCid && unseen ? '.unseen' : ''}`, { style: { '--n': Math.max(1, n) }, 'data-count': n },
+    cid === S.myCid ? h('span.avatar.md', myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase()) : avatar(c, { size: 'md' }));
+}
+VIEWS.status = () => {
+  const mine = live(myStatuses());
+  const rows = statusRows(new Map([...S.statuses].filter(([cid]) => cid !== S.myCid && S.contacts.has(cid))));
+  const fresh = rows.filter((r) => r.unseen), seen = rows.filter((r) => !r.unseen);
+  const photoIn = h('input', { type: 'file', accept: 'image/*', hidden: true, 'data-testid': 'status-photo-input', onchange: async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    try { await openPhotoStatusComposer(f); } catch (ex) { toast(ex.message, 'error'); }
+  } });
+  const row = (r) => h('li', h('button.contact.statusrow', { type: 'button', onclick: () => openStatusViewer(rows.map((x) => x.cid), r.cid), 'data-testid': `status-${displayName(S.contacts.get(r.cid))}` },
+    statusRing(r.cid, r.statuses), h('span.settext', h('strong', displayName(S.contacts.get(r.cid))), h('small', `${ago(r.latest)}${r.statuses.length > 1 ? ` · ${r.statuses.length} updates` : ''}`))));
+  return h('div.screen.full.tabbed',
+    header('Status', { actions: [
+      h('button.icon', { onclick: () => openTextStatusComposer(), 'aria-label': 'New text status', 'data-testid': 'status-new-text' }, icon('pencil')),
+      h('button.icon', { onclick: () => photoIn.click(), 'aria-label': 'New photo status', 'data-testid': 'status-new-photo' }, icon('camera'))] }),
     h('div.panel',
-      h('h2', 'You'),
-      profileEditor(nameIn),
-      h('p.hint', 'Identity key: ', myId),
+      h('ul.contacts', h('li', h('button.contact.statusrow', { type: 'button', 'data-testid': 'status-mine', onclick: () => (mine.length ? openStatusViewer([S.myCid], S.myCid) : openTextStatusComposer()) },
+        mine.length ? statusRing(S.myCid, mine) : h('span.avatar.md.addring', myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase(), h('span.plus', icon('plus', 14))),
+        h('span.settext', h('strong', 'My status'), h('small', mine.length ? `${mine.length} ${mine.length === 1 ? 'update' : 'updates'} · ${ago(mine[mine.length - 1].ts)}` : 'Tap to add a status update'))))),
+      h('div.share.statusadd',
+        h('button', { onclick: () => openTextStatusComposer(), 'data-testid': 'status-add-text' }, icon('text', 18), ' Text'),
+        h('button', { onclick: () => photoIn.click(), 'data-testid': 'status-add-photo' }, icon('camera', 18), ' Photo')),
+      photoIn,
+      fresh.length ? [h('h2', 'Recent'), h('ul.contacts', fresh.map(row))] : null,
+      seen.length ? [h('h2', 'Viewed'), h('ul.contacts', seen.map(row))] : null,
+      !rows.length ? h('p.empty', 'No status updates from your contacts right now. Theirs appear here for 24 hours.') : null,
+      h('p.hint.center', icon('shield', 14), ` Visible to ${statusAudienceLabel()} · end-to-end encrypted · gone after 24 h. `,
+        h('button.linkish', { onclick: () => go('settings', 'privacy'), 'data-testid': 'status-privacy-link' }, 'Change'))),
+    tabBar('status'));
+};
 
-      h('h2', 'Calls'),
-      callToggle('voice', 'Allow voice calls'),
-      callToggle('video', 'Allow video calls'),
-      h('p.hint', 'When off, your contacts don’t see the call button, and calls are refused even if someone tries. You can also block calls from one person in their contact info.'),
-      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.calls?.hideIp !== false, 'data-testid': 'hide-ip', onchange: async (e) => {
-        S.settings.calls = { ...(S.settings.calls || {}), hideIp: e.target.checked }; await S.vault.putRecord('settings', S.settings);
-      } }), ' Hide my IP address on internet calls'),
-      h('p.hint', 'On: calls go through the encrypted relay, so the other person never learns your IP address (slightly more delay). Off: a direct connection when possible. Calls are end-to-end encrypted either way. Nearby calls without internet are always direct.'),
+/** Bottom navigation on the main screens. */
+function tabBar(active) {
+  const tab = (id, label, ic, to, dot) => h(`button.tab${active === id ? '.on' : ''}`, { type: 'button', onclick: to, 'aria-current': active === id ? 'page' : null, 'data-testid': id === 'settings' ? 'settings' : `tab-${id}` },
+    h('span.tabicon', icon(ic, 22), dot ? h('span.tabdot', { 'data-testid': `tabdot-${id}` }) : null), h('span', label));
+  const unread = [...S.unread.values()].reduce((a, b) => a + b, 0);
+  return h('nav.tabbar', { 'aria-label': 'Main' },
+    tab('chats', 'Chats', 'chat', () => go('home'), unread > 0),
+    tab('status', 'Status', 'status', () => go('status'), hasUnseenStatus()),
+    tab('settings', 'Settings', 'gear', () => go('settings')));
+}
 
-      h('h2', 'Security'),
+// -- composing
+function openTextStatusComposer() {
+  closeStatusOverlay();
+  let bg = 0, font = 0;
+  const ta = h('textarea.sttext', { maxlength: MAX_STATUS_TEXT, placeholder: 'Type a status', 'aria-label': 'Status text', 'data-testid': 'status-text', rows: 4 });
+  const count = h('small.stcount', `0 / ${MAX_STATUS_TEXT}`);
+  const stage = h(`div.ststage.stbg-${STATUS_BGS[bg]}.stfont-${STATUS_FONTS[font]}`, ta);
+  const setCls = () => { stage.className = `ststage stbg-${STATUS_BGS[bg]} stfont-${STATUS_FONTS[font]}`; };
+  ta.addEventListener('input', () => { count.textContent = `${ta.value.length} / ${MAX_STATUS_TEXT}`; });
+  const ov = h('div.stoverlay', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'New text status', 'data-testid': 'status-composer' },
+    h('div.sttop',
+      h('button.icon', { onclick: closeStatusOverlay, 'aria-label': 'Close', 'data-testid': 'status-close' }, icon('close')),
+      h('span.grow'),
+      h('button.icon', { onclick: () => { font = (font + 1) % STATUS_FONTS.length; setCls(); ta.focus(); }, 'aria-label': 'Change font', 'data-testid': 'status-font' }, icon('text')),
+      h('button.icon', { onclick: () => { bg = (bg + 1) % STATUS_BGS.length; setCls(); ta.focus(); }, 'aria-label': 'Change background colour', 'data-testid': 'status-bg' }, icon('palette'))),
+    stage,
+    h('div.stbottom', count, h('span.grow'), h('small', icon('shield', 12), ` ${statusAudienceLabel()}`),
+      h('button.primary.round', { 'aria-label': 'Post status', 'data-testid': 'status-post', onclick: async () => {
+        const text = ta.value.trim(); if (!text) { ta.focus(); return; }
+        closeStatusOverlay();
+        await postStatus({ kind: 'text', text, bg: STATUS_BGS[bg], font: STATUS_FONTS[font] });
+      } }, icon('send', 20))));
+  document.body.append(ov);
+  ta.focus();
+}
+async function openPhotoStatusComposer(file) {
+  const prep = await prepareOutgoing(file); // downscaled, re-drawn: no location/camera data
+  if (!/^image\//.test(prep.file.type)) throw new Error('A status photo must be a photo');
+  closeStatusOverlay();
+  const url = URL.createObjectURL(prep.file);
+  const cap = h('input.stcap', { type: 'text', maxlength: MAX_CAPTION, placeholder: 'Add a caption…', 'aria-label': 'Caption', 'data-testid': 'status-caption' });
+  const ov = h('div.stoverlay.photo', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'New photo status', 'data-testid': 'status-composer' },
+    h('div.sttop', h('button.icon', { onclick: () => { URL.revokeObjectURL(url); closeStatusOverlay(); }, 'aria-label': 'Close', 'data-testid': 'status-close' }, icon('close'))),
+    h('div.ststage', h('img.stimg', { src: url, alt: 'Your status photo' })),
+    h('div.stbottom', cap, h('button.primary.round', { 'aria-label': 'Post status', 'data-testid': 'status-post', onclick: async () => {
+      URL.revokeObjectURL(url); closeStatusOverlay();
+      await postStatus({ kind: 'photo', blob: prep.file, url: URL.createObjectURL(prep.file), cap: cap.value.trim().slice(0, MAX_CAPTION) });
+    } }, icon('send', 20))));
+  document.body.append(ov);
+}
+function closeStatusOverlay() { const o = document.querySelector('.stoverlay'); if (!o) return; o.stop?.(); o.remove(); }
+
+// -- viewing: progress bars, tap right/left to move, hold to pause, auto-advance
+function openStatusViewer(order, startCid) {
+  closeStatusOverlay();
+  let oi = Math.max(0, order.indexOf(startCid)), si = 0, timer = 0, started = 0, left = 0, paused = false;
+  const bars = h('div.stbars'), who = h('strong'), when = h('small'), stage = h('div.ststage'), bottom = h('div.stbottom');
+  const ov = h('div.stoverlay.viewer', { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Status', 'data-testid': 'status-viewer' },
+    bars,
+    h('div.sttop', h('button.icon', { onclick: () => close(), 'aria-label': 'Close', 'data-testid': 'status-close' }, icon('close')), h('div.stwho', who, when), h('span.grow')),
+    stage, bottom);
+  const listOf = (cid) => live(S.statuses.get(cid) || []).sort((a, b) => a.ts - b.ts);
+  const close = () => { clearTimeout(timer); ov.remove(); document.removeEventListener('keydown', keys); rerenderIf('status'); rerenderIf('home'); };
+  ov.stop = () => { clearTimeout(timer); document.removeEventListener('keydown', keys); };
+  const pause = () => { if (paused) return; paused = true; clearTimeout(timer); left -= Date.now() - started; ov.classList.add('paused'); };
+  const resume = () => { if (!paused) return; paused = false; started = Date.now(); timer = setTimeout(next, left); ov.classList.remove('paused'); };
+  function next() { const l = listOf(order[oi]); if (si + 1 < l.length) { si++; show(); } else if (oi + 1 < order.length) { oi++; si = 0; jumpUnseen(); show(); } else close(); }
+  function prev() { if (si > 0) { si--; show(); } else if (oi > 0) { oi--; si = Math.max(0, listOf(order[oi]).length - 1); show(); } else show(); }
+  function jumpUnseen() { const l = listOf(order[oi]); const k = l.findIndex((s) => !s.seen); si = order[oi] === S.myCid || k < 0 ? 0 : k; }
+  function show() {
+    clearTimeout(timer); paused = false; ov.classList.remove('paused');
+    const cid = order[oi], list = listOf(cid), s = list[si];
+    if (!s) { close(); return; }
+    const mineNow = cid === S.myCid;
+    who.textContent = mineNow ? 'My status' : displayName(S.contacts.get(cid));
+    when.textContent = ago(s.ts);
+    bars.replaceChildren(...list.map((_, i) => h(`span.stbar${i < si ? '.done' : i === si ? '.now' : ''}`, { style: { '--dur': `${showFor(s)}ms` } }, h('i'))));
+    stage.className = s.kind === 'text' ? `ststage stbg-${s.bg} stfont-${s.font}` : 'ststage';
+    // replaceChildren takes nodes as separate arguments — an array would be turned into the text
+    // "[object HTMLImageElement]…" (it was, until the e2e test looked at the screen).
+    stage.replaceChildren(...(s.kind === 'text' ? [h('p.stshow', { 'data-testid': 'status-shown' }, s.text)]
+      : [h('img.stimg', { src: s.url || '', alt: 'Status photo', 'data-testid': 'status-shown-photo' }), s.cap ? h('p.stcapshow', s.cap) : null].filter(Boolean)));
+    // Mark seen; tell the owner only if my receipts are on for them (reciprocal, like read receipts).
+    if (!mineNow && !s.seen) {
+      s.seen = true; persistStatuses();
+      const c = S.contacts.get(cid);
+      if (c && receiptsOn(S.settings, c)) deliver(cid, { t: 'status-seen', id: s.id }).catch(() => {});
+    }
+    if (mineNow) {
+      const viewers = Object.entries(s.views || {});
+      bottom.replaceChildren(
+        h('button.stseen', { 'data-testid': 'status-seen-by', onclick: () => {
+          pause();
+          modal({ title: viewers.length ? `Seen by ${viewers.length}` : 'No views yet', body: viewers.length
+            ? [h('ul.picklist', viewers.sort((a, b) => b[1] - a[1]).map(([vc, t]) => h('li', h('span', displayName(S.contacts.get(vc)) || 'Someone'), h('small', ago(t)))))]
+            : ['Views show here when people with read receipts on look at it.'], actions: [['Close', true]] }).then(resume);
+        } }, icon('eye', 18), ` ${viewers.length}`),
+        h('span.grow'),
+        h('button.icon', { 'aria-label': 'Delete this status', 'data-testid': 'status-delete', onclick: async () => {
+          pause();
+          if (await modal({ title: 'Delete this status?', body: ['It disappears from your contacts’ phones too.'], actions: [['Cancel', false], ['Delete', true, 'danger']] })) { await deleteMyStatus(s); if (listOf(cid).length) { si = Math.min(si, listOf(cid).length - 1); show(); } else close(); }
+          else resume();
+        } }, icon('trash', 20)));
+    } else {
+      const replyIn = h('input.streply', { type: 'text', placeholder: `Reply to ${displayName(S.contacts.get(cid))}…`, 'aria-label': 'Reply', 'data-testid': 'status-reply',
+        onfocus: pause, onblur: () => { if (!replyIn.value) resume(); } });
+      bottom.replaceChildren(replyIn, h('button.primary.round', { 'aria-label': 'Send reply', 'data-testid': 'status-reply-send', onclick: async () => {
+        const text = replyIn.value.trim(); if (!text) return;
+        try {
+          await sendTextTo(cid, text, { re: { id: s.id, by: cid, k: 'status', t: s.kind === 'text' ? s.text : s.cap || 'Photo' } });
+          replyIn.value = ''; toast('Reply sent', 'success'); replyIn.blur(); resume();
+        } catch (e) { toast(e.message, 'error'); }
+      } }, icon('send', 18)));
+    }
+    left = showFor(s); started = Date.now(); timer = setTimeout(next, left);
+  }
+  // Tap the right two-thirds → next, left third → back; press and hold → pause.
+  let downAt = 0;
+  stage.addEventListener('pointerdown', () => { downAt = Date.now(); pause(); });
+  stage.addEventListener('pointerup', (e) => {
+    const held = Date.now() - downAt > 300;
+    if (held) { resume(); return; }
+    const r = stage.getBoundingClientRect();
+    if (e.clientX - r.left < r.width / 3) prev(); else next();
+  });
+  stage.addEventListener('pointercancel', resume);
+  function keys(e) { if (e.key === 'Escape') close(); else if (e.key === 'ArrowRight') next(); else if (e.key === 'ArrowLeft') prev(); }
+  document.addEventListener('keydown', keys);
+  document.body.append(ov);
+  jumpUnseen(); show();
+}
+
+function statusPrivacyEditor() {
+  const a = cleanAudience(S.settings.statusAudience);
+  const save = async (next) => { S.settings.statusAudience = cleanAudience(next); await S.vault.putRecord('settings', S.settings); render(); };
+  const people = [...S.contacts.values()].filter((c) => !c.request).sort((x, y) => displayName(x).localeCompare(displayName(y)));
+  const radio = (mode, label, sub) => h('label.radio', h('input', { type: 'radio', name: 'st-aud', checked: a.mode === mode, 'data-testid': `status-aud-${mode}`, onchange: () => save({ mode, list: a.mode === mode ? a.list : [] }) }),
+    h('span', h('strong', label), h('small', sub)));
+  return [
+    h('h2', 'Status'),
+    h('p.hint', 'Who can see your status updates. Applies to updates you post from now on.'),
+    radio('all', 'My contacts', 'Everyone you’ve accepted'),
+    radio('except', 'My contacts except…', 'Hide from some people'),
+    radio('only', 'Only share with…', 'Just the people you pick'),
+    a.mode !== 'all' ? h('ul.picklist', { 'data-testid': 'status-aud-list' }, people.map((c) => h('li', h('label.toggle', h('input', { type: 'checkbox', checked: a.list.includes(c.id), 'data-testid': `status-aud-${displayName(c)}`,
+      onchange: (e) => save({ mode: a.mode, list: e.target.checked ? [...a.list, c.id] : a.list.filter((x) => x !== c.id) }) }), ' ', displayName(c))))) : null,
+  ];
+}
+
+// ---- theme (device-wide) ----
+// The theme is a plain UI preference kept in localStorage — the same for every vault on this
+// phone ON PURPOSE: if the real and the decoy (duress) vault had different themes, the lock
+// screen's colours would reveal which one was used last. It says nothing else about you.
+const THEME_KEY = 'murmur-theme';
+function themeChoice() { try { const t = localStorage.getItem(THEME_KEY); return ['dark', 'light', 'system'].includes(t) ? t : 'dark'; } catch { return 'dark'; } }
+function applyTheme(choice = themeChoice()) {
+  const v = ['dark', 'light', 'system'].includes(choice) ? choice : 'dark';
+  document.documentElement.dataset.theme = v;
+  try { localStorage.setItem(THEME_KEY, v); } catch { /* private mode: still applies for this session */ }
+  // The phone's status bar follows the theme too.
+  requestAnimationFrame(() => document.querySelector('meta[name="theme-color"]')?.setAttribute('content', getComputedStyle(document.documentElement).getPropertyValue('--bg').trim() || '#101c2c'));
+}
+applyTheme();
+matchMedia('(prefers-color-scheme: light)').addEventListener?.('change', () => { if (themeChoice() === 'system') applyTheme('system'); });
+
+// ---- chat colour & wallpaper (all chats, or one chat) ----
+// The default look lives in the vault's settings; a chat's own look (contact.look / group.look)
+// overrides it field by field. A photo wallpaper is stored ENCRYPTED in the vault (record
+// wall/<scope>), downscaled and re-drawn so it carries no location/camera data, and shown via a
+// blob: URL — it never leaves the phone and isn't sent to anyone.
+const WALL_URLS = new Map(); // scope → blob URL (memory only)
+const wallScope = (key) => (key == null || key === 'default' ? 'default' : key);
+function ownerOf(scope) { return scope === 'default' ? null : String(scope).startsWith('g:') ? S.groups.get(String(scope).slice(2)) : S.contacts.get(scope); }
+const lookFor = (key) => effectiveLook(S.settings?.look, key ? ownerOf(key)?.look : null);
+async function saveLook(scope, patch) {
+  if (scope === 'default') { S.settings.look = cleanLook({ ...S.settings.look, ...patch }); await S.vault.putRecord('settings', S.settings); return; }
+  const o = ownerOf(scope); if (!o) return;
+  o.look = { ...(o.look || {}), ...patch };
+  for (const [k, v] of Object.entries(o.look)) if (v === 'default') delete o.look[k];
+  if (!Object.keys(o.look).length) delete o.look;
+  await (String(scope).startsWith('g:') ? persistGroups() : persistContacts());
+}
+/** Which stored photo a chat shows: its own if it chose "photo", else the default one. */
+function wallPhotoScope(key) {
+  const own = key ? ownerOf(key)?.look : null;
+  return own?.wall === 'photo' ? key : 'default';
+}
+async function wallUrl(scope) {
+  if (WALL_URLS.has(scope)) return WALL_URLS.get(scope);
+  const rec = await S.vault.getRecord(`wall/${scope}`, null);
+  if (!rec?.b64) return null;
+  const url = URL.createObjectURL(new Blob([fromB64u(rec.b64)], { type: 'image/jpeg' }));
+  WALL_URLS.set(scope, url);
+  return url;
+}
+async function makeWallpaper(file) {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width * scale); cv.height = Math.round(bmp.height * scale);
+  cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close?.();
+  const b = await new Promise((res) => cv.toBlob(res, 'image/jpeg', 0.8));
+  if (!b) throw new Error('Couldn’t read that photo');
+  return toB64u(new Uint8Array(await b.arrayBuffer()));
+}
+async function setWallPhoto(scope, file) {
+  const b64 = await makeWallpaper(file);
+  await S.vault.putRecord(`wall/${scope}`, { b64 });
+  if (WALL_URLS.has(scope)) { URL.revokeObjectURL(WALL_URLS.get(scope)); WALL_URLS.delete(scope); }
+  await saveLook(scope, { wall: 'photo' });
+}
+/** Paint a chat screen with its look: bubble colours (with readable text) and the wallpaper. */
+function applyLook(screenEl, logEl, key) {
+  const look = lookFor(key);
+  for (const [k, v] of Object.entries(bubbleVars(look.bubble))) screenEl.style.setProperty(k, v);
+  for (const w of WALLS) logEl.classList.remove(`wall-${w.id}`);
+  logEl.classList.remove('wall-photo', 'wall-dim');
+  logEl.classList.add(`wall-${look.wall}`);
+  if (look.dim) logEl.classList.add('wall-dim');
+  screenEl.dataset.wall = look.wall;
+  if (look.wall === 'photo') {
+    wallUrl(wallPhotoScope(key)).then((url) => { if (url) logEl.style.setProperty('--wall-img', `url("${url}")`); }).catch(() => {});
+  }
+}
+
+/** The colour + wallpaper picker, used in Appearance (scope "default") and in a chat's info. */
+function lookEditor(scope) {
+  const perChat = scope !== 'default';
+  const own = perChat ? ownerOf(scope)?.look || {} : S.settings.look || {};
+  const look = perChat ? lookFor(scope) : cleanLook(S.settings.look);
+  const isOn = (field, v) => (perChat ? (own[field] ?? 'default') : look[field]) === v;
+  // The live preview below is the feedback — no notice per tap (they piled up five deep).
+  const pick = async (patch) => { await saveLook(scope, patch); render(); };
+  const fileIn = h('input', { type: 'file', accept: 'image/*', hidden: true, 'data-testid': `wall-photo-input`, onchange: async (e) => {
+    const f = e.target.files[0]; e.target.value = ''; if (!f) return;
+    try { await setWallPhoto(scope, f); toast('Wallpaper set', 'success'); render(); } catch (ex) { toast(ex.message, 'error'); }
+  } });
+  const swatch = (b) => h(`button.swatch${isOn('bubble', b.id) ? '.on' : ''}`, { type: 'button', role: 'radio', 'aria-checked': isOn('bubble', b.id), 'aria-label': b.name, title: b.name, 'data-testid': `bubble-${b.id}`,
+    style: { background: b.hex, color: inkOn(b.hex) }, onclick: () => pick({ bubble: b.id }) }, isOn('bubble', b.id) ? icon('check', 16) : null);
+  const tile = (w) => h(`button.walltile.wall-${w.id}${isOn('wall', w.id) ? '.on' : ''}`, { type: 'button', role: 'radio', 'aria-checked': isOn('wall', w.id), 'data-testid': `wall-${w.id}`,
+    onclick: () => pick({ wall: w.id }) }, h('span', w.name));
+  // Live preview with this scope's look.
+  const pv = h('div.lookpreview', { 'data-testid': 'look-preview' });
+  const pvLog = h('div.log', h('div.msg.in', 'See you at 6?', h('div.meta', '18:02')), h('div.msg.out', 'On my way 🚶', h('div.meta', '18:03 ', h('span.status', { 'data-st': 'read' }, '✓✓'))));
+  pv.append(pvLog); applyLook(pv, pvLog, perChat ? scope : null);
+  if (!perChat) { // the default preview must ignore any chat's own look
+    for (const [k, v] of Object.entries(bubbleVars(look.bubble))) pv.style.setProperty(k, v);
+  }
+  return [
+    h('h2', 'Chat colour'),
+    h('div.swatches', { role: 'radiogroup', 'aria-label': 'Chat colour' },
+      perChat ? h(`button.swatch.default${isOn('bubble', 'default') ? '.on' : ''}`, { type: 'button', role: 'radio', 'aria-checked': isOn('bubble', 'default'), 'data-testid': 'bubble-default', title: 'Same as all chats',
+        onclick: () => pick({ bubble: 'default' }) }, 'Default') : null,
+      BUBBLES.map(swatch)),
+    h('h2', 'Wallpaper'),
+    h('div.walltiles', { role: 'radiogroup', 'aria-label': 'Wallpaper' },
+      perChat ? h(`button.walltile.default${isOn('wall', 'default') ? '.on' : ''}`, { type: 'button', role: 'radio', 'aria-checked': isOn('wall', 'default'), 'data-testid': 'wall-default',
+        onclick: () => pick({ wall: 'default' }) }, h('span', 'Default')) : null,
+      WALLS.map(tile),
+      h(`button.walltile.photo${isOn('wall', 'photo') ? '.on' : ''}`, { type: 'button', 'data-testid': 'wall-photo', onclick: () => fileIn.click() }, icon('image', 22), h('span', 'Your photo'))),
+    fileIn,
+    h('label.toggle', h('input', { type: 'checkbox', checked: look.dim, 'data-testid': 'wall-dim', onchange: (e) => pick({ dim: e.target.checked }) }), ' Dim the wallpaper (easier to read)'),
+    h('h2', 'Preview'), pv,
+    h('p.hint', perChat ? 'Only this chat. “Default” follows Settings → Appearance. Only you see your colours and wallpaper — nothing is sent.'
+      : 'For all chats. You can give one chat its own look in its info screen. Only you see these — nothing is sent, and a photo wallpaper stays encrypted on this phone.'),
+    perChat && ownerOf(scope)?.look ? h('button', { 'data-testid': 'look-reset', onclick: () => pick({ bubble: 'default', wall: 'default', dim: 'default' }) }, 'Reset to default') : null,
+  ];
+}
+
+const THEMES = [['dark', 'Midnight (default)'], ['light', 'Light'], ['system', 'Match my phone']];
+const SETTINGS_PAGES = [
+  { id: 'account', icon: 'user', title: 'Account', sub: () => `${S.profile.name || 'Your name'}${S.profile.username ? ` · @${S.profile.username}` : ''}`,
+    words: 'profile name photo picture avatar username login identity key remember' },
+  { id: 'appearance', icon: 'palette', title: 'Appearance', sub: () => `${(THEMES.find(([v]) => v === themeChoice()) || THEMES[0])[1]} · chat colour · wallpaper`,
+    words: 'theme dark light midnight colour color chat colour bubble wallpaper background image photo dim' },
+  { id: 'chats', icon: 'chat', title: 'Chats', sub: () => (S.settings.voiceSend === 'release' ? 'Voice: send when you let go' : 'Voice: listen before sending'),
+    words: 'voice messages walkie talkie record send' },
+  { id: 'privacy', icon: 'eye', title: 'Privacy', sub: () => `Read receipts ${S.settings.readReceipts === false ? 'off' : 'on'} · status: ${statusAudienceLabel()}`,
+    words: 'read receipts blue ticks seen status story who can see viewers privacy' },
+  { id: 'security', icon: 'lock', title: 'Security', sub: () => 'Auto-lock, passphrase, duress passcode',
+    words: 'lock auto-lock passphrase password change wrong attempts erase wipe duress decoy panic passcode' },
+  { id: 'calls', icon: 'phone', title: 'Calls', sub: () => `${S.settings.calls?.voice === false && S.settings.calls?.video === false ? 'Calls off' : 'Who can call you'} · hide IP ${S.settings.calls?.hideIp === false ? 'off' : 'on'}`,
+    words: 'call calls voice video ip address hide relay turn' },
+  { id: 'backups', icon: 'cloud', title: 'Backups & new phone', sub: () => 'Backup file, online backup, move to a new phone',
+    words: 'backup restore move transfer new phone online cloud file export' },
+  { id: 'internet', icon: 'globe', title: 'Internet mode', sub: () => (S.remote ? (S.relayOnline ? 'On · connected' : 'On · relay unreachable') : 'Off · nearby only'),
+    words: 'internet relay far away online offline nearby wifi hotspot' },
+  { id: 'help', icon: 'help', title: 'Help & about', sub: () => `Murmur ${APP_VERSION} · how it protects you`,
+    words: 'help about version update fingerprint build protect security how works' },
+];
+
+function settingsHome() {
+  const rowFor = (p) => h('li', h('button.setrow', { type: 'button', onclick: () => go('settings', p.id), 'data-testid': `settings-${p.id}` },
+    h('span.seticon', icon(p.icon, 20)), h('span.settext', h('strong', p.title), h('small', p.sub())), icon('chevron', 18)));
+  const groups = [['account', 'appearance'], ['chats', 'privacy', 'security', 'calls'], ['backups', 'internet'], ['help']];
+  const lists = h('div.setgroups', groups.map((ids) => h('ul.setlist', ids.map((id) => rowFor(SETTINGS_PAGES.find((p) => p.id === id))))));
+  const results = h('ul.setlist', { hidden: true, 'data-testid': 'settings-results' });
+  const search = h('input.setsearch', { type: 'search', placeholder: 'Search settings', 'aria-label': 'Search settings', 'data-testid': 'settings-search', oninput: (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    lists.hidden = !!q; results.hidden = !q;
+    if (!q) return;
+    const hits = SETTINGS_PAGES.filter((p) => `${p.title} ${p.sub()} ${p.words}`.toLowerCase().includes(q));
+    results.replaceChildren(...(hits.length ? hits.map(rowFor) : [h('li', h('p.hint.center', `No setting matches “${e.target.value.trim()}”.`))]));
+  } });
+  return h('div.screen.full.tabbed',
+    header('Settings'),
+    h('div.panel',
+      h('button.mecard', { type: 'button', onclick: () => go('settings', 'account'), 'data-testid': 'settings-me' },
+        h('span.avatar.lg', myPicUrl() ? h('img', { src: myPicUrl(), alt: '' }) : (S.profile.name || '?').slice(0, 1).toUpperCase()),
+        h('span.settext', h('strong', S.profile.name || 'Set your name'), h('small', S.profile.username ? `@${S.profile.username}` : 'Add a username so you can log in on a new phone')),
+        icon('chevron', 18)),
+      search, results, lists,
+      h('ul.setlist', h('li', h('button.setrow.danger', { type: 'button', onclick: panicWipe, 'data-testid': 'panic' },
+        h('span.seticon', icon('trash', 20)), h('span.settext', h('strong', 'Erase everything now'), h('small', 'Panic button: wipes this phone’s Murmur data')))))),
+    tabBar('settings'));
+}
+
+const SETTINGS_PAGE = {
+  account() {
+    const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
+    const myId = h('code.small', '…');
+    contactId(S.vault.identity.publicRaw).then((x) => { myId.textContent = x.match(/.{4}/g).slice(0, 4).join(' '); });
+    return [profileEditor(nameIn), h('h2', 'Identity key'), h('p.hint', 'Your public identity, as your contacts see it: ', myId)];
+  },
+  appearance() {
+    return [
+      h('h2', 'Theme'),
+      h('div.seg', { role: 'radiogroup', 'aria-label': 'Theme' }, THEMES.map(([v, label]) => h(`button${themeChoice() === v ? '.on' : ''}`, {
+        type: 'button', role: 'radio', 'aria-checked': themeChoice() === v, 'data-testid': `theme-${v}`,
+        onclick: () => { applyTheme(v); render(); } }, label))),
+      h('p.hint', 'Midnight is the default. Light is easier in bright sunlight; “Match my phone” follows your phone’s dark-mode setting.'),
+      ...lookEditor('default'),
+    ];
+  },
+  chats() {
+    return [
+      h('label', { for: 'voice-send' }, 'Voice messages'),
+      h('select#voice-send', { 'data-testid': 'voice-send', onchange: async (e) => {
+        S.settings.voiceSend = e.target.value; await S.vault.putRecord('settings', S.settings);
+        toast(e.target.value === 'release' ? 'Voice messages send when you let go' : 'You’ll hear each voice message before it sends');
+      } },
+        h('option', { value: 'review', selected: S.settings.voiceSend !== 'release' }, 'Listen first, then tap Send'),
+        h('option', { value: 'release', selected: S.settings.voiceSend === 'release' }, 'Send as soon as I let go (walkie-talkie)')),
+      h('p.hint', 'Photos, videos and files always show a preview with a Send button, so a wrong tap never sends anything.'),
+      h('p.hint', 'Chat colour and wallpaper are in Appearance. Disappearing messages and history are set per chat, in each contact’s info.'),
+    ];
+  },
+  privacy() {
+    return [
+      h('h2', 'Read receipts'),
+      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.readReceipts !== false, 'data-testid': 'read-receipts', onchange: async (e) => {
+        S.settings.readReceipts = e.target.checked; await S.vault.putRecord('settings', S.settings);
+        toast(e.target.checked ? 'Read receipts on' : 'Read receipts off — you won’t send or see blue ticks');
+      } }), ' Read receipts'),
+      h('p.hint', 'Blue ✓✓ when someone has opened your message, and they see the same from you. Off: you don’t send them and don’t see them. Choose differently for one person in their contact info. It also decides whether people see that you viewed their status. Groups show delivery only.'),
+      ...statusPrivacyEditor(),
+    ];
+  },
+  security() {
+    const lockSel = h('select', { 'aria-label': 'Auto-lock' }, LOCK_OPTIONS.map(([v, l]) => h('option', { value: v, selected: S.settings.autoLockMin === v }, l)));
+    const wipeSel = h('select', { 'aria-label': 'Wipe after failed attempts' });
+    Vault.meta(SLOTS.a).then((m) => m?.wipeAfter ?? 0).then((n) => {
+      const opts = WIPE_OPTIONS.some(([v]) => v === n) ? WIPE_OPTIONS : [...WIPE_OPTIONS, [n, `After ${n} wrong tries`]]; // keep an older choice visible
+      for (const [v, l] of opts) wipeSel.append(h('option', { value: v, selected: n === v }, l));
+    });
+    const oldP = h('input', { type: 'password', placeholder: 'Current passphrase', autocomplete: 'current-password' });
+    const newP = h('input', { type: 'password', placeholder: `New passphrase (${MIN_PASSPHRASE}+ chars)`, autocomplete: 'new-password' });
+    return [
+      h('h2', 'Screen lock'),
       h('label', 'Auto-lock after inactivity'),
       h('div.row', lockSel, h('button', { onclick: async () => { S.settings.autoLockMin = +lockSel.value; await S.vault.putRecord('settings', S.settings); toast('Saved'); } }, 'Save')),
-      h('label', 'Wrong passphrase protection'),
+      h('h2', 'Wrong passphrase protection'),
       h('p.hint', 'After 4 wrong tries Murmur makes you wait — 30 s, then 1 min, 5 min, 15 min, 1 hour — like an iPhone. Only someone holding this phone can even try: there is no online login to attack. Erasing is optional: it stops a thief, but anyone who picks up your phone could also trigger it on purpose.'),
       h('label', 'Erase everything after wrong passphrases'),
       h('div.row', wipeSel, h('button', { onclick: async () => { await Vault.setWipeAfterOn(SLOTS.a, +wipeSel.value); await Vault.setWipeAfterOn(SLOTS.b, +wipeSel.value); toast('Saved'); } }, 'Save')),
       h('p.hint', 'Neither the waits nor erasing can stop someone who copies the encrypted data off the phone first — a long passphrase is your real protection.'),
-      h('label', 'Change passphrase'),
+      h('h2', 'Change passphrase'),
       oldP, newP,
       h('button', { onclick: async () => {
         try {
@@ -2805,26 +3349,23 @@ VIEWS.settings = () => {
           rekeyOnlineBackup(np).catch((e) => toast(`Online backup: ${e.message}`, 'error')); }
         catch (e) { toast(e instanceof WrongPassphraseError ? 'Current passphrase is wrong' : e.message, 'error'); }
       } }, 'Change passphrase'),
-
       duressSection(),
-      backupSection(),
-
-      h('h2', 'Messages'),
-      h('label', { for: 'voice-send' }, 'Voice messages'),
-      h('select#voice-send', { 'data-testid': 'voice-send', onchange: async (e) => {
-        S.settings.voiceSend = e.target.value; await S.vault.putRecord('settings', S.settings);
-        toast(e.target.value === 'release' ? 'Voice messages send when you let go' : 'You’ll hear each voice message before it sends');
-      } },
-        h('option', { value: 'review', selected: S.settings.voiceSend !== 'release' }, 'Listen first, then tap Send'),
-        h('option', { value: 'release', selected: S.settings.voiceSend === 'release' }, 'Send as soon as I let go (walkie-talkie)')),
-      h('p.hint', 'Photos, videos and files always show a preview with a Send button, so a wrong tap never sends anything.'),
-      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.readReceipts !== false, 'data-testid': 'read-receipts', onchange: async (e) => {
-        S.settings.readReceipts = e.target.checked; await S.vault.putRecord('settings', S.settings);
-        toast(e.target.checked ? 'Read receipts on' : 'Read receipts off — you won’t send or see blue ticks');
-      } }), ' Read receipts'),
-      h('p.hint', 'Blue ✓✓ when someone has opened your message, and they see the same from you. Off: you don’t send them and don’t see them (like WhatsApp). You can choose differently for one person in their contact info. Groups show delivery only.'),
-
-      h('h2', 'Internet mode'),
+    ];
+  },
+  calls() {
+    return [
+      callToggle('voice', 'Allow voice calls'),
+      callToggle('video', 'Allow video calls'),
+      h('p.hint', 'When off, your contacts don’t see the call button, and calls are refused even if someone tries. You can also block calls from one person in their contact info.'),
+      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.calls?.hideIp !== false, 'data-testid': 'hide-ip', onchange: async (e) => {
+        S.settings.calls = { ...(S.settings.calls || {}), hideIp: e.target.checked }; await S.vault.putRecord('settings', S.settings);
+      } }), ' Hide my IP address on internet calls'),
+      h('p.hint', 'On: calls go through the encrypted relay, so the other person never learns your IP address (slightly more delay). Off: a direct connection when possible. Calls are end-to-end encrypted either way. Nearby calls without internet are always direct.'),
+    ];
+  },
+  backups() { return [backupSection()]; },
+  internet() {
+    return [
       h('p', { 'data-testid': 'internet-status' }, S.remote ? (S.relayOnline ? 'On — connected to the relay' : 'On — relay not reachable right now (messages wait safely on this phone)') : 'Off — nearby (same Wi-Fi) only'),
       h('p.hint', 'Lets you reach contacts who are far away. Messages are end-to-end encrypted before they leave this phone; the relay only stores unreadable data, deletes it once delivered, and erases anything unclaimed after 30 days. The relay can see when you are online and your IP address.'),
       h('button', { 'data-testid': 'toggle-internet', onclick: async () => {
@@ -2833,19 +3374,33 @@ VIEWS.settings = () => {
         if (S.settings.internet) await startRemote().catch((e) => toast(e.message, 'error')); else stopRemote();
         render();
       } }, S.remote ? 'Turn off internet mode' : 'Turn on internet mode'),
-
-      h('h2', 'This app'),
+    ];
+  },
+  help() {
+    // "checking…" while it loads; "unavailable" only if it really can't be read.
+    const fp = h('code.small', { 'data-testid': 'build-fp' }, 'checking…');
+    fetch('./build-info.json').then((r) => r.json()).then((b) => { fp.textContent = b.fingerprint; }).catch(() => { fp.textContent = 'unavailable'; });
+    const sw = h('span', { 'data-testid': 'offline-status' }, navigator.serviceWorker?.controller ? 'Installed — works with no network'
+      : offlineError || 'Not installed yet (reload once while online)');
+    return [
       h('p', `Murmur ${APP_VERSION} · `, sw),
       h('p.hint', 'Build fingerprint (compare with a friend to confirm you run identical code): '), fp,
       updateBanner() || h('button', { onclick: () => { checkForUpdate(); toast('Checking for a new version…'); }, 'data-testid': 'check-update' }, 'Check for update'),
       h('button', { onclick: () => go('about') }, icon('shield', 18), ' How Murmur protects you'),
+    ];
+  },
+};
 
-      h('h2', 'Panic'),
-      h('button.danger.big', { onclick: panicWipe, 'data-testid': 'panic' }, icon('trash', 18), ' Erase everything now')));
+VIEWS.settings = (page) => {
+  const p = SETTINGS_PAGES.find((x) => x.id === page);
+  if (!p) return settingsHome();
+  return h('div.screen.full',
+    header(p.title, { back: () => go('settings') }),
+    h('div.panel', { 'data-testid': `settings-page-${p.id}` }, ...SETTINGS_PAGE[p.id]()));
 };
 
 VIEWS.about = () => h('div.screen.full',
-  header('How Murmur protects you', { back: () => go('settings') }),
+  header('How Murmur protects you', { back: () => go('settings', 'help') }),
   h('div.panel.prose',
     h('h2', 'What happens when you connect'),
     h('p', 'Your phones open a direct WebRTC connection on the local network. There are no STUN, TURN or signaling servers — the QR codes you scan carry everything needed, signed by each person’s identity key.'),
