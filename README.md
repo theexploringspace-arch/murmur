@@ -51,7 +51,7 @@ Requires **Node.js 22+**. There is nothing to `npm install` for the app itself.
 
 ```powershell
 cd murmur
-npm test            # 137 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, voice waveforms, scam checks, media, groups, QR, build
+npm test            # 148 unit tests: crypto, protocol, ratchet, relay (+TURN), duress, profiles, edits, calls, voice waveforms, replies/forwards/receipts, scam checks, media, groups, QR, build
 npm run build       # src/ → dist/  (prints the build fingerprint)
 npm run serve       # http://localhost:8080
 ```
@@ -182,9 +182,11 @@ Run it locally: `node relay/node/server.mjs --port 8787 --origin http://localhos
 
 | Feature | Nearby (no internet) | Far away (relay) | Notes |
 |---|---|---|---|
-| Text, receipts ✓✓, disappearing | ✅ | ✅ | |
-| Photos & videos | ✅ | ✅ (512 KiB chunks) | Photos go at **standard size** (longest side 1600 px, ~250–450 KB: usually one relay message) with an **Original quality** switch. Hidden location/camera data removed; you see exactly what will be sent and tap **Send** (a wrong pick never sends); only real images/videos are displayed; **Save** opens the phone's share sheet (Save Image → Photos) |
-| Voice messages | ✅ | ✅ | WhatsApp-style. **Hold** the mic, talk, lift; **tap once** for hands-free (⏸ stop and listen · ➤ send now · 🗑 delete); slide far away to cancel (2 min max). The listen-first step happens **inside the composer bar** — no pop-up. Bubbles show ▶, a waveform you can tap or drag to seek, the length, and 1× / 1.5× / 2× — no file name, size or Save button. Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
+| Text, receipts, disappearing | ✅ | ✅ | ✓ sent · grey ✓✓ delivered · **blue ✓✓ read**. Read receipts: Settings → *Messages* (everyone) and contact info (one person). Reciprocal like WhatsApp: off means you neither send nor see them. Groups show delivery only |
+| Reply | ✅ | ✅ | **Swipe a bubble right** (or long-press → Reply, or Reply in the photo viewer). The quote shows who wrote it and a preview (photo thumbnail, “Voice message”, file name…); tap it to jump to the original. Works for text, photos, voice, files, in groups too |
+| Forward | ✅ | ✅ | Long-press → Forward (or from the photo viewer) to up to **5** chats or groups. Sent as a fresh encrypted copy marked *Forwarded* (*Forwarded many times* after 5 hops) — never who it came from |
+| Photos & videos | ✅ | ✅ (512 KiB chunks) | WhatsApp-style bubbles: just the picture with the time on its corner — no file name, size or Save button. **Tap** → full screen with what it really is (*JPEG · 199 KB · 1600×1200*, from the file's bytes, not its name) and **Reply · Forward · Save** (Save opens the share sheet → Save Image). Documents get a compact card (type badge, name, *PDF · size*). Photos go at **standard size** (longest side 1600 px) with an **Original quality** switch; hidden location/camera data removed; you preview and tap **Send** first |
+| Voice messages | ✅ | ✅ | WhatsApp-style. **Hold** the mic, talk, lift; **tap once** for hands-free (⏸ stop and listen · ➤ send now · 🗑 delete); slide far away to cancel (2 min max). The listen-first step happens **inside the composer bar** — no pop-up. Bubbles show ▶, a thin WhatsApp-style waveform you can tap or drag to seek, the length, and 1× / 1.5× / 2× — no file name, size or Save button. Settings → *Voice messages* switches to instant send-on-release. Needs microphone permission |
 | Voice & video calls | ✅ | ✅ | Peer-to-peer, end-to-end encrypted (DTLS-SRTP keyed through the authenticated chat). Mute, camera off, flip camera. **Hide my IP** (default on) routes internet calls through TURN. Rings only while Murmur is open on their phone. One-to-one only |
 | Call permissions | ✅ | ✅ | Settings → *Calls*: allow voice / video. Contact info: block calls from one person. Their phone hides the buttons **and** yours refuses the call anyway |
 | Edit & delete | ✅ | ✅ | Long-press (or right-click) a message. Edit your text for **15 min**; **delete for everyone** within **1 hour**; delete for me any time. Receivers enforce the same rules and only accept changes from the real author |
@@ -256,6 +258,7 @@ murmur/
 | CSP + Trusted Types enforcement; data-at-rest is ciphertext | GitHub Pages workflow (action versions checked Nov 2026; not run from here) |
 | Calls in two browsers with fake camera/mic: nearby and via the relay, media both ways, mute, decline, permissions | Calls between two iPhones on mobile data (needs TURN switched on); earpiece vs. speaker can't be chosen by a web app on iPhone |
 | Edit/delete, profile photo, username login, duress passcode | Real iPhone voice recording after the recorder fix (WebKit bugs 301507/234784) |
+| Replies (menu, swipe, photo), forwarding to another person, read receipts on/off (global, per contact, reciprocal, over nearby and relay), photo/document bubbles and viewer — three browsers | How swipe-to-reply feels under a real thumb; share-sheet Save from the new viewer on iPhone |
 
 ## License
 

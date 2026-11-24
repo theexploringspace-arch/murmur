@@ -168,6 +168,7 @@ Rule of thumb: whatever other code uses as a "ready" flag must be assigned **las
 | `core/profile.js` — username rules, login hash, profile validation, per-contact call flags | yes | `test/unit/profile.test.mjs` |
 | `core/call.js` — WebRTC call engine + signal validation + `callDecision()` | engine needs a browser | `test/unit/call.test.mjs` + e2e "voice & video calls" and the relay call in "phase 1" |
 | `core/waveform.js` — bar heights, live mic level, clock text, speeds, seek maths | yes | `test/unit/waveform.test.mjs` |
+| `core/meta.js` — reply quotes, forward hops, read-receipt rules, status ordering, file-type labels | yes | `test/unit/meta.test.mjs` |
 | `ui/voice.js` — voice bubble player + recorder bar (needs MediaRecorder/WebAudio) | browser only | e2e "phase 1" voice section |
 | `relay/src/router.js` `/v1/turn` | — | `test/unit/relay.test.mjs` (fake Cloudflare API, port-53 filter, Origin check, rate limit, STUN fallback) |
 
@@ -200,6 +201,28 @@ and when a "flaky" test fails the same way twice, it is usually a real bug weari
 
 The waveform is computed on each phone from the decrypted audio (`decodeAudioData`), never sent:
 a sender can't make a clip look different from what it sounds like, and the protocol didn't change.
+
+## Lesson: one field name, two meanings
+Forwarding first wanted the field `fwd`. But groups already used `fwd` — "the creator relayed this
+from member X" — and the receiver *trusts* it to decide who wrote a group message. A forwarded
+message carrying `fwd: true` into a group would have been read as a relay claim and either dropped
+or mis-attributed. The forward tag is `fw` (a hop count), and a unit test asserts that `fwd` is
+not accepted as one. Lesson: before naming a protocol field, grep for it — on the wire, a name
+collision is a security question, not a style one.
+
+And while the read receipts went in, the ticks turned out to have been teal all along because a
+global `.status` rule meant for another screen leaked into the bubbles; they're now scoped
+(`.msg .meta .status`), grey for delivered, blue for read.
+
+## Lesson: a security test that cried wolf
+"data at rest is ciphertext" used to decode every stored byte and fail if it found `Bob`. Once
+history kept photos and files (~1 MB of ciphertext), three random bytes spelling `B`,`o`,`b`
+turned up about once in 20 runs — a false alarm that trains people to ignore the test. The fix
+made it *stricter*, not looser: every vault record must have exactly the sealed shape
+`{iv: 12 bytes, ct}`; readable parts (record names, any field) must contain no names or texts at
+all; and ciphertext is searched for what a real leak looks like — plaintext JSON (`"Bob"`,
+`"text":"Hello`), 5+ bytes, which random data matches about once in a million runs. Lesson: when a
+security test is flaky, find the probability, then fix the *test design*, never just retry it.
 
 ## History storage
 `history/<contact>` is the list; each file's bytes are their own record `media/<contact>/<message>`,

@@ -150,9 +150,9 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
       const big = Buffer.alloc(300 * 1024); for (let i = 0; i < big.length; i++) big[i] = (i * 7919) & 255;
       await A.page.setInputFiles(tid('file-input'), { name: 'data.bin', mimeType: 'application/octet-stream', buffer: big });
       await A.page.click(tid('modal-send'));
-      await B.page.waitForFunction(() => [...document.querySelectorAll('button.file')].some((a) => a.textContent.includes('data.bin')), null, { timeout: 20000 });
+      await B.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="file"]')].some((a) => a.textContent.includes('data.bin')), null, { timeout: 20000 });
       const sum = await B.page.evaluate(async () => {
-        const a = [...document.querySelectorAll('button.file')].find((x) => x.textContent.includes('data.bin'));
+        const a = [...document.querySelectorAll('[data-testid="file"]')].find((x) => x.textContent.includes('data.bin'));
         const b = new Uint8Array(await (await fetch(a.dataset.blob)).arrayBuffer());
         let s = 0; for (const x of b) s = (s * 31 + x) >>> 0; return [b.length, s];
       });
@@ -169,13 +169,26 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
     });
 
     await t.test('data at rest is ciphertext; private key non-extractable', async () => {
-      const raw = await A.page.evaluate(async () => {
+      // Two checks, so the test is both strict and never flaky:
+      //  1. everything OUTSIDE ciphertext (record names, any readable field) contains no names/texts at all;
+      //  2. ciphertext bytes contain no plaintext JSON ("Bob" with its quotes, "text":"Hello"…).
+      // (Matching a bare 3-byte word like Bob inside ~1 MB of random ciphertext hits by pure chance
+      //  about once in 20 runs — it did. A 5+ byte JSON fragment: about once in a million.)
+      const { plain, cipher, shapes } = await A.page.evaluate(async () => {
         const db = await new Promise((r) => { const q = indexedDB.open('murmur'); q.onsuccess = () => r(q.result); });
-        const all = await new Promise((r) => { const q = db.transaction('kv').objectStore('kv').getAll(); q.onsuccess = () => r(q.result); });
-        const dec = new TextDecoder('latin1');
-        return JSON.stringify(all, (_, v) => (v instanceof Uint8Array ? dec.decode(v) : v));
+        const rows = await new Promise((r) => { const out = []; const q = db.transaction('kv').objectStore('kv').openCursor();
+          q.onsuccess = () => { const c = q.result; if (!c) return r(out); out.push([c.key, c.value]); c.continue(); }; });
+        const dec = new TextDecoder('latin1'); let cipher = ''; const shapes = [];
+        const plain = JSON.stringify(rows, (k, v) => {
+          if (v instanceof Uint8Array) { if (k === 'ct') { cipher += dec.decode(v); return '<ct>'; } return `<${v.length} bytes>`; }
+          return v;
+        });
+        for (const [k, v] of rows) if (/^(b:)?rec\//.test(k)) shapes.push(v && v.iv instanceof Uint8Array && v.iv.length === 12 && v.ct instanceof Uint8Array && Object.keys(v).length === 2 ? 'sealed' : `OPEN ${k}`);
+        return { plain, cipher, shapes };
       });
-      for (const needle of ['Bob', 'Hello', 'Alice', 'm149']) assert.ok(!raw.includes(needle), `"${needle}" must not appear in storage`);
+      assert.ok(shapes.length > 3 && shapes.every((x) => x === 'sealed'), `every record is {iv, ct}: ${shapes.filter((x) => x !== 'sealed').join(', ')}`);
+      for (const needle of ['Bob', 'bob_test', 'Hello', 'Alice', 'm149']) assert.ok(!plain.includes(needle), `"${needle}" must not appear in readable storage`);
+      for (const needle of ['"Bob"', '"bob_test"', '"text":"Hello', '"Alice"', '"m149"']) assert.ok(!cipher.includes(needle), `${needle} must not appear inside ciphertext (plaintext JSON leak)`);
     });
 
     await t.test('strict CSP + Trusted Types are enforced', async () => {
@@ -582,7 +595,13 @@ test('profile photo, @username login, edit & delete messages', { timeout: 240000
     assert.deepEqual(await A.page.$$eval('.tabs button', (b) => b.map((x) => x.textContent)), ['Media 1', 'Docs 1', 'Links 1']);
     await A.page.click('[data-testid="shared-media"] .thumb');
     await A.page.waitForFunction(() => document.querySelector('[data-testid="viewer-image"]')?.naturalWidth > 0, null, { timeout: 10000 });
-    await A.page.click(tid('modal-false'));
+    await A.page.waitForSelector(tid('viewer-chat')); // opened from Shared: "In chat" jumps back to the message
+    await A.page.click(tid('viewer-close'));
+    assert.equal(await A.page.$$eval(tid('viewer'), (v) => v.length), 0);
+    await A.page.click(tid('tab-docs'));
+    await A.page.click(tid('doc-open'));
+    assert.match(await A.page.textContent(tid('viewer-info')), /^TXT · \d+ B$/);
+    await A.page.click(tid('viewer-close'));
     await A.page.click(tid('tab-docs'));
     assert.match(await A.page.textContent(tid('shared-docs')), /notes\.txt/);
     await A.page.click(tid('tab-links'));
@@ -695,6 +714,158 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
   } catch (e) { for (const p of P) console.error('DEBUG', p.errors); throw e; } finally { await browser.close(); }
 });
 
+test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe, to a photo), forward, read receipts on/off', { timeout: 300000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const A = await profile(browser, 'alice-wa'), B = await profile(browser, 'bob-wa'), C = await profile(browser, 'carol-wa');
+  const inLog = (p, re, sel = 'msg-in') => p.page.waitForFunction(([s, r]) => [...document.querySelectorAll(`[data-testid="${s}"]`)].some((m) => new RegExp(r).test(m.textContent)), [sel, re.source], { timeout: 20000 });
+  const bubbleOf = (text, dir) => `${tid(`msg-${dir}`)}:has-text("${text}")`;
+  const openMenu = async (p, text, dir) => { await p.page.locator(bubbleOf(text, dir)).last().click({ button: 'right' }); await p.page.waitForSelector('.modal'); };
+  const statusOf = (p, text) => p.page.$eval(`${bubbleOf(text, 'out')} .status`, (e) => e.dataset.st);
+  try {
+    await onboard(A, 'Alice', 'correct horse battery staple');
+    await onboard(B, 'Bob', 'another long passphrase');
+    await onboard(C, 'Carol', 'yet another long passphrase');
+    await pairByText(A, B);
+    await A.page.click(tid('back')); await pairByText(A, C, {});
+    await A.page.click(tid('back')); await A.page.click(tid('contact-Bob'));
+    await B.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
+
+    // --- a photo is just the photo: no file name, no size, no Save; the time sits on the corner ---
+    await A.page.setInputFiles(tid('file-input'), join(root, 'test/fixtures/media/photo-gps.jpg'));
+    await A.page.click(tid('modal-send'));
+    await B.page.waitForFunction(() => document.querySelector('[data-testid="msg-in"].media img.attach')?.naturalWidth > 0, null, { timeout: 20000 });
+    await B.page.waitForFunction(() => document.getElementById('chatstatus')?.hidden !== false, null, { timeout: 5000 }); // no stuck "Receiving… 100%"
+    const photoText = await B.page.$eval(`${tid('msg-in')}.media`, (e) => e.textContent);
+    assert.doesNotMatch(photoText, /\.jpe?g|KB|Save/i, `photo bubble shows only the picture and the time (${photoText})`);
+    assert.equal(await B.page.$$eval(`${tid('msg-in')}.media .meta.over`, (e) => e.length), 1);
+    // Tap → full screen, with the REAL type and size, and Save / Forward / Reply.
+    await B.page.click(`${tid('msg-in')} ${tid('media-open')}`);
+    await B.page.waitForFunction(() => /^JPEG · [\d.]+ KB · \d+×\d+$/.test(document.querySelector('[data-testid="viewer-info"]')?.textContent || ''), null, { timeout: 10000 });
+    for (const b of ['viewer-save', 'viewer-forward', 'viewer-reply']) await B.page.waitForSelector(tid(b));
+    await shot(B.page, 'wa-2-viewer');
+    await B.page.keyboard.press('Escape');
+    assert.equal(await B.page.$$eval(tid('viewer'), (v) => v.length), 0, 'Escape closes the viewer');
+    // Long-press on the photo (touch) opens the message menu — the photo being tappable mustn't block it.
+    await B.page.$eval(`${tid('msg-in')} ${tid('media-open')}`, (el) => {
+      const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 3, isPrimary: true, bubbles: true, clientX: r.x + 30, clientY: r.y + 30 };
+      el.dispatchEvent(new PointerEvent('pointerdown', o)); setTimeout(() => el.dispatchEvent(new PointerEvent('pointerup', o)), 700);
+    });
+    await B.page.waitForSelector(tid('modal-forward'), { timeout: 5000 });
+    await B.page.click(tid('modal-false'));
+    assert.equal(await B.page.$$eval(tid('viewer'), (v) => v.length), 0, 'a long-press is not also a tap');
+
+    // --- a document is a compact card: type badge, name, "PDF · size" — no Save chip ---
+    await A.page.setInputFiles(tid('file-input'), { name: 'Quarterly report.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n% murmur test\n1 0 obj << >> endobj\ntrailer <<>>\n%%EOF\n') });
+    await A.page.click(tid('modal-send'));
+    await B.page.waitForSelector(`${tid('msg-in')} ${tid('file')} .docbadge`, { timeout: 20000 });
+    assert.equal(await B.page.textContent(`${tid('msg-in')} ${tid('file')} .docbadge`), 'PDF');
+    assert.match(await B.page.textContent(`${tid('msg-in')} ${tid('file')} small`), /^PDF · \d+ B$/);
+    assert.doesNotMatch(await B.page.textContent(`${tid('msg-in')} ${tid('file')}`), /Save/);
+
+    // --- reply from the menu: quote shows on both phones, with the right author ---
+    await send(A, 'lunch at 1?');
+    await inLog(B, /lunch at 1\?/);
+    await openMenu(B, 'lunch at 1?', 'in');
+    await B.page.click(tid('modal-reply'));
+    await B.page.waitForSelector(`${tid('reply-bar')}:not([hidden])`);
+    assert.match(await B.page.textContent(tid('reply-bar')), /Alice.*lunch at 1\?/s);
+    await shot(B.page, 'wa-1-replybar');
+    await send(B, 'yes! see you there');
+    assert.equal(await B.page.$$eval(`${tid('reply-bar')}:not([hidden])`, (e) => e.length), 0, 'sent: the reply bar clears');
+    await inLog(A, /see you there/);
+    const q = await A.page.$eval(`${bubbleOf('see you there', 'in')} ${tid('quote')}`, (e) => ({ who: e.querySelector('.qwho').textContent, text: e.querySelector('.qtext').textContent.trim() }));
+    assert.deepEqual(q, { who: 'You', text: 'lunch at 1?' }, 'Alice sees her own words quoted as "You"');
+    assert.equal(await B.page.$eval(`${bubbleOf('see you there', 'out')} .qwho`, (e) => e.textContent), 'Alice');
+    // Tapping the quote jumps to (and flashes) the original.
+    await A.page.click(`${bubbleOf('see you there', 'in')} ${tid('quote')}`);
+    await A.page.waitForSelector(`${bubbleOf('lunch at 1?', 'out')}.flash`);
+
+    // --- swipe a bubble to the right (touch) to reply; ✕ cancels ---
+    const swipe = (p, text, dir, dx) => p.page.$eval(bubbleOf(text, dir), (el, d) => {
+      const r = el.getBoundingClientRect(); const o = { pointerType: 'touch', pointerId: 7, isPrimary: true, bubbles: true, clientX: r.x + 20, clientY: r.y + 10 };
+      el.dispatchEvent(new PointerEvent('pointerdown', o));
+      for (let x = 0; x <= d; x += 10) el.dispatchEvent(new PointerEvent('pointermove', { ...o, clientX: o.clientX + x }));
+      el.dispatchEvent(new PointerEvent('pointerup', { ...o, clientX: o.clientX + d }));
+    }, dx);
+    await swipe(A, 'see you there', 'in', 30); // too short: nothing
+    assert.equal(await A.page.$$eval(`${tid('reply-bar')}:not([hidden])`, (e) => e.length), 0, 'a small drag is not a reply');
+    await swipe(A, 'see you there', 'in', 90);
+    await A.page.waitForSelector(`${tid('reply-bar')}:not([hidden])`);
+    await A.page.click(tid('reply-cancel'));
+    assert.equal(await A.page.$$eval(`${tid('reply-bar')}:not([hidden])`, (e) => e.length), 0);
+    await swipe(A, 'see you there', 'in', 90);
+    await send(A, 'great 👍');
+    await inLog(B, /great/);
+    assert.equal(await B.page.$eval(`${bubbleOf('great', 'in')} .qwho`, (e) => e.textContent), 'You');
+
+    // --- reply to a photo: the quote says "Photo" and shows a thumbnail ---
+    await B.page.click(`${tid('msg-in')} ${tid('media-open')}`);
+    await B.page.click(tid('viewer-reply'));
+    await send(B, 'nice pic');
+    await inLog(A, /nice pic/);
+    await A.page.waitForTimeout(500); await shot(A.page, 'wa-3-quotes');
+    assert.match(await A.page.textContent(`${bubbleOf('nice pic', 'in')} .qtext`), /Photo/);
+    await A.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"]')].some((m) => /nice pic/.test(m.textContent) && m.querySelector('.qthumb')?.naturalWidth > 0), null, { timeout: 10000 });
+
+    // --- forward Bob's message to Carol: a fresh copy, tagged "Forwarded", no quote, no trace of Bob ---
+    await openMenu(A, 'see you there', 'in');
+    await A.page.click(tid('modal-forward'));
+    await A.page.check(tid('fwd-Carol'));
+    await A.page.click(tid('modal-send'));
+    await A.page.waitForFunction(() => /Forwarded to Carol/.test(document.body.textContent), null, { timeout: 15000 });
+    await inLog(C, /yes! see you there/); // Carol is still in her chat with Alice from pairing
+    const fwd = await C.page.$eval(bubbleOf('see you there', 'in'), (e) => ({ label: e.querySelector('[data-testid="forwarded"]')?.textContent.trim(), quote: !!e.querySelector('[data-testid="quote"]'), bob: /Bob/.test(e.textContent) }));
+    assert.deepEqual(fwd, { label: 'Forwarded', quote: false, bob: false });
+    // A photo forwarded from the viewer arrives as a photo.
+    await A.page.click(`${tid('msg-out')} ${tid('media-open')}`);
+    await A.page.click(tid('viewer-forward'));
+    await A.page.check(tid('fwd-Carol'));
+    await A.page.click(tid('modal-send'));
+    await C.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"].media')].some((m) => m.querySelector('[data-testid="forwarded"]') && m.querySelector('img.attach')?.naturalWidth > 0), null, { timeout: 20000 });
+    await shot(C.page, 'wa-4-forwarded');
+
+    // --- read receipts: blue ✓✓ when Bob has the chat open… ---
+    await send(A, 'read receipt check');
+    await A.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"]')].some((m) => /read receipt check/.test(m.textContent) && m.querySelector('.status')?.dataset.st === 'read'), null, { timeout: 20000 });
+    // …Bob turns them off just for Alice: she only gets "delivered" from now on…
+    await B.page.click(tid('contact-info'));
+    await B.page.selectOption(tid('contact-receipts'), 'off');
+    await B.page.click(tid('back'));
+    await send(A, 'are you reading this');
+    await inLog(B, /are you reading this/);
+    await A.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"]')].some((m) => /are you reading this/.test(m.textContent) && m.querySelector('.status')?.dataset.st === 'delivered'), null, { timeout: 20000 });
+    await A.page.waitForTimeout(1500);
+    assert.equal(await statusOf(A, 'are you reading this'), 'delivered', 'no read receipt was sent');
+    // …and it's reciprocal: Bob doesn't see Alice's blue ticks either, even though she sends them.
+    await send(B, 'quiet mode');
+    await inLog(A, /quiet mode/);
+    await B.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-out"]')].some((m) => /quiet mode/.test(m.textContent) && m.querySelector('.status')?.dataset.st === 'delivered'), null, { timeout: 20000 });
+    await B.page.waitForTimeout(1500);
+    assert.equal(await statusOf(B, 'quiet mode'), 'delivered');
+    // Global switch: per-contact back to default, then everything off in Settings.
+    await B.page.click(tid('contact-info'));
+    await B.page.selectOption(tid('contact-receipts'), 'default');
+    await B.page.click(tid('back')); await B.page.click(tid('back')); await B.page.click(tid('settings'));
+    await B.page.uncheck(tid('read-receipts'));
+    await B.page.click(tid('back')); await B.page.click(tid('contact-Alice'));
+    await send(A, 'global off check');
+    await inLog(B, /global off check/);
+    await A.page.waitForTimeout(2000);
+    assert.equal(await statusOf(A, 'global off check'), 'delivered');
+    // Earlier blue ticks stay blue on Alice's phone (her receipts are on).
+    assert.equal(await statusOf(A, 'read receipt check'), 'read');
+    await shot(A.page, 'wa-5-ticks');
+
+    // --- everything survives a lock/unlock (replies, forwards, ticks are in the encrypted history) ---
+    await A.page.click(tid('back')); await A.page.click(tid('lock'));
+    await userReady(A.page); await A.page.fill(tid('unlock-pass'), 'correct horse battery staple'); await A.page.click(tid('unlock'));
+    await A.page.click(tid('contact-Bob'));
+    await A.page.waitForSelector(`${bubbleOf('see you there', 'in')} ${tid('quote')}`);
+    assert.equal(await statusOf(A, 'read receipt check'), 'read');
+    for (const p of [A, B, C]) assert.deepEqual(p.errors, [], `${p.name}: no page errors`);
+  } finally { await browser.close(); }
+});
+
 test('voice & video calls: ring, accept, media flows both ways, mute, hang up, decline, and call permissions', { timeout: 240000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME, args: ['--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream', '--disable-features=WebRtcHideLocalIpsWithMdns', '--autoplay-policy=no-user-gesture-required'] });
   const A = await profile(browser, 'alice-call'), B = await profile(browser, 'bob-call');
@@ -788,6 +959,20 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
     await send(C, 'Hi Dave — not clicking that 😄');
     await D.page.waitForFunction(() => [...document.querySelectorAll('[data-testid="msg-in"] .text')].some((e) => e.textContent.startsWith('Hi Dave')), null, { timeout: 20000 });
     await C.page.waitForFunction(() => document.querySelector('[data-testid="msg-out"] .status')?.textContent === '✓✓', null, { timeout: 20000 });
+    // Dave has the chat open, so it turns blue (read) — through the relay too.
+    await C.page.waitForFunction(() => document.querySelector('[data-testid="msg-out"] .status')?.dataset.st === 'read', null, { timeout: 20000 });
+
+    // The "Connect nearby" card can be hidden with its ✕ — and brought back from contact info.
+    await C.page.waitForSelector(tid('nearby-card'));
+    await C.page.click(tid('nearby-dismiss'));
+    await C.page.waitForFunction((s) => !document.querySelector(s), tid('nearby-card'), { timeout: 5000 });
+    await C.page.click(tid('back')); await C.page.click(tid('contact-Dave'));
+    assert.equal(await C.page.$$eval(tid('nearby-card'), (e) => e.length), 0, 'stays hidden');
+    await C.page.click(tid('contact-info'));
+    await C.page.waitForSelector(tid('contact-nearby-show')); // still reachable here
+    await C.page.click(tid('nearby-unhide'));
+    await C.page.click(tid('back'));
+    await C.page.waitForSelector(tid('nearby-card'));
 
     // A disguised program sent as a "photo" is flagged and never displayed.
     const exe = Buffer.concat([Buffer.from('MZ'), Buffer.alloc(2000, 7)]);
@@ -896,10 +1081,12 @@ test('phase 1: private photos, walkie-talkie, location, SOS and groups (3 people
         window.__shared = { n: d.files.length, name: f.name, type: f.type, jpeg: b[0] === 0xff && b[1] === 0xd8, secret: /SECRET/.test(new TextDecoder('latin1').decode(b)) };
       };
     });
-    await P.Dave.page.click(`${tid('msg-in')} ${tid('file')}`);
+    await P.Dave.page.click(`${tid('msg-in')} ${tid('media-open')}`);
+    await P.Dave.page.click(tid('viewer-save'));
     await P.Dave.page.waitForFunction(() => !!window.__shared, null, { timeout: 5000 });
     assert.deepEqual(await P.Dave.page.evaluate(() => window.__shared), { n: 1, name: 'photo-gps.jpg', type: 'image/jpeg', jpeg: true, secret: false },
       'phone save hands the cleaned photo, with its real image type, to the share sheet');
+    await P.Dave.page.click(tid('viewer-close'));
 
     // --- speed: a big camera photo goes out at standard size (one relay message), original is one tap away ---
     const bigB64 = await P.Carol.page.evaluate(async () => {

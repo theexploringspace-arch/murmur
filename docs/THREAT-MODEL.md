@@ -135,6 +135,16 @@ version that leaked it as a record name). Tested in `test/unit/duress.test.mjs`.
 the same screen appears and "succeeds", but it can't touch slot A. The duress passcode must
 differ from the real passphrase, and changing either passphrase to match the other is refused.
 
+## Replies, forwards, read receipts — added threats
+
+| Threat | Outcome | Why |
+|---|---|---|
+| A contact fakes a quote of *your* message ("you said: I owe you $500") | **No** | If your phone has the quoted message, the quote is built from **your** copy, not their preview. They can only quote an id you don't have, which shows their text — the same as them simply typing it |
+| A quote reveals who wrote the original to someone new | **No new information** | A reply goes to the same chat the original was in, whose members already saw it |
+| A forward leaks who it originally came from | **No** | A forwarded message is a fresh message with only `fw` (a hop count) — no sender, no original id, no quote |
+| Read receipts tell people when you're active | **Yes, if on** — that is what they are | Off globally or per contact. Reciprocal (off = you don't see theirs either). A message read with receipts off stays "read-sent" locally, so switching them on later doesn't reveal past reading. The relay sees one more small padded envelope |
+| A stranger (unaccepted invite-link contact) learns you read their message | **No** | Receipts are never sent to an unaccepted contact |
+
 ## Calls, profiles, edits — added threats
 
 | Threat | Outcome | Why |

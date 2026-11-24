@@ -8,7 +8,7 @@
 // Nothing about the waveform is sent over the network: the bars are recomputed from the
 // encrypted audio itself, so a sender can't make a clip *look* different from what it is.
 
-export const BARS = 36;         // bars in a bubble / review bar (fits a 260px-wide bubble)
+export const BARS = 40;         // thin 2px bars, 2px apart — fills a bubble like WhatsApp
 export const MIN_BAR = 0.08;    // silence still draws a visible dot, like WhatsApp
 
 /**

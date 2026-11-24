@@ -21,6 +21,7 @@ import { createPairingCode, parsePairingCode, PairingError, MAX_AGE_S } from './
 import { sdpFingerprint } from './sdp.js';
 import { toB64u, fromB64u, random, toHex, equal } from './bytes.js';
 import { sha256 } from './crypto.js';
+import { msgMeta } from './meta.js';
 
 export const MAX_TEXT = 8000;
 export const MAX_FILE = 25 * 1024 * 1024;
@@ -30,10 +31,10 @@ export const APP_VERSION = '1.0.0';
 
 export const newId = () => toHex(random(8));
 /** Message types handled by the app layer (location, SOS, groups); everything else unknown is ignored. */
-export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call']);
-/** Optional file tags: which group a file belongs to, and whether it is a voice clip. */
+export const APP_TYPES = new Set(['loc', 'sos', 'ginv', 'gmsg', 'gleave', 'edit', 'del', 'profile', 'call', 'read']);
+/** Optional file tags: which group a file belongs to, whether it is a voice clip, reply/forward (meta.js). */
 export function fileExtra(m) {
-  const out = {};
+  const out = msgMeta(m);
   if (typeof m?.gid === 'string' && /^[0-9a-f]{32}$/.test(m.gid)) out.gid = m.gid;
   if (m?.kind === 'voice') out.kind = 'voice';
   return out;
@@ -128,11 +129,12 @@ export class Conversation {
   }
 
   // ---------- sending ----------
-  async sendText(text, ttl = 0) {
+  /** @param {{re?, fw?}} [tags] reply quote / forwarded hops — see meta.js */
+  async sendText(text, ttl = 0, tags = {}) {
     text = String(text);
     if (!text.trim()) return null;
     if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
-    const m = { t: 'msg', id: newId(), ts: Date.now(), text, ttl: ttl | 0 };
+    const m = { t: 'msg', id: newId(), ts: Date.now(), text, ttl: ttl | 0, ...msgMeta(tags) };
     await this.#send(m);
     return m;
   }
@@ -178,7 +180,7 @@ export class Conversation {
         break;
       case 'msg':
         if (typeof m.text !== 'string' || m.text.length > MAX_TEXT || typeof m.id !== 'string') return;
-        this.emit('message', { id: m.id.slice(0, 32), ts: +m.ts || Date.now(), text: m.text, ttl: Math.max(0, m.ttl | 0) });
+        this.emit('message', { id: m.id.slice(0, 32), ts: +m.ts || Date.now(), text: m.text, ttl: Math.max(0, m.ttl | 0), ...msgMeta(m) });
         this.session.sendMessage({ t: 'ack', id: m.id }).catch(() => {});
         break;
       case 'ack': this.emit('ack', String(m.id)); break;

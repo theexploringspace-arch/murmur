@@ -3,14 +3,14 @@
   --bg: #0e1116; --bg2: #161b22; --bg3: #1f2630; --line: #2a3340;
   --fg: #e8edf3; --fg2: #9aa7b4; --accent: #5eead4; --accent2: #2dd4bf; --accent-ink: #052e2b;
   --danger: #f87171; --warn: #fbbf24; --ok: #4ade80;
-  --out: #134e4a; --in: #1f2630;
+  --out: #134e4a; --in: #1f2630; --read: #53bdeb;
   --r: 14px; --safe-b: env(safe-area-inset-bottom, 0px); --safe-t: env(safe-area-inset-top, 0px);
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   color-scheme: dark;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg: #f6f7f9; --bg2: #fff; --bg3: #eef1f4; --line: #d8dee5; --fg: #0f172a; --fg2: #5b6675;
-    --accent: #0d9488; --accent2: #0f766e; --accent-ink: #fff; --out: #ccfbf1; --in: #fff; color-scheme: light; }
+    --accent: #0d9488; --accent2: #0f766e; --accent-ink: #fff; --out: #ccfbf1; --in: #fff; --read: #0a7cd8; color-scheme: light; }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
@@ -288,9 +288,9 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 
 /* ---- voice messages (WhatsApp-style) — see src/js/ui/voice.js ---- */
 /* While recording or reviewing, the bar takes over the composer: no pop-up over the chat. */
-.composer[data-voice="holding"] > :not(.voicebar):not(.mic),
-.composer[data-voice="locked"] > :not(.voicebar),
-.composer[data-voice="review"] > :not(.voicebar) { display: none !important; }
+.composer[data-voice="holding"] > :not(.voicebar):not(.mic):not(.replybar),
+.composer[data-voice="locked"] > :not(.voicebar):not(.replybar),
+.composer[data-voice="review"] > :not(.voicebar):not(.replybar) { display: none !important; }
 .composer[data-voice]:not([data-voice="idle"]) { align-items: center; }
 .voicebar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 0.35rem; min-height: 48px; }
 .voicebar > * { display: none; }
@@ -303,7 +303,7 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .vdot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); flex: none; animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: 0.25; } }
 .vtimer { font-variant-numeric: tabular-nums; font-size: 0.95rem; min-width: 2.6em; }
-.vrec .vwave { flex: 1; height: 24px; }
+.vrec .vwave { flex: 1; height: 20px; }
 .vhint { color: var(--fg2); font-size: 0.8rem; white-space: nowrap; padding-right: 0.2rem; flex: none; }
 .voicebar[data-state="holding"] .vwave { max-width: 110px; }
 .voicebar .vtrash { color: var(--danger); }
@@ -315,8 +315,8 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .vplay { width: 40px; height: 40px; min-height: 40px; padding: 0; border: 0; border-radius: 50%; background: transparent; justify-content: center; flex: none; color: var(--fg); }
 .vplay svg path, .voicebar .vstop svg path { fill: currentColor; stroke-width: 1; }
 .vmid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.vwave { display: flex; align-items: center; gap: 2px; height: 30px; min-width: 0; overflow: hidden; touch-action: pan-y; cursor: pointer; }
-.vwave span { flex: 1; min-width: 1px; max-width: 4px; border-radius: 2px; background: var(--fg2); opacity: 0.55; transition: height 90ms linear; }
+.vwave { display: flex; align-items: center; gap: 2px; height: 22px; min-width: 0; overflow: hidden; touch-action: pan-y; cursor: pointer; }
+.vwave span { flex: none; width: 2px; min-height: 3px; border-radius: 1px; background: var(--fg2); opacity: 0.6; transition: height 90ms linear; }
 .vwave span.on { background: var(--accent); opacity: 1; }
 .vrec .vwave span { background: var(--fg); opacity: 0.8; }
 .vtime { font-size: 0.75rem; color: var(--fg2); font-variant-numeric: tabular-nums; }
@@ -326,3 +326,70 @@ button.avatar.me { border: 0; padding: 0; color: var(--fg); cursor: pointer; }
 .voice.compact .vwave { flex: 1; }
 .doclist .voice { width: 100%; }
 @media (prefers-reduced-motion: reduce) { .vdot { animation: none; } .vwave span { transition: none; } }
+
+/* ---- WhatsApp-style bubbles: ticks, media, documents, replies, forwards (see bubble() in app.js) ---- */
+.msg { position: relative; touch-action: pan-y; transition: transform 0.18s ease; }
+.msg.swiping { transition: none; }
+.msg.swiping::before { content: '↩'; position: absolute; left: -2rem; top: 50%; transform: translateY(-50%); font-size: 1.1rem; color: var(--fg2); opacity: 0.4; }
+.msg.swiping[data-armed="1"]::before { opacity: 1; color: var(--accent); }
+.msg.flash { animation: flash 1.2s ease; }
+@keyframes flash { 0%, 40% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+.msg .meta .status { color: var(--fg2); font-weight: 600; text-align: right; min-height: 0; letter-spacing: -0.12em; }
+.msg .meta .status[data-st="read"] { color: var(--read); }
+.msg .meta .status[data-st="failed"] { color: var(--danger); }
+
+.msg.media { padding: 3px; }
+.msg.media > :not(.mediawrap) { margin: 0.3rem 0.55rem; }
+.mediawrap { position: relative; }
+.mediabox { display: block; padding: 0; border: 0; background: none; min-height: 0; width: auto; border-radius: 13px; overflow: hidden; cursor: zoom-in; }
+.msg .mediabox img.attach, .msg .mediabox video.attach { display: block; width: min(260px, 66vw); max-width: none; max-height: 340px; object-fit: cover; margin: 0; border-radius: 13px; background: #000; }
+.playbadge { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; pointer-events: none; }
+.playbadge svg { width: 52px; height: 52px; padding: 13px 11px 13px 15px; border-radius: 50%; background: rgba(0, 0, 0, 0.5); color: #fff; }
+.playbadge svg path { fill: currentColor; }
+.msg .meta.over { position: absolute; right: 6px; bottom: 6px; margin: 0; padding: 0.1rem 0.45rem; border-radius: 10px; background: rgba(0, 0, 0, 0.45); color: #fff; pointer-events: none; }
+.msg .meta.over .status { color: #fff; }
+.msg .meta.over .status[data-st="read"] { color: #7fd3ff; }
+
+.doc { display: flex; align-items: center; gap: 0.6rem; width: min(260px, 66vw); padding: 0.5rem 0.6rem; min-height: 0; border: 0; border-radius: 10px; background: rgba(0, 0, 0, 0.18); text-align: left; white-space: normal; }
+.docbadge { flex: none; display: flex; align-items: center; justify-content: center; width: 38px; height: 46px; border-radius: 6px; background: var(--accent); color: var(--accent-ink); font-size: 0.62rem; font-weight: 800; letter-spacing: 0.02em; }
+.docbadge.big { width: 76px; height: 92px; font-size: 1.05rem; border-radius: 10px; }
+.docmeta { display: flex; flex-direction: column; min-width: 0; }
+.docname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; font-size: 0.9rem; }
+.docmeta small { color: var(--fg2); font-size: 0.75rem; }
+
+.fwd { display: flex; align-items: center; gap: 0.25rem; font-size: 0.75rem; font-style: italic; color: var(--fg2); margin-bottom: 0.15rem; }
+.replyq { display: flex; align-items: stretch; gap: 0.5rem; width: 100%; min-height: 0; margin: 0 0 0.3rem; padding: 0.35rem 0.5rem 0.35rem 0.6rem; border: 0; border-left: 4px solid var(--accent); border-radius: 8px; background: rgba(0, 0, 0, 0.2); color: inherit; text-align: left; white-space: normal; font-size: 0.85rem; }
+@media (prefers-color-scheme: light) { .replyq { background: rgba(0, 0, 0, 0.06); } }
+.qbody { display: flex; flex-direction: column; min-width: 0; flex: 1; gap: 0.1rem; }
+.qwho { color: var(--accent); font-size: 0.8rem; }
+.qwho.me { color: #a78bfa; }
+.qtext { color: var(--fg2); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.qtext svg { vertical-align: -2px; }
+.qthumb { width: 42px; height: 42px; object-fit: cover; border-radius: 6px; flex: none; }
+
+.composer { flex-wrap: wrap; }
+.replybar { flex-basis: 100%; display: flex; align-items: center; gap: 0.3rem; }
+.replybar[hidden] { display: none; }
+.replybar .replyq { margin: 0; flex: 1; cursor: default; }
+
+.reconnect { position: relative; }
+.reconnect .dismiss { position: absolute; top: 0.2rem; right: 0.2rem; color: var(--fg2); min-height: 32px; width: 32px; padding: 0; }
+button.linkish { background: none; border: 0; padding: 0.4rem 0; min-height: 0; color: var(--accent); text-decoration: underline; }
+
+/* full-screen viewer */
+.viewer-screen { position: fixed; inset: 0; z-index: 1000; display: flex; flex-direction: column; background: #000; color: #fff; padding: var(--safe-t, 0) 0 var(--safe-b, 0); }
+.vtop { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem; }
+.vtop .icon { color: #fff; }
+.vwho { display: flex; flex-direction: column; line-height: 1.2; }
+.vwho small { color: #b7c0ca; }
+.vstage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; }
+.vbig { width: 100%; height: 100%; object-fit: contain; } /* small photos scale up to fill the screen, like WhatsApp */
+.vdoc { display: flex; flex-direction: column; align-items: center; gap: 0.8rem; padding: 1rem; text-align: center; word-break: break-all; }
+.vbottom { display: flex; flex-direction: column; gap: 0.4rem; padding: 0.6rem 0.5rem 0.8rem; }
+.vinfo { text-align: center; color: #b7c0ca; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.vacts { display: flex; justify-content: space-around; }
+.vact { display: flex; flex-direction: column; align-items: center; gap: 0.2rem; background: none; border: 0; color: #fff; font-size: 0.75rem; min-width: 64px; }
+@media (prefers-reduced-motion: reduce) { .msg, .msg.flash { transition: none; animation: none; } }
+/* Things that can pop up over the viewer (a dangerous-file warning, a toast) must stay on top of it. */
+.viewer-screen ~ .modal-backdrop, body > .modal-backdrop { z-index: 1050; }
+#toasts { z-index: 1100; }

@@ -89,3 +89,15 @@ Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the mess
 2. "Hide my IP" uses `iceTransportPolicy: 'relay'`. Why must the **answering** phone also use it?
    (Hint: peer-reflexive candidates.) Find where the app fetches ICE servers before accepting.
 3. Threat-model it: what can Cloudflare TURN learn about a call, and what can't it?
+
+## Exercise 13 — replies, forwards and receipts
+1. Open `core/meta.js` → `resolveQuote()`. Write down an attack that would work if the quote were
+   drawn from the sender's preview `t` instead of your own copy. Then find the unit test that
+   proves it can't happen.
+2. Why is `re.by` a contact id and not "me"/"you"? (Hint: draw a 3-person group and ask what "you"
+   means on each phone.)
+3. Read receipts are reciprocal. Argue both sides: what does reciprocity protect, and what does it
+   cost someone who just wants privacy for themselves?
+4. Debugging task: a message shows grey ✓✓ forever even though the other phone opened the chat.
+   List three places in the code you'd look, in order (hint: `confirmReads`, `receiptsOn`, the
+   `read` case in `onAppMessage`).

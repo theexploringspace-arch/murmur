@@ -139,8 +139,8 @@ bidirectional bursts (`test/unit/core.test.mjs`, 150-message E2E burst).
 | `t` | fields | notes |
 |---|---|---|
 | `hello` | `name`, `app` | first message each way |
-| `msg` | `id`, `ts`, `text` (≤ 8000), `ttl` (s) | receiver replies `ack` |
-| `ack` | `id` | delivery receipt (✓✓) |
+| `msg` | `id`, `ts`, `text` (≤ 8000), `ttl` (s), [`re`], [`fw`] | receiver replies `ack`. `re`/`fw`: §14 |
+| `ack` | `id` | delivery receipt (grey ✓✓) |
 | `typing` | `on` | |
 | `file` | `id`, `ts`, `name`, `mime`, `size` (≤ 25 MiB), `sha` (b64url SHA-256), `chunks`, `ttl` | then `chunks` × `chunk` |
 | `chunk` | `id`, `i`, `d` (b64url, 8 KiB raw) | strictly sequential; size & hash verified |
@@ -306,3 +306,34 @@ Relay chunks: `"MBK1" ‖ id8 ‖ u32 created ‖ u16 i ‖ u16 n ‖ ≤ 900 Ki
 Renewal (envelope kind 6): `[01, 06] ‖ invite` (the usual signed invite) to each contact's inbox; the
 contact answers with a normal join + hello. Accepted only if `invite.identityPub` equals the stored key
 for that contact, `created ≥ last renewal` and the invite id is new.
+
+## 14. Replies, forwards and read receipts (`meta.js`)
+
+Optional tags on `msg`, `file` (and so voice), `gmsg` and `loc`. Validated by `msgMeta()` on every
+receive path (nearby, relay, groups); anything malformed is dropped silently, never an error.
+
+| Tag | Shape | Meaning |
+|---|---|---|
+| `re` | `{ id: 8–32 hex, by: 32-hex contact id, k ∈ text·photo·video·voice·file·loc·sos, t ≤ 120 chars }` | This message **replies** to message `id`, written by `by`. `k`/`t` are a preview for phones that don't have the original |
+| `fw` | integer 1–99 | **Forwarded**, this many hops (≥ 5 → "Forwarded many times"). Not to be confused with `fwd`, the group creator relaying a member's message (§9) |
+
+`by` is an absolute contact id (the SHA-256-derived id of §1), so "who wrote it" means the same on
+every phone — "You" when it is your own id, the contact's or member's name otherwise.
+
+**Quotes are drawn from the receiver's own copy.** If the receiving phone has message `id`, the quote
+shows *its* text/kind — the sender's preview `t` is used only when the original isn't on this phone.
+A contact therefore can't make a quote put words in your mouth.
+
+| `t` | fields | notes |
+|---|---|---|
+| `read` | `ids` (≤ 200 message ids) | "I have seen these" → blue ✓✓. 1:1 chats only (groups: delivery only) |
+
+A phone sends `read` only while the chat is on screen and the app is visible, batched after 400 ms;
+each incoming message is marked `rs` locally once seen (even with receipts off), so turning them on
+later never sends a burst of old receipts. **Reciprocal:** with receipts off for a contact (per
+contact `on`/`off` overrides the global switch), a phone neither sends `read` nor shows the
+contact's. Status only moves forward — `queued → sent → delivered → read` — and `failed` can't
+replace a message the other phone already confirmed (`statusAfter()`).
+
+**Forwarding** sends a brand-new message (new `id`, encrypted for each recipient as usual) carrying
+`fw`, with no `re` and nothing about the original sender. At most 5 chats per forward.

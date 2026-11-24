@@ -25,6 +25,7 @@ import { readBox, writeBox } from './core/relaybox.js';
 import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
 import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
+import { msgMeta, quoteOf, resolveQuote, kindOf, kindLabel, forwardHops, forwardLabel, receiptsOn, toConfirm, readIds, statusAfter, typeLabel } from './core/meta.js';
 
 const $app = document.getElementById('app');
 const store = new IdbStore();
@@ -43,6 +44,7 @@ const S = {
   unread: new Map(),
   typing: new Map(),
   drafts: new Map(),     // chat key → unsent text (memory only, never stored)
+  replyTo: new Map(),    // chat key → reply quote waiting in the composer (memory only)
   view: null, viewArgs: null,
   scanner: null,
   lastActivity: Date.now(),
@@ -83,7 +85,7 @@ let lastScreen = '';
 function render() {
   const screen = `${S.view}:${S.viewArgs?.[0] ?? ''}`;
   if (screen !== lastScreen) {
-    lastScreen = screen; stopAllVoice(); PLAYERS.clear();
+    lastScreen = screen; stopAllVoice(); PLAYERS.clear(); closeViewer();
     if (S.voiceRec) { S.voiceRec.discard(); S.voiceRec = null; } // releases the microphone
   }
   // Re-drawing the same chat must not steal the keyboard or move the cursor while you type.
@@ -141,7 +143,7 @@ async function saveHistory(id) {
   const out = [];
   for (const m of (S.chats.get(id) || []).slice(-HISTORY_MAX)) {
     if (m.ttl) continue;
-    const base = { id: m.id, dir: m.dir, ts: m.ts, status: m.status, edited: m.edited, deleted: m.deleted, system: m.system };
+    const base = { id: m.id, dir: m.dir, ts: m.ts, status: m.status, edited: m.edited, deleted: m.deleted, system: m.system, re: m.re, fw: m.fw, rs: m.rs };
     if (m.file && !m.deleted) {
       if (!m.file.stored && m.file.blob) {
         const bytes = new Uint8Array(await m.file.blob.arrayBuffer());
@@ -253,11 +255,20 @@ function stopRemote() { S.remote?.stop(); S.remote = null; S.relayOnline = false
 function setMsgStatus(cid, mid, status) {
   const m = (S.chats.get(cid) || []).find((x) => x.id === mid && x.dir === 'out');
   if (!m) { if (status === 'delivered') groupAck(cid, mid); return; }
-  if (m.status === 'delivered') return;
-  m.status = status;
-  const el = document.querySelector(`[data-mid="${mid}"] .status`);
-  if (el) el.textContent = STATUS_MARK[status] || '';
+  const next = statusAfter(m.status, status); // only forward: a late "delivered" never undoes "read"
+  if (next === m.status) return;
+  m.status = next; paintStatus(cid, m);
   persistHistory(cid).catch(() => {});
+}
+/** Read receipts are reciprocal: with them off for this contact, their "read" shows as delivered. */
+function shownStatus(key, m) {
+  if (m.status === 'read' && !(S.contacts.get(key) && receiptsOn(S.settings, S.contacts.get(key)))) return 'delivered';
+  return m.status || 'sent';
+}
+function paintStatus(key, m) {
+  if (!isOpenChat(key)) return;
+  const el = document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"] .status`); if (!el) return;
+  const st = shownStatus(key, m); el.textContent = groupStatus(m, key); el.dataset.st = st; el.title = STATUS_WORD[st] || st;
 }
 const ACKED = new Set(); // `${cid}:${mid}` confirmed by the other phone (bounded)
 const markDelivered = (cid, mid) => {
@@ -275,7 +286,8 @@ function backstopViaRelay(cid, m) {
     S.remote.send(cid, m).then(() => setMsgStatus(cid, m.id, S.relayOnline ? 'sent' : 'queued')).catch(() => {});
   }, LIVE_CONFIRM_MS);
 }
-const STATUS_MARK = { queued: '○', sent: '✓', delivered: '✓✓', failed: '!' };
+const STATUS_MARK = { queued: '○', sent: '✓', delivered: '✓✓', read: '✓✓', failed: '!' };
+const STATUS_WORD = { queued: 'Waiting to send', sent: 'Sent', delivered: 'Delivered', read: 'Read', failed: 'Not delivered' };
 
 async function onRemoteJoined({ cid, name, pub }) {
   let c = S.contacts.get(cid);
@@ -297,7 +309,7 @@ async function onRemoteMessage(cid, m) {
     case 'hello': if (!c.remote) { c.remote = true; await persistContacts(); } rerenderIf('chat', () => S.viewArgs[0] === cid); rerenderIf('home'); break;
     case 'msg':
       if (typeof m.text !== 'string' || m.text.length > MAX_TEXT || typeof m.id !== 'string') return;
-      addMessage(cid, { id: m.id.slice(0, 32), dir: 'in', ts: +m.ts || Date.now(), text: m.text, ttl: Math.max(0, m.ttl | 0) });
+      addMessage(cid, { id: m.id.slice(0, 32), dir: 'in', ts: +m.ts || Date.now(), text: m.text, ttl: Math.max(0, m.ttl | 0), ...msgMeta(m) });
       S.remote.send(cid, { t: 'ack', id: m.id }).catch(() => {});
       break;
     case 'ack': markDelivered(cid, String(m.id)); break;
@@ -384,7 +396,7 @@ function lock(reason) {
   for (const u of PIC_URLS.values()) URL.revokeObjectURL(u); PIC_URLS.clear();
   endCall('locked');
   S.vault?.lock();
-  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
+  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), replyTo: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
   go('unlock');
   if (reason) toast(reason);
@@ -514,8 +526,28 @@ function addMessage(cid, m) {
   const open = isOpenChat(cid);
   if (m.dir === 'in' && !(open && !document.hidden)) S.unread.set(cid, (S.unread.get(cid) || 0) + 1);
   persistHistory(cid).catch(() => {});
-  if (open) appendBubble(m, cid); else rerenderIf('home');
+  if (open) { appendBubble(m, cid); if (m.dir === 'in') confirmReads(cid); } else rerenderIf('home');
 }
+
+// ---- read receipts (blue ✓✓): sent only while the chat is really on screen ----
+// Every incoming message gets `rs` (read-sent) once you've seen it — even with receipts off —
+// so switching them on later never floods the other phone with old "read"s.
+const READ_TIMERS = new Map();
+function confirmReads(cid) {
+  if (String(cid).startsWith('g:') || document.hidden || !isOpenChat(cid)) return; // groups: delivery only
+  clearTimeout(READ_TIMERS.get(cid));
+  READ_TIMERS.set(cid, setTimeout(() => {
+    READ_TIMERS.delete(cid);
+    if (document.hidden || !isOpenChat(cid)) return;
+    const c = S.contacts.get(cid); if (!c || c.request) return; // an unaccepted stranger learns nothing
+    const msgs = S.chats.get(cid) || []; const ids = toConfirm(msgs);
+    if (!ids.length) return;
+    for (const m of msgs) if (ids.includes(m.id)) m.rs = 1;
+    persistHistory(cid).catch(() => {});
+    if (receiptsOn(S.settings, c)) for (let i = 0; i < ids.length; i += 200) deliver(cid, { t: 'read', ids: ids.slice(i, i + 200) }).catch(() => {});
+  }, 400));
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.view === 'chat' && S.vault) confirmReads(S.viewArgs[0]); });
 const isOpenChat = (key) => (S.view === 'chat' && S.viewArgs[0] === key) || (S.view === 'group' && `g:${S.viewArgs[0]}` === key);
 
 /** Called once a Conversation is connected: bind it to a (possibly new) contact. */
@@ -534,7 +566,10 @@ async function adoptConversation(conv) {
   if (old && old !== conv) old.close('replaced by new connection');
   S.convs.set(id, conv);
   conv.on('message', (m) => addMessage(id, { ...m, dir: 'in' }))
-    .on('file', async (f) => receivedFile(id, { id: f.id, ts: f.ts, ttl: f.ttl }, f.name, f.mime, new Uint8Array(await f.blob.arrayBuffer()), f))
+    .on('file', async (f) => {
+      await receivedFile(id, { id: f.id, ts: f.ts, ttl: f.ttl }, f.name, f.mime, new Uint8Array(await f.blob.arrayBuffer()), f);
+      if (S.view === 'chat' && S.viewArgs[0] === id) setStatusLine(''); // "Receiving… 100%" is done
+    })
     .on('app', (m) => onAppMessage(id, m).catch((e) => console.warn(e)))
     .on('control', (m) => onControl(conv, id, m).catch((e) => toast(`Internet setup failed: ${e.message}`, 'error')))
     .on('file-start', (f) => { if (S.view === 'chat' && S.viewArgs[0] === id) setStatusLine(`Receiving ${f.name}…`); })
@@ -1050,39 +1085,81 @@ function richText(m, cid) {
     : h(`button.inlink.risk-${seg.analysis.risk}`, { type: 'button', 'data-testid': 'link', onclick: () => checkLink(seg, cid, m.dir) }, seg.text))));
 }
 
+// ---- message bubbles (WhatsApp-style) ----
+// Photos and videos fill the bubble with the time over the corner; no file name, no size, no
+// Save button. Tap → full-screen viewer, which shows what the file really is (JPEG · 199 KB) and
+// offers Save / Forward / Reply. Documents get a compact card. Voice notes get the player.
+const isVisual = (m) => !!(m.file?.url && (m.file.safety?.inline || m.file.playable === 'video'));
+
+function whoWrote(by, key) {
+  if (by === S.myCid) return 'You';
+  if (String(key).startsWith('g:')) return memberName(S.groups.get(String(key).slice(2)), by);
+  const c = S.contacts.get(by); return c ? displayName(c) : 'Them';
+}
+const QUOTE_ICON = { photo: 'image', video: 'video', voice: 'mic', file: 'clip', loc: 'pin', sos: 'alert' };
+/** The quoted message: who wrote it, an icon for its kind, a preview line, a thumbnail for photos. */
+function quoteContent(re, key) {
+  const local = findMsg(key, re.id);
+  const q = resolveQuote(re, local);
+  const text = q.t || kindLabel(q.k, local?.file?.name);
+  return [h('span.qbody', h(`strong.qwho${q.by === S.myCid ? '.me' : ''}`, whoWrote(q.by, key)),
+    h('span.qtext', QUOTE_ICON[q.k] && !q.gone ? icon(QUOTE_ICON[q.k], 14) : null, ' ', text)),
+  local?.file?.url && local.file.safety?.inline && !q.gone ? h('img.qthumb', { src: local.file.url, alt: '' }) : null];
+}
+/** Scroll to a message and flash it (tap on a quote). */
+function jumpTo(key, mid) {
+  const el = document.querySelector(`#log [data-mid="${CSS.escape(mid)}"]`);
+  if (!el) { toast('The original message isn’t on this phone anymore'); return; }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+}
+
 function bubble(m, key = S.viewArgs?.[0]) {
   if (m.system) return h('p.sysmsg', { 'data-mid': m.id }, m.text);
   if (m.deleted) return h(`div.msg.${m.dir}.deleted`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
     h('p.gone', { 'data-testid': 'deleted' }, icon('trash', 14), m.dir === 'out' ? ' You deleted this message' : ' This message was deleted'),
     h('div.meta', fmtTime(m.ts)));
   const cid = m.from || key; // in groups, safety decisions use the actual sender
+  const st = m.dir === 'out' ? shownStatus(key, m) : null;
+  const meta = (over) => h(`div.meta${over ? '.over' : ''}`, fmtTime(m.ts), m.edited ? h('span.edited', { 'data-testid': 'edited' }, 'edited') : null,
+    m.expiresAt ? h('span.ttl', icon('timer', 12), h('span', { 'data-expires': m.expiresAt })) : null,
+    m.dir === 'out' ? h('span.status', { title: STATUS_WORD[st] || st, 'data-st': st, 'data-testid': 'status' }, groupStatus(m, key)) : null);
   const body = [];
   if (m.from && m.dir === 'in' && String(key).startsWith('g:')) body.push(h('div.sender', { 'data-testid': 'sender' }, memberName(S.groups.get(String(key).slice(2)), m.from)));
+  if (m.fw) body.push(h('div.fwd', { 'data-testid': 'forwarded' }, icon('forward', 13), ` ${forwardLabel(m.fw)}`));
+  if (m.re) body.push(h('button.replyq', { type: 'button', 'data-testid': 'quote', 'data-qid': m.re.id, onclick: () => jumpTo(key, m.re.id) }, ...quoteContent(m.re, key)));
   if (m.sos) body.push(sosCard(m));
   if (m.loc) body.push(locCard(m));
   if (m.text != null) body.push(richText(m, cid));
+  let overMeta = false;
   if (m.file) {
-    const sf = m.file.safety;
-    if (m.file.url && sf?.inline) body.push(h('img.attach', { src: m.file.url, alt: m.file.name }));
-    // A voice note is a message, not a file: player only — no name, no size, no Save.
-    if (isVoice(m)) {
-      if (!PLAYERS.has(m.file.url)) PLAYERS.set(m.file.url, voicePlayer({ blob: m.file.blob, url: m.file.url }));
-      body.push(PLAYERS.get(m.file.url));
-    } else if (m.file.url && m.file.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: m.file.url, 'data-testid': 'audio' }));
-    if (m.file.url && m.file.playable === 'video') body.push(h('video.attach', { controls: true, playsinline: true, preload: 'metadata', src: m.file.url, 'data-testid': 'video' }));
+    const f = m.file, sf = f.safety;
+    if (isVisual(m)) {
+      const isVid = f.playable === 'video';
+      overMeta = !(sf && sf.verdict !== 'ok');
+      body.push(h('div.mediawrap',
+        h('button.mediabox', { type: 'button', onclick: () => openViewer(m, key), 'data-testid': 'media-open', 'aria-label': isVid ? 'Open video' : 'Open photo' },
+          isVid ? [h('video.attach', { src: `${f.url}#t=0.1`, preload: 'metadata', muted: true, playsinline: true, 'data-testid': 'video' }), h('span.playbadge', icon('play', 26))]
+            : h('img.attach', { src: f.url, alt: 'Photo' })),
+        overMeta ? meta(true) : null));
+    } else if (isVoice(m)) {
+      // A voice note is a message, not a file: player only — no name, no size, no Save.
+      if (!PLAYERS.has(f.url)) PLAYERS.set(f.url, voicePlayer({ blob: f.blob, url: f.url }));
+      body.push(PLAYERS.get(f.url));
+    } else if (f.url) {
+      if (f.playable === 'audio') body.push(h('audio', { controls: true, preload: 'metadata', src: f.url, 'data-testid': 'audio' }));
+      const tl = typeLabel(sf?.realType || f.mime, f.name);
+      body.push(h('button.doc', { type: 'button', onclick: () => openViewer(m, key), 'data-testid': 'file', 'data-blob': f.url },
+        h('span.docbadge', tl), h('span.docmeta', h('strong.docname', f.name), h('small', `${tl} · ${fmtBytes(f.size)}`))));
+    } else if (f.stored && !f.missing) body.push(h('p.hint', f.kind === 'voice' ? 'Loading voice message…' : 'Loading…'));
+    else body.push(h('p.hint', icon(f.kind === 'voice' ? 'mic' : 'clip', 14), f.kind === 'voice' ? ' Voice message' : ` ${f.name}`));
     if (sf && sf.verdict !== 'ok') body.push(h(`p.filewarn.${sf.verdict}`, { 'data-testid': 'file-warning' }, icon('alert', 14), ` ${sf.reasons[0]}`));
-    if (!m.file.url && m.file.stored && !m.file.missing) body.push(h('p.hint', m.file.kind === 'voice' ? 'Loading voice message…' : 'Loading…'));
-    if (isVoice(m)) { /* nothing else to show */ } else if (!m.file.url && m.file.kind === 'voice') body.push(h('p.hint', icon('mic', 14), ' Voice message'));
-    else body.push(m.file.url ? h('button.file', { type: 'button', onclick: () => saveFile(m, cid), 'data-testid': 'file', 'data-blob': m.file.url }, icon('clip', 16), ` ${m.file.name} · ${fmtBytes(m.file.size)}`, h('span.save', 'Save')) : h('span.file', m.file.name));
   }
-  return h(`div.msg.${m.dir}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` },
-    ...body,
-    h('div.meta', fmtTime(m.ts), m.edited ? h('span.edited', { 'data-testid': 'edited' }, 'edited') : null,
-      m.expiresAt ? h('span.ttl', icon('timer', 12), h('span', { 'data-expires': m.expiresAt })) : null,
-      m.dir === 'out' ? h('span.status', { title: m.status || 'sent' }, groupStatus(m, key)) : null));
+  const media = overMeta && !m.text && !m.loc && !m.sos;
+  return h(`div.msg.${m.dir}${media ? '.media' : ''}`, { 'data-mid': m.id, 'data-testid': `msg-${m.dir}` }, ...body, overMeta ? null : meta(false));
 }
 function groupStatus(m, key) {
-  if (!String(key).startsWith('g:') || !m.acks) return STATUS_MARK[m.status] || '✓';
+  if (!String(key).startsWith('g:') || !m.acks) return STATUS_MARK[shownStatus(key, m)] || '✓';
   const g = S.groups.get(String(key).slice(2)); const n = g ? recipients(g, S.myCid).length : 0;
   if (m.status === 'queued' && !m.acks.length) return STATUS_MARK.queued;
   return m.acks.length && m.acks.length >= n ? '✓✓' : m.acks.length ? `✓ ${m.acks.length}/${n}` : '✓';
@@ -1096,6 +1173,30 @@ function appendBubble(m, key) {
   log.append(bubble(m, key)); // key tells the renderer whether this is a group chat (sender names)
   if (nearBottom || m.dir === 'out') log.scrollTop = log.scrollHeight;
   purgeExpired();
+}
+
+// ---- sending (chat, reply and forward all go through these) ----
+async function sendTextTo(id, text, tags = {}) {
+  if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
+  const c = S.contacts.get(id); if (!c) throw new Error('Contact not found');
+  if (isOnline(id)) {
+    const m = await S.convs.get(id).sendText(text, c.ttl, tags);
+    addMessage(id, { ...m, dir: 'out', status: 'sent' });
+    backstopViaRelay(id, m);
+  } else {
+    if (!(hasRemote(id) && S.remote.canSend(id))) throw new Error(`${displayName(c)} isn't reachable yet`);
+    const m = { t: 'msg', id: newId(), ts: Date.now(), text, ttl: c.ttl | 0, ...msgMeta(tags) };
+    addMessage(id, { ...m, dir: 'out', status: 'queued' });
+    await S.remote.send(id, m);
+  }
+}
+async function sendFileTo(id, f, kind, tags = {}) {
+  const c = S.contacts.get(id); if (!c) throw new Error('Contact not found');
+  setStatusLine(`Sending ${kind === 'voice' ? 'voice message' : f.name}…`);
+  const extra = { ...(kind ? { kind } : {}), ...msgMeta(tags) };
+  const r = await deliverFile(id, f, c.ttl, (s, t) => setStatusLine(`Sending… ${Math.round((s / t) * 100)}%`), extra);
+  addMessage(id, await fileMessage({ id: r.meta.id, dir: 'out', ts: r.meta.ts, ttl: r.meta.ttl, status: r.status, ...msgMeta(tags) }, r.meta.name, r.meta.mime, r.bytes, kind));
+  setStatusLine('');
 }
 
 VIEWS.chat = (id) => {
@@ -1113,25 +1214,11 @@ VIEWS.chat = (id) => {
   const comp = composer({
     key: id, disabled: !online,
     placeholder: live ? 'Message' : online ? (S.relayOnline ? 'Message (via internet)' : 'Message — sends when you’re online') : hasRemote(id) ? 'Waiting for their first message…' : 'Reconnect to send',
-    onText: async (text) => {
-      if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
-      if (isOnline(id)) {
-        const m = await S.convs.get(id).sendText(text, c.ttl);
-        addMessage(id, { ...m, dir: 'out', status: 'sent' });
-        backstopViaRelay(id, m);
-      } else {
-        const m = { t: 'msg', id: newId(), ts: Date.now(), text, ttl: c.ttl | 0 };
-        addMessage(id, { ...m, dir: 'out', status: 'queued' });
-        await S.remote.send(id, m);
-      }
+    onText: async (text, tags) => {
+      await sendTextTo(id, text, tags);
       if (typingSent) { S.convs.get(id)?.setTyping(false); typingSent = false; }
     },
-    onFile: async (f, kind) => {
-      setStatusLine(`Sending ${f.name}…`);
-      const r = await deliverFile(id, f, c.ttl, (s, t) => setStatusLine(`Sending… ${Math.round((s / t) * 100)}%`), kind ? { kind } : {});
-      addMessage(id, await fileMessage({ id: r.meta.id, dir: 'out', ts: r.meta.ts, ttl: r.meta.ttl, status: r.status }, r.meta.name, r.meta.mime, r.bytes, kind));
-      setStatusLine('');
-    },
+    onFile: (f, kind, tags) => sendFileTo(id, f, kind, tags),
     onLocation: () => shareLocation(id, () => [id]),
   });
   const input = comp.querySelector('textarea');
@@ -1163,7 +1250,9 @@ VIEWS.chat = (id) => {
     !c.request && c.remote && !c.verified ? h('div.banner', { 'data-testid': 'verify-banner' },
       h('p', icon('shield', 14), ' Not verified yet. Call them and compare safety numbers to be sure nobody swapped the invite.'),
       h('button', { onclick: () => go('contact', id) }, 'Compare numbers')) : null,
-    live ? null : h(`div.reconnect${hasRemote(id) ? '.compact' : ''}`,
+    live || (hasRemote(id) && c.hideNearby) ? null : h(`div.reconnect${hasRemote(id) ? '.compact' : ''}`, { 'data-testid': 'nearby-card' },
+      hasRemote(id) ? h('button.icon.small.dismiss', { type: 'button', 'aria-label': 'Hide this', title: 'Hide — it’s also in contact info', 'data-testid': 'nearby-dismiss',
+        onclick: async () => { c.hideNearby = true; await persistContacts(); render(); toast('Hidden. Connect nearby any time from contact info (tap their name).'); } }, icon('close', 16)) : null,
       h('p', hasRemote(id) ? 'Together without internet? Connect nearby:' : 'Meet up on the same Wi-Fi or hotspot to reconnect:'),
       h('div.share',
         h('button.primary', { onclick: () => go('invite', id), 'data-testid': 'reconnect-invite' }, icon('qr', 18), ' Show my code'),
@@ -1175,6 +1264,7 @@ VIEWS.chat = (id) => {
     h('div.chattools', h('label.ttlwrap', { title: 'Disappearing messages' }, icon('timer', 16), ttlSel)),
     comp);
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; if (online) input.focus(); });
+  confirmReads(id);
   return view;
 };
 
@@ -1207,7 +1297,7 @@ async function receivedFile(cid, base, name, mime, bytes, extra = {}) {
     if (!isMember(S.groups.get(extra.gid), cid)) return; // not from a member: drop
     key = `g:${extra.gid}`; from = cid;
   }
-  addMessage(key, { ...(await fileMessage({ ...base, dir: 'in' }, name, mime, bytes, extra.kind)), from });
+  addMessage(key, { ...(await fileMessage({ ...base, dir: 'in', ...msgMeta(extra) }, name, mime, bytes, extra.kind)), from });
 }
 
 // ---- photos & videos: remove hidden location/camera data before sending ----
@@ -1383,7 +1473,7 @@ async function onAppMessage(cid, m) {
       }
       const L = { lat: m.lat, lon: m.lon, acc: m.acc, lid: typeof m.lid === 'string' ? m.lid.slice(0, 32) : undefined, until: Number.isFinite(m.until) ? m.until : undefined };
       if (L.lid && updateLiveBubble(key, L.lid, { ...m, ...L })) return;
-      addMessage(key, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), loc: L, from }); ack();
+      addMessage(key, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), loc: L, from, ...msgMeta(m) }); ack();
       break;
     }
     case 'sos': {
@@ -1415,11 +1505,17 @@ async function onAppMessage(cid, m) {
       const g = S.groups.get(m.gid);
       if (!isMember(g, cid) || typeof m.text !== 'string' || m.text.length > MAX_TEXT) return;
       const from = groupOrigin(g, cid, m); if (!from) return;
-      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), text: m.text, from }); ack();
+      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), text: m.text, from, ...msgMeta(m) }); ack();
       forwardIfAdmin(g, m, cid);
       break;
     }
     case 'edit': case 'del': applyEditOrDelete(cid, m); break;
+    case 'read': {
+      // Reciprocal: with receipts off for this contact we don't show theirs either.
+      if (!receiptsOn(S.settings, c)) return;
+      for (const mid of readIds(m)) { ACKED.add(`${cid}:${mid}`); setMsgStatus(cid, mid, 'read'); }
+      break;
+    }
     case 'profile': await onProfile(cid, m); break;
     case 'call': onCallSignal(cid, m); break;
     case 'gleave': {
@@ -1676,6 +1772,38 @@ function wipeContent(m) {
 /** Long-press (phones) or right-click (computers) on a bubble opens its actions. */
 function messageActions(log, key) {
   let timer = 0, sx = 0, sy = 0;
+  // Swipe a bubble to the right to reply (touch), like WhatsApp. Bubbles are touch-action: pan-y,
+  // so vertical scrolling still belongs to the browser and a sideways drag reaches us.
+  let sw = null, eatClick = false;
+  const NO_SWIPE = '.vwave, .vspeed, .vplay, audio, video[controls], input, textarea, a';
+  log.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' || e.target.closest(NO_SWIPE)) return;
+    const el = e.target.closest('.msg[data-mid]'); if (!el) return;
+    sw = { el, x: e.clientX, y: e.clientY, id: e.pointerId, dx: 0, on: false, buzz: false };
+  });
+  log.addEventListener('pointermove', (e) => {
+    if (!sw || e.pointerId !== sw.id) return;
+    const dx = e.clientX - sw.x, dy = e.clientY - sw.y;
+    if (!sw.on) {
+      if (Math.abs(dy) > 14) { sw = null; return; }
+      if (dx > 14 && dx > Math.abs(dy) * 1.5) { sw.on = true; clearTimeout(timer); sw.el.classList.add('swiping'); } else return;
+    }
+    sw.dx = Math.max(0, Math.min(96, dx));
+    sw.el.style.transform = `translateX(${sw.dx}px)`;
+    sw.el.dataset.armed = sw.dx >= 64 ? '1' : '';
+    if (sw.dx >= 64 && !sw.buzz) { sw.buzz = true; navigator.vibrate?.(10); }
+  });
+  const endSwipe = (e) => {
+    if (!sw || e.pointerId !== sw.id) return;
+    const { el, on, dx } = sw; sw = null;
+    if (!on) return;
+    el.style.transform = ''; el.classList.remove('swiping'); delete el.dataset.armed;
+    eatClick = true; setTimeout(() => { eatClick = false; }, 400); // the lift after a drag isn't a tap
+    const m = findMsg(key, el.dataset.mid);
+    if (e.type === 'pointerup' && dx >= 64 && m) setReply(key, m);
+  };
+  log.addEventListener('pointerup', endSwipe); log.addEventListener('pointercancel', endSwipe);
+  log.addEventListener('click', (e) => { if (eatClick) { e.stopPropagation(); e.preventDefault(); eatClick = false; } }, true);
   const open = (target) => {
     const el = target.closest?.('[data-mid]'); if (!el) return;
     const m = findMsg(key, el.dataset.mid); if (!m || m.system) return;
@@ -1684,7 +1812,9 @@ function messageActions(log, key) {
   };
   log.addEventListener('contextmenu', (e) => { if (e.target.closest('[data-mid]')) { e.preventDefault(); open(e.target); } });
   log.addEventListener('pointerdown', (e) => {
-    if (e.pointerType === 'mouse' || e.target.closest('button, a, audio, video, input')) return;
+    // Photos, documents and quotes are buttons (tap opens them) but still part of the message:
+    // a long-press on them opens the menu too. Real controls (play, links, players) don't.
+    if (e.pointerType === 'mouse' || e.target.closest('button:not(.mediabox):not(.doc):not(.replyq), a, audio, video[controls], input')) return;
     sx = e.clientX; sy = e.clientY; clearTimeout(timer);
     timer = setTimeout(() => open(e.target), 500);
   });
@@ -1695,6 +1825,8 @@ function messageActions(log, key) {
 async function messageMenu(key, m) {
   const left = (ms) => { const min = minutesLeft(m, ms); return min > 1 ? `${min} min left` : 'less than a minute left'; };
   const actions = [['Cancel', false]];
+  if (canReply(m)) actions.push(['Reply', 'reply']);
+  if (canForward(m)) actions.push(['Forward', 'forward']);
   if (m.text != null && !m.deleted) actions.push(['Copy', 'copy']);
   if (canEdit(m)) actions.push([`Edit (${left(EDIT_WINDOW)})`, 'edit']);
   actions.push(['Delete for me', 'me']);
@@ -1704,11 +1836,86 @@ async function messageMenu(key, m) {
       m.dir === 'out' && !canDeleteAll(m) && !m.deleted ? h('p.hint', 'Too late to delete this for everyone (1-hour limit) — you can still remove it from this phone.') : null].filter(Boolean),
     actions });
   try {
-    if (choice === 'copy') { await navigator.clipboard.writeText(m.text); toast('Copied'); }
+    if (choice === 'reply') setReply(key, m);
+    else if (choice === 'forward') await forwardMessage(key, m);
+    else if (choice === 'copy') { await navigator.clipboard.writeText(m.text); toast('Copied'); }
     else if (choice === 'edit') await editMessage(key, m);
     else if (choice === 'me') deleteForMe(key, m);
     else if (choice === 'all') await deleteForEveryone(key, m);
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// ---- reply ----
+const canReply = (m) => !!(m && !m.deleted && !m.system && m.id);
+/** Put a quote of `m` above the composer of chat `key`. */
+function setReply(key, m) {
+  if (!canReply(m)) return;
+  S.replyTo.set(key, quoteOf(m, S.myCid, key));
+  refreshReplyBar(key);
+  document.getElementById('compose')?.focus();
+}
+function replyBar(key) {
+  const re = S.replyTo.get(key);
+  return h('div#replybar.replybar', { hidden: !re, 'data-testid': 'reply-bar' }, re ? [
+    h('div.replyq', ...quoteContent(re, key)),
+    h('button.icon.small', { type: 'button', 'aria-label': 'Cancel reply', 'data-testid': 'reply-cancel', onclick: () => { S.replyTo.delete(key); refreshReplyBar(key); } }, icon('close', 18))] : []);
+}
+function refreshReplyBar(key) { if (isOpenChat(key)) document.getElementById('replybar')?.replaceWith(replyBar(key)); }
+/** The composer's pending reply as message tags, removed from the composer. */
+function takeReply(key) {
+  const re = S.replyTo.get(key); if (!re) return {};
+  S.replyTo.delete(key); refreshReplyBar(key);
+  return { re };
+}
+
+// ---- forward ----
+// Up to 5 chats at once (WhatsApp's limit — a brake on chain-message spam). The copy is sent
+// fresh to each chat, encrypted for each recipient like any new message, and tagged "Forwarded"
+// (≥ 5 hops: "Forwarded many times"). It never carries who it originally came from.
+const FORWARD_MAX = 5;
+const canForward = (m) => !!(m && !m.deleted && !m.system && !m.sos && (m.text != null || m.loc || m.file));
+const fileOf = (m) => new File([m.file.blob], m.file.name, { type: m.file.blob.type || m.file.mime });
+async function forwardMessage(key, m) {
+  if (!canForward(m)) return;
+  if (m.file && !m.file.blob) { toast('This file is still loading — try again in a moment', 'error'); return; }
+  const targets = [
+    ...[...S.contacts.values()].filter((c) => !c.request && canChat(c.id)).map((c) => ({ key: c.id, name: displayName(c), sub: '' })),
+    ...[...S.groups.values()].filter((g) => !g.removed).map((g) => ({ key: `g:${g.id}`, name: g.name, sub: `${g.members.length} people` })),
+  ].sort((x, y) => x.name.localeCompare(y.name));
+  if (!targets.length) { toast('No chats you can send to right now', 'error'); return; }
+  const picked = new Set();
+  const count = h('p.hint', `Choose up to ${FORWARD_MAX} chats.`);
+  const boxes = [];
+  const list = h('ul.picklist.fwdlist', { 'data-testid': 'forward-list' }, targets.map((t) => {
+    const cb = h('input', { type: 'checkbox', 'data-testid': `fwd-${t.name}`, onchange: (e) => {
+      if (e.target.checked) picked.add(t.key); else picked.delete(t.key);
+      for (const b of boxes) b.disabled = !b.checked && picked.size >= FORWARD_MAX;
+      count.textContent = picked.size ? `${picked.size} of ${FORWARD_MAX} selected` : `Choose up to ${FORWARD_MAX} chats.`;
+    } });
+    boxes.push(cb);
+    return h('li', h('label.toggle', cb, ' ', t.name, t.sub ? h('small', ` · ${t.sub}`) : null));
+  }));
+  const v = await modal({ title: 'Forward to…', body: [list, count], actions: [['Cancel', false], ['Send', 'send', 'primary']] });
+  if (v !== 'send' || !picked.size) return;
+  const ok = [], failed = [];
+  for (const t of targets.filter((x) => picked.has(x.key))) {
+    try { await forwardTo(t.key, m); ok.push(t.name); } catch (e) { failed.push(t.name); console.warn('forward:', e.message); }
+  }
+  setStatusLine('');
+  if (ok.length) toast(`Forwarded to ${ok.join(', ')}`, 'success');
+  if (failed.length) toast(`Couldn’t forward to ${failed.join(', ')}`, 'error');
+}
+async function forwardTo(target, m) {
+  const tags = { fw: forwardHops(m) };
+  const g = target.startsWith('g:') ? S.groups.get(target.slice(2)) : null;
+  if (m.text != null) return g ? sendGroupText(g, m.text, tags) : sendTextTo(target, m.text, tags);
+  if (m.file) return g ? groupFile(g, fileOf(m), m.file.kind, tags) : sendFileTo(target, fileOf(m), m.file.kind, tags);
+  if (m.loc) {
+    // A forwarded live location is a snapshot: only its owner can keep it updating.
+    const lm = locMessage(m.loc, { ...tags, ...(g ? { gid: g.id } : {}) });
+    const to = g ? () => recipients(g, S.myCid).filter((c) => S.contacts.has(c)) : () => [target];
+    return sendToTargets(target, to, lm, { loc: pick(lm), fw: tags.fw });
+  }
 }
 
 /** Send to whoever got the original: the contact, or every group member. */
@@ -1845,14 +2052,8 @@ VIEWS.group = (gid) => {
   const comp = composer({
     key, disabled: !active,
     placeholder: active ? `Message ${g.name}` : 'You are no longer in this group',
-    onText: async (text) => {
-      const m = { t: 'gmsg', gid, id: newId(), ts: Date.now(), text };
-      addMessage(key, { ...m, dir: 'out', status: 'sent', acks: [] });
-      const r = await fanOut(g, m);
-      if (r.failed.length) toast(`Couldn’t reach ${r.failed.join(', ')} yet`, 'error');
-      if (r.queued && !r.sent) setMsgStatusDirect(key, m.id, 'queued');
-    },
-    onFile: (file, kind) => groupFile(g, file, kind),
+    onText: (text, tags) => sendGroupText(g, text, tags),
+    onFile: (file, kind, tags) => groupFile(g, file, kind, tags),
     onLocation: () => shareLocation(key, () => recipients(S.groups.get(gid), S.myCid).filter((c) => S.contacts.has(c))),
   });
   return h('div.screen.chat',
@@ -1863,19 +2064,28 @@ VIEWS.group = (gid) => {
     g.members.some((m) => m.cid !== S.myCid && !S.contacts.has(m.cid)) ? h('div.banner', h('p', icon('shield', 14), ' Some members aren’t your contacts: their names come from the group creator, and their messages reach you only through people you know.')) : null,
     log, h('p#chatstatus.chatstatus', { hidden: true }), comp);
 };
+async function sendGroupText(g, text, tags = {}) {
+  if (text.length > MAX_TEXT) throw new Error(`Message too long (max ${MAX_TEXT} characters)`);
+  const key = `g:${g.id}`;
+  const m = { t: 'gmsg', gid: g.id, id: newId(), ts: Date.now(), text, ...msgMeta(tags) };
+  addMessage(key, { ...m, dir: 'out', status: 'sent', acks: [] });
+  const r = await fanOut(g, m);
+  if (r.failed.length) toast(`Couldn’t reach ${r.failed.join(', ')} yet`, 'error');
+  if (r.queued && !r.sent) setMsgStatusDirect(key, m.id, 'queued');
+}
 function setMsgStatusDirect(key, mid, status) {
   const m = (S.chats.get(key) || []).find((x) => x.id === mid); if (!m) return;
-  m.status = status; const el = document.querySelector(`[data-mid="${mid}"] .status`); if (el) el.textContent = STATUS_MARK[status];
+  m.status = statusAfter(m.status, status); paintStatus(key, m);
 }
-async function groupFile(g, file, kind) {
+async function groupFile(g, file, kind, tags = {}) {
   const id = newId(); let first = null; const failed = [];
   for (const cid of recipients(g, S.myCid)) {
     if (!S.contacts.has(cid)) { failed.push(memberName(g, cid)); continue; }
-    try { const r = await deliverFile(cid, file, 0, (s, t) => setStatusLine(`Sending to ${memberName(g, cid)}… ${Math.round((s / t) * 100)}%`), { gid: g.id, kind, id }); first ||= r; }
+    try { const r = await deliverFile(cid, file, 0, (s, t) => setStatusLine(`Sending to ${memberName(g, cid)}… ${Math.round((s / t) * 100)}%`), { gid: g.id, kind, id, ...msgMeta(tags) }); first ||= r; }
     catch { failed.push(memberName(g, cid)); }
   }
   setStatusLine('');
-  if (first) addMessage(`g:${g.id}`, { ...(await fileMessage({ id, dir: 'out', ts: Date.now(), status: first.status, acks: [] }, file.name, file.type, first.bytes, kind)) });
+  if (first) addMessage(`g:${g.id}`, { ...(await fileMessage({ id, dir: 'out', ts: Date.now(), status: first.status, acks: [], ...msgMeta(tags) }, file.name, file.type, first.bytes, kind)) });
   if (failed.length) toast(`Couldn’t reach ${failed.join(', ')} yet`, 'error');
 }
 
@@ -1911,8 +2121,12 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
   const send = async () => {
     const text = input.value; if (!text.trim() || disabled) return;
     input.value = ''; input.style.height = ''; S.drafts.delete(key);
+    const tags = takeReply(key);
     // Re-read the box after the send: a redraw during the await replaced this element.
-    try { await onText(text); } catch (e) { toast(e.message, 'error'); S.drafts.set(key, text); const box = document.getElementById('compose'); if (box) box.value = text; }
+    try { await onText(text, tags); } catch (e) {
+      toast(e.message, 'error'); S.drafts.set(key, text); const box = document.getElementById('compose'); if (box) box.value = text;
+      if (tags.re) { S.replyTo.set(key, tags.re); refreshReplyBar(key); }
+    }
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && matchMedia('(pointer:fine)').matches) { e.preventDefault(); send(); } });
   input.addEventListener('input', () => {
@@ -1927,7 +2141,7 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
       // Nothing leaves the phone on a mis-tap: photos, videos and files always show a preview first.
       // (Voice notes are reviewed inside the composer bar instead — see ui/voice.js.)
       if (!(await reviewBeforeSend(prep, kind))) return;
-      await onFile(prep.file, kind);
+      await onFile(prep.file, kind, takeReply(key));
     } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
   };
   fileIn.addEventListener('change', () => { const f = fileIn.files[0]; fileIn.value = ''; if (f) sendFile(f); });
@@ -1941,7 +2155,7 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
       onState: (st) => vr.form?.setAttribute('data-voice', st),
       onSend: async (clip) => {
         if (clip.size > MAX_FILE) { toast(`Max ${fmtBytes(MAX_FILE)} per file`, 'error'); return; }
-        try { await vr.onFile(clip, 'voice'); } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
+        try { await vr.onFile(clip, 'voice', takeReply(vr.key)); } catch (e) { setStatusLine(''); toast(e.message, 'error'); }
       },
     }));
     S.voiceRec = vr;
@@ -1949,6 +2163,7 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
   const vr = S.voiceRec;
   vr.onFile = onFile; vr.button.disabled = !!disabled;
   const form = h('form.composer', { onsubmit: (e) => { e.preventDefault(); send(); }, 'data-voice': vr.state() },
+    replyBar(key),
     h('button.icon', { type: 'button', onclick: () => fileIn.click(), disabled, 'aria-label': 'Attach photo, video or file', 'data-testid': 'attach' }, icon('clip')),
     h('button.icon', { type: 'button', onclick: onLocation, disabled, 'aria-label': 'Share location', 'data-testid': 'share-location' }, icon('pin')),
     input, fileIn, vr.bar,
@@ -2026,6 +2241,21 @@ VIEWS.contact = (id) => {
         toast(c.noCalls ? `${displayName(c)} can no longer call you` : `${displayName(c)} can call you again`);
       } }), ` Allow ${displayName(c)} to call me`),
       h('p.hint', c.calls && !c.calls.voice && !c.calls.video ? `${displayName(c)} doesn’t accept calls right now.` : ''),
+      h('h2', 'Read receipts'),
+      h('select', { 'data-testid': 'contact-receipts', 'aria-label': 'Read receipts for this contact', onchange: async (e) => {
+        if (e.target.value === 'default') delete c.receipts; else c.receipts = e.target.value;
+        await persistContacts(); toast(receiptsOn(S.settings, c) ? `${displayName(c)} sees when you’ve read their messages` : `${displayName(c)} won’t see when you’ve read their messages`);
+      } },
+        h('option', { value: 'default', selected: !c.receipts }, `Same as everyone (${S.settings.readReceipts === false ? 'off' : 'on'})`),
+        h('option', { value: 'on', selected: c.receipts === 'on' }, 'On for this contact'),
+        h('option', { value: 'off', selected: c.receipts === 'off' }, 'Off for this contact')),
+      h('p.hint', 'Blue ✓✓ tells the sender you’ve opened their message. It works both ways: when it’s off, you won’t see theirs either. Delivered (grey ✓✓) always shows.'),
+      !isOnline(id) ? [h('h2', 'Connect nearby'),
+        h('p.hint', 'On the same Wi-Fi or hotspot? Show your code to each other — no internet needed.'),
+        h('div.share',
+          h('button.primary', { onclick: () => go('invite', id), 'data-testid': 'contact-nearby-show' }, icon('qr', 18), ' Show my code'),
+          h('button', { onclick: () => go('join', id) }, icon('scan', 18), ' Scan theirs')),
+        c.hideNearby ? h('button.linkish', { 'data-testid': 'nearby-unhide', onclick: async () => { delete c.hideNearby; await persistContacts(); toast('The nearby card is back in your chat'); } }, 'Show the nearby card in the chat again') : null] : null,
       h('h2', 'Safety number'),
       h('p', 'Compare these digits with ', h('strong', c.name), '’s screen — in person or on a voice call. If they match, nobody is intercepting you.'),
       sn,
@@ -2071,13 +2301,44 @@ function sharedItems(id) {
   }
   return { media: media.reverse(), docs: docs.reverse(), links: links.reverse() };
 }
-function openViewer(m, cid) {
+// ---- full-screen viewer: the photo/video/file, what it really is, and what you can do with it ----
+function fileInfo(m, img) {
   const f = m.file;
-  const big = f.playable === 'video' ? h('video.viewer', { controls: true, playsinline: true, src: f.url, autoplay: true })
-    : h('img.viewer', { src: f.url, alt: f.name, 'data-testid': 'viewer-image' });
-  modal({ title: `${m.dir === 'out' ? 'You' : displayName(S.contacts.get(cid) || {})} · ${new Date(m.ts).toLocaleString()}`, body: [big],
-    actions: [['Close', false], ['Show in chat', 'chat'], ['Save', 'save', 'primary']] })
-    .then((v) => { if (v === 'save') saveFile(m, cid); else if (v === 'chat') { go('chat', cid); requestAnimationFrame(() => document.querySelector(`#log [data-mid="${CSS.escape(m.id)}"]`)?.scrollIntoView({ block: 'center' })); } });
+  const dims = img?.naturalWidth ? ` · ${img.naturalWidth}×${img.naturalHeight}` : '';
+  return `${typeLabel(f.safety?.realType || f.mime, f.name)} · ${fmtBytes(f.size)}${dims}`;
+}
+function closeViewer() {
+  const v = document.querySelector('.viewer-screen'); if (!v) return;
+  v.querySelector('video')?.pause(); v.remove(); document.removeEventListener('keydown', viewerKeys);
+}
+function viewerKeys(e) { if (e.key === 'Escape') closeViewer(); }
+function openViewer(m, key, { fromShared = false } = {}) {
+  closeViewer();
+  const f = m.file; if (!f?.url) return;
+  const k = kindOf(m);
+  const cid = m.from || key;
+  const info = h('span.vinfo', { 'data-testid': 'viewer-info' }, fileInfo(m));
+  const sf = f.safety;
+  const stage = k === 'photo' ? h('img.vbig', { src: f.url, alt: 'Photo', 'data-testid': 'viewer-image', onload: (e) => { info.textContent = fileInfo(m, e.target); } })
+    : k === 'video' ? h('video.vbig', { controls: true, playsinline: true, autoplay: true, src: f.url, 'data-testid': 'viewer-video' })
+    : h('div.vdoc', h('span.docbadge.big', typeLabel(sf?.realType || f.mime, f.name)), h('strong', { 'data-testid': 'viewer-name' }, f.name),
+      sf && sf.verdict !== 'ok' ? h('ul.filewarn', sf.reasons.map((r) => h('li', r))) : null);
+  const who = m.dir === 'out' ? 'You' : whoWrote(cid, key);
+  const act = (label, ic, fn, tid) => h('button.vact', { type: 'button', onclick: fn, 'data-testid': tid }, icon(ic, 22), h('span', label));
+  const v = h('div.viewer-screen', { role: 'dialog', 'aria-modal': 'true', 'aria-label': `${k} from ${who}`, 'data-testid': 'viewer' },
+    h('div.vtop',
+      h('button.icon', { type: 'button', onclick: closeViewer, 'aria-label': 'Close', 'data-testid': 'viewer-close' }, icon('back')),
+      h('div.vwho', h('strong', who), h('small', new Date(m.ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })))),
+    h('div.vstage', stage),
+    h('div.vbottom', info,
+      h('div.vacts',
+        canReply(m) ? act('Reply', 'reply', () => { closeViewer(); if (fromShared || !isOpenChat(key)) go(key.startsWith('g:') ? 'group' : 'chat', key.startsWith('g:') ? key.slice(2) : key); S.replyTo.set(key, quoteOf(m, S.myCid, key)); refreshReplyBar(key); }, 'viewer-reply') : null,
+        canForward(m) ? act('Forward', 'forward', () => { closeViewer(); forwardMessage(key, m).catch((e) => toast(e.message, 'error')); }, 'viewer-forward') : null,
+        fromShared ? act('In chat', 'chat', () => { closeViewer(); go('chat', key); requestAnimationFrame(() => jumpTo(key, m.id)); }, 'viewer-chat') : null,
+        // Straight from the tap (no await before it): iPhone only allows the share sheet that way.
+        act('Save', 'share', () => saveFile(m, cid), 'viewer-save'))));
+  document.body.append(v);
+  document.addEventListener('keydown', viewerKeys);
 }
 VIEWS.shared = (id, tab = 'media') => {
   const c = S.contacts.get(id);
@@ -2088,7 +2349,7 @@ VIEWS.shared = (id, tab = 'media') => {
   const empty = (t) => h('p.empty', t);
   let body;
   if (tab === 'media') {
-    body = k.media.length ? h('div.mediagrid', { 'data-testid': 'shared-media' }, k.media.map((m) => h('button.thumb', { type: 'button', onclick: () => m.file.url && openViewer(m, id), 'aria-label': m.file.name },
+    body = k.media.length ? h('div.mediagrid', { 'data-testid': 'shared-media' }, k.media.map((m) => h('button.thumb', { type: 'button', onclick: () => m.file.url && openViewer(m, id, { fromShared: true }), 'aria-label': kindLabel(kindOf(m)) },
       !m.file.url ? h('span.hint', '…') : m.file.playable === 'video' ? [h('video', { src: m.file.url, preload: 'metadata', muted: true, playsinline: true }), h('span.play', '▶')] : h('img', { src: m.file.url, alt: '' }))))
       : empty('No photos or videos yet.');
   } else if (tab === 'docs') {
@@ -2098,7 +2359,7 @@ VIEWS.shared = (id, tab = 'media') => {
           voicePlayer({ blob: m.file.blob, url: m.file.url, compact: true })]
         : [h('div.docinfo', icon('clip', 18), h('div', h('strong', m.file.name), h('small', `${fmtBytes(m.file.size)} · ${m.dir === 'out' ? 'You' : displayName(c)} · ${when(m)}`))),
           m.file.url && m.file.playable === 'audio' ? h('audio', { controls: true, preload: 'none', src: m.file.url }) : null,
-          m.file.url ? h('button', { type: 'button', onclick: () => saveFile(m, id) }, 'Save') : h('span.hint', 'Loading…')])))
+          m.file.url ? h('button', { type: 'button', onclick: () => openViewer(m, id, { fromShared: true }), 'data-testid': 'doc-open' }, 'Open') : h('span.hint', 'Loading…')])))
       : empty('No files or voice messages yet.');
   } else {
     body = k.links.length ? h('ul.linklist', { 'data-testid': 'shared-links' }, k.links.map(({ m, seg }) => h('li',
@@ -2557,6 +2818,11 @@ VIEWS.settings = () => {
         h('option', { value: 'review', selected: S.settings.voiceSend !== 'release' }, 'Listen first, then tap Send'),
         h('option', { value: 'release', selected: S.settings.voiceSend === 'release' }, 'Send as soon as I let go (walkie-talkie)')),
       h('p.hint', 'Photos, videos and files always show a preview with a Send button, so a wrong tap never sends anything.'),
+      h('label.toggle', h('input', { type: 'checkbox', checked: S.settings.readReceipts !== false, 'data-testid': 'read-receipts', onchange: async (e) => {
+        S.settings.readReceipts = e.target.checked; await S.vault.putRecord('settings', S.settings);
+        toast(e.target.checked ? 'Read receipts on' : 'Read receipts off — you won’t send or see blue ticks');
+      } }), ' Read receipts'),
+      h('p.hint', 'Blue ✓✓ when someone has opened your message, and they see the same from you. Off: you don’t send them and don’t see them (like WhatsApp). You can choose differently for one person in their contact info. Groups show delivery only.'),
 
       h('h2', 'Internet mode'),
       h('p', { 'data-testid': 'internet-status' }, S.remote ? (S.relayOnline ? 'On — connected to the relay' : 'On — relay not reachable right now (messages wait safely on this phone)') : 'Off — nearby (same Wi-Fi) only'),
