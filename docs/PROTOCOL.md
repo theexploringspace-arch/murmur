@@ -363,3 +363,42 @@ Validation (`readStatus` / `statusTag`): a `ts` more than 5 minutes in the futur
 would outlive 24 h), as is anything already expired. A contact can have at most 30 live statuses on
 your phone; requests (unaccepted invite-link contacts) can't send any. Replying to a status sends an
 ordinary message with `re: { k: 'status', … }` (§14), so it lands in your chat with them.
+
+## 16. Devices — one active phone per account (`devices.js`)
+
+There is no account server, so "logging in on another phone" (online backup, backup file) copies the
+vault: same identity key, same relay inbox. The relay sends every inbox message to **every** connected
+copy and deletes it on the first `ack` — so two live copies fight over messages, and after a restore
+re-keys the contacts (§13) the old copy can't decrypt what it grabs. Rule: **the phone that most
+recently took the account over is active**; other copies stop using the inbox and say so.
+
+**Devices box.** A relay mailbox with secret `labeledHash('murmur/devices/box/v1', inboxSecret)` —
+only copies of this account can derive it; the relay can't link it to the inbox. Rows are
+`'MDV1' ‖ iv(12) ‖ AES-256-GCM(key, JSON, aad='MDV1')`, key = `labeledHash('murmur/devices/key/v1', inboxSecret)`:
+
+| Row | Fields | Written |
+|---|---|---|
+| `take` | `id, name, at, via` (`new` · `online` · `file` · `move` · `back` · `existing`) | account created / restored / moved here, "Use Murmur on this phone", or the box is empty |
+| `here` | `id, name, at` | heartbeat, at most every 30 min while open (`HEARTBEAT_MS`) |
+| `out` | `id, to, at` | the active phone signs phone `to` out |
+
+`id` is a random per-browser id in `localStorage` (deliberately **not** in the vault, so a backup
+doesn't carry it to another phone). Phones read the box on unlock, on return to the foreground and
+every 2 min while open (`CHECK_MS`); reads add nothing.
+
+**Folding** (`deviceState`): rows in **relay order** (the mailbox returns them oldest-first) — never
+phone clocks, so a wrong clock can't win. The last `take` is the active phone. An `out` counts only
+if written by the phone that was active at that point in the log (a stale copy can't sign out the
+active one), and a later `take` by the signed-out phone clears it.
+
+**Reactions.** Superseded → stop the relay connection, close nearby links, store
+`device/replaced` in the vault and show *"Your account is active on another phone"* (take back /
+erase / lock). Signed out → erase this phone. A take-over marker (`device/take` in the outer store) is
+cleared only after the `take` row is on the relay, so an offline first start can't make the new phone
+look replaced. A restoring phone writes its `take` **before** sending renewal invites.
+
+**No lost messages.** Before acking an envelope it can't decrypt, `Remote` calls `beforeDrop`, which
+waits for a devices check that **started after** the envelope arrived (a burst shares one). If the
+account moved, the envelope is left on the relay for the active phone. A contact that receives a
+renewal from a new phone (§13) closes any nearby link to the old phone.
+

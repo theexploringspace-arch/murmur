@@ -104,6 +104,16 @@ test('Murmur end-to-end', { timeout: 240000 }, async (t) => {
   const A = await profile(browser, 'alice');
   const B = await profile(browser, 'bob');
   try {
+    await t.test('launch screen: logo + "from Prince Is Genius", then it gets out of the way', async () => {
+      // A fresh page, so we catch the splash before app.js removes it.
+      const p = await A.ctx.newPage(); await p.goto(ORIGIN + '/');
+      assert.match(await p.textContent(tid('splash')), /Murmur\s*from\s*Prince Is Genius/);
+      assert.equal(await p.$eval('.splash-logo', (i) => i.complete && i.naturalWidth > 0), true, 'the logo loads (CSP allows it)');
+      await p.waitForSelector(tid('splash'), { state: 'detached', timeout: 5000 }); // removed, not just faded
+      await p.click(tid('get-started'), { timeout: 5000 }); // the app underneath is usable
+      await p.close();
+    });
+
     await t.test('onboarding creates encrypted vaults', async () => {
       await onboard(A, 'Alice', 'correct horse battery staple');
       await onboard(B, 'Bob', 'tr0ub4dor & 3 bananas');
@@ -717,6 +727,97 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
   } catch (e) { for (const p of P) console.error('DEBUG', p.errors); throw e; } finally { await browser.close(); }
 });
 
+test('devices: see where your account is signed in; logging in elsewhere parks the old phone (no lost messages), take it back, sign a phone out', { timeout: 300000 }, async () => {
+  const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
+  const PASS = 'correct horse battery staple';
+  const A = await profile(browser, 'alice-phone1'), B = await profile(browser, 'bob-dev');
+  const P = [A, B];
+  const logHas = (p, t) => p.page.waitForFunction((x) => (document.querySelector('[data-testid="log"]')?.textContent || '').includes(x), t, { timeout: 30000 });
+  const openContact = async (p, name) => { await p.page.waitForSelector(tid(`contact-${name}`), { timeout: 30000 }); await p.page.click(tid(`contact-${name}`)); };
+  const devices = async (p) => { await openSetting(p.page, 'devices'); await p.page.waitForSelector(tid('devices-list'), { timeout: 30000 }); };
+  const rows = (p) => p.page.$$eval('[data-testid="devices-list"] li', (ls) => ls.map((l) => [l.dataset.state, l.textContent]));
+  try {
+    await onboard(A, 'Alice', PASS); await onboard(B, 'Bob', 'another long passphrase');
+    await pairByText(A, B);
+    await B.page.waitForSelector(`${tid('conn-state')}[data-online="true"]`);
+    await send(B, 'hello phone one'); await logHas(A, 'hello phone one');
+
+    // 1. One phone: it's listed as this phone, created here.
+    await A.page.click(tid('back'));
+    await devices(A);
+    let r = await rows(A);
+    assert.equal(r.length, 1);
+    assert.equal(r[0][0], 'me');
+    assert.match(r[0][1], /This phone[\s\S]*Active now[\s\S]*Created the account/);
+    await A.page.click(tid('device-rename'));
+    await A.page.fill(tid('device-name'), 'Alice’s Tecno'); await A.page.click(tid('modal-save'));
+    await A.page.waitForFunction(() => /Alice’s Tecno/.test(document.querySelector('[data-testid="device-me"]')?.textContent || ''));
+    await shot(A.page, 'd01-devices-one');
+
+    // Online backup on, so another phone can log in with username + passphrase.
+    await A.page.click(tid('back')); await A.page.click(tid('settings-backups'));
+    await A.page.click(tid('online-toggle'));
+    await A.page.fill(tid('confirm-pass'), PASS); await A.page.click(tid('modal-ok'));
+    await A.page.waitForFunction(() => /^On — last backup/.test(document.querySelector('[data-testid="online-status"]')?.textContent || ''), null, { timeout: 60000 });
+    await leaveSettings(A.page);
+
+    // 2. Log in on a second phone WHILE the first is still open.
+    const D = await profile(browser, 'alice-phone2'); P.push(D);
+    await D.page.click(tid('have-account')); await D.page.click(tid('restore-online'));
+    await D.page.fill(tid('login-user'), 'alice_test'); await D.page.fill(tid('login-pass'), PASS);
+    await D.page.click(tid('login-go'));
+    await openContact(D, 'Bob');
+    await logHas(B, 'restored Murmur on a new phone');
+    // Bob writes after the move. The new phone gets it; the old one must NOT swallow it (it used to:
+    // it grabbed the message, couldn't decrypt it, and deleted it from the relay for good).
+    // The case that used to LOSE messages: the new phone is closed, the old one is open. The old
+    // phone receives Bob's message, can't decrypt it (it's keyed for the new phone)… and used to
+    // delete it from the relay. Now it checks the device list, leaves it there and parks itself.
+    await D.page.close();
+    await send(B, 'after the move');
+    await A.page.waitForSelector(tid('replaced'), { timeout: 30000 });
+    D.page = await D.ctx.newPage(); await D.page.goto(ORIGIN + '/');
+    await userReady(D.page); await D.page.fill(tid('unlock-pass'), PASS); await D.page.click(tid('unlock'));
+    await openContact(D, 'Bob');
+    await logHas(D, 'after the move'); // it waited on the relay for the right phone
+    assert.match(await A.page.textContent(tid('replaced-by')), /Logged in with username \+ passphrase/);
+    await shot(A.page, 'd02-replaced');
+    await send(B, 'second after the move'); await logHas(D, 'second after the move');
+
+    // The new phone sees both: itself (active) and the old one, replaced.
+    await D.page.click(tid('back'));
+    await devices(D);
+    r = await rows(D);
+    assert.deepEqual(r.map(([s]) => s), ['me', 'replaced']);
+    assert.match(r[1][1], /Alice’s Tecno[\s\S]*Replaced/);
+    await shot(D.page, 'd03-devices-two');
+    await leaveSettings(D.page);
+
+    // 3. Take it back on the first phone: the second gets parked, Bob's messages follow.
+    await A.page.click(tid('take-back')); await A.page.click(tid('modal-take'));
+    await A.page.waitForSelector(tid('tab-chats'), { timeout: 30000 });
+    await openContact(A, 'Bob');
+    await send(B, 'welcome back phone one');
+    await logHas(A, 'welcome back phone one');
+    await D.page.waitForSelector(tid('replaced'), { timeout: 30000 });
+    assert.match(await D.page.textContent(tid('replaced-by')), /Alice’s Tecno[\s\S]*Took the account back/);
+
+    // 4. Sign the second phone out from the first: it erases its copy next time it checks.
+    await A.page.click(tid('back')); await devices(A);
+    await A.page.waitForFunction(() => document.querySelectorAll('[data-testid="devices-list"] li').length === 2);
+    await A.page.click(tid('device-signout')); await A.page.click(tid('modal-out'));
+    await A.page.waitForSelector('[data-testid="devices-list"] li[data-state="out"]', { timeout: 30000 });
+    await D.page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))); // the owner opens it again
+    await D.page.waitForFunction(() => /signed out of this phone from “Alice’s Tecno”/.test(document.body.textContent), null, { timeout: 30000 });
+    await D.page.click(tid('modal-ok'));
+    await D.page.waitForSelector(tid('get-started')); // erased: back to a fresh start
+    // And phone one keeps working.
+    await leaveSettings(A.page); await openContact(A, 'Bob');
+    await send(A, 'all mine again'); await logHas(B, 'all mine again');
+    for (const p of P) assert.deepEqual(p.errors.filter((e) => !/WebSocket connection/.test(e)), [], p.name);
+  } catch (e) { for (const p of P) console.error('DEBUG', p.name, p.errors); throw e; } finally { await browser.close(); }
+});
+
 test('WhatsApp-style chat: photo & document bubbles, viewer, reply (menu, swipe, to a photo), forward, read receipts on/off', { timeout: 300000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
   const A = await profile(browser, 'alice-wa'), B = await profile(browser, 'bob-wa'), C = await profile(browser, 'carol-wa');
@@ -875,6 +976,8 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
   const A = await profile(browser, 'alice-st'), B = await profile(browser, 'bob-st'), C = await profile(browser, 'carol-st');
   const css = (p, sel, prop) => p.page.$eval(sel, (e, pr) => getComputedStyle(e).getPropertyValue(pr).trim(), prop);
   const outBg = (p) => p.page.$eval(`${tid('msg-out')}:not(.media)`, (e) => getComputedStyle(e).backgroundColor);
+  // What the chat screen really paints behind the messages (the computed image, not the class list).
+  const chatPaint = (p) => p.page.$eval(".screen.chat", (e) => getComputedStyle(e).backgroundImage);
   const inLog = (p, re, sel = 'msg-in') => p.page.waitForFunction(([s, r]) => [...document.querySelectorAll(`[data-testid="${s}"]`)].some((m) => new RegExp(r).test(m.textContent)), [sel, re.source], { timeout: 20000 });
   try {
     await onboard(A, 'Alice', 'correct horse battery staple');
@@ -927,6 +1030,22 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     await send(A, 'hi in violet');
     assert.equal(await outBg(A), 'rgb(91, 58, 140)', 'sent bubbles use the chosen colour');
     assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-aurora')), true);
+    // Classes alone proved nothing last time (a later `.chat { background }` rule painted over every
+    // wallpaper while the classes were all correct) — so check what the screen actually PAINTS.
+    assert.match(await chatPaint(A), /radial-gradient/, 'aurora wallpaper is really drawn');
+    // The message bar floats over the chat: no bar background, the list scrolls underneath it,
+    // and the last message is padded clear of it.
+    const bar = await A.page.$eval('.chat .composer', (f) => {
+      const cs = getComputedStyle(f), log = document.querySelector('#log');
+      return { pos: cs.position, bg: cs.backgroundColor, logBottom: log.getBoundingClientRect().bottom, barBottom: f.getBoundingClientRect().bottom,
+        pad: parseFloat(getComputedStyle(log).paddingBottom), h: f.getBoundingClientRect().height,
+        pill: getComputedStyle(f.querySelector('textarea')).borderRadius };
+    });
+    assert.equal(bar.pos, 'absolute', 'the message bar floats');
+    assert.equal(bar.bg, 'rgba(0, 0, 0, 0)', 'no solid strip behind the floating bar');
+    assert.ok(Math.abs(bar.logBottom - bar.barBottom) < 2, 'messages run behind the bar to the bottom edge');
+    assert.ok(bar.pad >= bar.h, `last message clears the bar (padding ${bar.pad} ≥ bar ${bar.h})`);
+    assert.equal(bar.pill, '22px', 'the text box is a pill');
     // …and ONE chat gets its own look (contact info → Chat colour & wallpaper), including a photo.
     await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
     await A.page.click(tid('bubble-rose'));
@@ -940,13 +1059,16 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     assert.equal(await outBg(A), 'rgb(155, 47, 74)', 'this chat: rose');
     await A.page.waitForFunction(() => /^url\("blob:/.test(getComputedStyle(document.querySelector('.screen.chat')).getPropertyValue('--wall-img').trim()), null, { timeout: 10000 });
     assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-photo') && e.classList.contains('wall-dim')), true);
+    assert.match(await chatPaint(A), /url\("blob:/, 'the photo is really drawn behind the chat (Prince: "refused to change after selecting a photo")');
     await shot(A.page, 'n03-chat-photo-wallpaper');
     // Carol's chat still follows the default (violet + aurora).
     await A.page.click(tid('back')); await A.page.click(tid('contact-Carol'));
     assert.equal(await A.page.$eval('.screen.chat', (e) => e.classList.contains('wall-aurora')), true);
+    assert.match(await chatPaint(A), /radial-gradient/);
     // The look is private: Bob's phone is untouched.
     await inLog(B, /hi in violet/);
     assert.equal(await B.page.$eval('.screen.chat', (e) => e.classList.contains('wall-none')), true);
+    assert.equal(await chatPaint(B), 'none');
     // Reset brings Bob's chat back to the default.
     await A.page.click(tid('back')); await A.page.click(tid('contact-Bob')); await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
     await A.page.click(tid('look-reset'));

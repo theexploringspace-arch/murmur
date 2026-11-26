@@ -189,8 +189,15 @@ who contacts you), an incoming call only rings while Murmur is open on that phon
 | The duress decoy leaks via a backup | **No** | A backup contains only the vault that is open; the other slot is never included |
 | A nearby link dies silently (phone walks away) | Messages still arrive | Anything sent nearby and not confirmed within 5 s is re-sent via the relay; duplicates are dropped by id (one SOS alarm, not two) |
 
+| Someone logs in to your account on another phone (knows username + passphrase, online backup on) | **You see it** | Settings → *Devices* lists every phone that used the account in 30 days. The newest log-in becomes the active phone; yours stops receiving and shows *"active on another phone"* with that phone's name and when — instead of silently losing messages. Take it back, sign it out, change your passphrase |
+| An old copy of your account deletes the new phone's messages | **No** | Before discarding a message it can't decrypt, a copy checks the device list (fresh, started after the message arrived) and leaves the message on the relay if the account moved |
+| A phone with a wrong clock takes over the account | **No** | Device rows are ordered by the relay's arrival order, not phone clocks |
+| The relay learns your devices | **No** | The device list is a separate sealed mailbox (AES-256-GCM, key derived from your inbox secret): the relay sees sizes and timing, not names or ids, and can't link it to your inbox |
+
 ## Known limitations (by design)
 
+- **Sign-out is honoured by Murmur, not enforced by a server.** A copy of your account made with your passphrase holds your identity key; a modified app could ignore a sign-out. You still *see* every take-over in Devices. Truly locking such a copy out would need a new identity key (and contacts re-verifying) — not built.
+- **One active phone at a time.** Murmur has no linked-devices protocol (each device with its own keys, messages encrypted to all of them). Logging in elsewhere moves the account.
 - **Proximity required**: both devices on the same LAN at the same time. No store-and-forward, no mesh.
 - **Networks with client isolation** (hotels, many cafés) block device-to-device traffic.
 - **mDNS dependence**: browsers hide local IPs behind random `*.local` names; a network that blocks

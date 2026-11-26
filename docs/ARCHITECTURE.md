@@ -267,6 +267,23 @@ all; and ciphertext is searched for what a real leak looks like — plaintext JS
 `"text":"Hello`), 5+ bytes, which random data matches about once in a million runs. Lesson: when a
 security test is flaky, find the probability, then fix the *test design*, never just retry it.
 
+## Lesson: two copies of one account
+Logging in with username + passphrase *copies* the vault — there's no server to say "this is the
+phone now". Reading the relay code answered what two copies do: the mailbox broadcasts to every
+socket and deletes on the first ack. After a restore re-keys the contacts, the old copy received
+messages it couldn't decrypt and acked them as garbage — deleting them for the new phone, silently.
+Fix: one active phone (`devices.js`), and the old copy asks before throwing anything away. The first
+version of that question had a 5-second cache; in the test a "not moved" answer 2.5 s old predated
+the new phone's take-over and the message was still lost. The rule now: an answer must come from a
+check that *started after* the evidence arrived. Both e2e cases (new phone open; new phone closed)
+were also run with the hook disabled to prove the test catches the loss.
+
+## Lesson: the class was right, the screen was wrong
+Wallpapers broke after a "full-screen chat" CSS block added `.chat { background: var(--bg) }` —
+later in the file, same specificity as `.wall-aurora`, so it won. The e2e test checked that the
+screen *had* the class `wall-photo`, which it did. It now checks the computed `background-image`
+(the thing a person sees), and was re-run with the bad rule restored to prove it fails.
+
 ## History storage
 `history/<contact>` is the list; each file's bytes are their own record `media/<contact>/<message>`,
 written once and deleted when the message is deleted (for me / for everyone), cleared, aged out

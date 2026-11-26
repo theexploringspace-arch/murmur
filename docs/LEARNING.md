@@ -119,3 +119,18 @@ Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the mess
    problem there? (Hint: message ticks — what does ✓ mean versus ✓✓?)
 3. Threat model: the relay can't read statuses, but it can count envelopes. What can it learn from a
    re-send every 5 minutes, and why does the 24-hour expiry bound that?
+
+## Exercise 16 — one account, two phones
+1. In `core/devices.js`, `deviceState` orders rows by the relay's order, not by `at`. Write the
+   attack (or the honest accident) that ordering by timestamps would allow. Which unit test covers it?
+2. Why is this phone's id kept in `localStorage` and not in the vault? What would break on a phone
+   restored from a backup if it were in the vault?
+3. `accountMovedHere` used to reuse any answer younger than 5 s. Draw the timeline that lost a
+   message (old phone checks → new phone takes over → message arrives). Then explain why "a check
+   that started after the message" is the right rule.
+4. Threat model: someone knows your username and passphrase and runs a *modified* Murmur that
+   ignores sign-outs. What does the device list still give you? What would it take to really lock
+   them out (hint: what do they hold that a new passphrase doesn't change)?
+5. Debugging drill: the browser e2e suite takes ~8 minutes. How did we prove the new device test
+   would catch the bug, without waiting for a real user to lose a message?
+
