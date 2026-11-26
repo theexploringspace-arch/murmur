@@ -237,3 +237,28 @@ test('mailbox opens are rate-limited per IP when the limiter is configured (429 
   assert.equal((await route(req('198.51.100.1'), env)).status, 200);
   assert.equal(touched, true);
 });
+
+test('security review: 20 PIN guesses sent AT ONCE still only get 4 real tries (checks are serialised)', async () => {
+  const b = await box();
+  const good = new Uint8Array(32).fill(1);
+  let s = await session(b);
+  await reply(s.ws, { t: 'gate', v: await sha(good) }); s.ws.close();
+  const guesses = await Promise.all(Array.from({ length: 20 }, (_, i) => session(b, new Uint8Array(32).fill(100 + i))));
+  const states = guesses.map((g) => g.texts[0]?.state);
+  assert.equal(states.filter((x) => x === 'wrong').length, 4, `got ${JSON.stringify(states)}`);
+  assert.equal(states.filter((x) => x === 'locked').length, 16);
+  // Even the RIGHT PIN is refused during the wait the burst triggered.
+  assert.equal((await session(b, good)).texts[0].state, 'locked');
+});
+
+test('security review: a socket that never authenticates is closed after AUTH_TIMEOUT_MS', async () => {
+  const b = await box();
+  const idle = connect(b, { auth: false }); await idle.opened;
+  const real = Date.now; const t0 = real();
+  Date.now = () => t0 + 11_000;
+  try {
+    const other = connect(b, { auth: false }); await other.opened; // a new connection sweeps old ones
+    assert.equal(await idle.closed, 4008);
+    other.ws.close();
+  } finally { Date.now = real; }
+});

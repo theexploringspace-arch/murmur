@@ -199,3 +199,13 @@ test('online keys: the PIN changes the KEY but not the MAILBOX (so the relay can
   assert.notEqual(b64(plain.key), b64(withPin.key));
   assert.notEqual(b64(withPin.key), b64(otherPin.key), 'a wrong PIN can’t open the backup even if the relay were bypassed');
 });
+
+test('security review: a crafted backup claiming billions of PBKDF2 rounds is refused instantly (no frozen page)', async () => {
+  const { openSealed: open } = await import('../../src/js/core/backup.js');
+  const bytes = new Uint8Array(10 + 4 + 16 + 12 + 32);
+  bytes.set(new TextEncoder().encode('MURMURBK')); bytes[8] = 1; bytes[9] = 1;
+  new DataView(bytes.buffer).setUint32(10, 4_000_000_000);
+  const t = Date.now();
+  await assert.rejects(open(bytes, { passphrase: 'x' }), /impossible settings/);
+  assert.ok(Date.now() - t < 500);
+});

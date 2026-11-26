@@ -1,0 +1,19 @@
+{
+  "name": "murmur",
+  "version": "1.0.0",
+  "description": "Offline, end-to-end encrypted, serverless messaging PWA over local Wi-Fi / hotspot.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/unit/*.test.mjs\"",
+    "test:e2e": "node --test --test-timeout=600000 \"test/e2e/run.mjs\"",
+    "build": "node tools/build.mjs",
+    "serve": "node tools/serve.mjs",
+    "check": "npm test && npm run build && npm run test:e2e"
+  },
+  "devDependencies": {}
+}

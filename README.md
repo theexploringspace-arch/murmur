@@ -247,7 +247,7 @@ murmur/
 ├── tools/serve.mjs           zero-dependency static server with security headers
 ├── test/unit/                node --test (no dependencies)
 ├── test/e2e/run.mjs          Playwright, two browsers, network guard, fake camera
-└── docs/                     PROTOCOL · ARCHITECTURE · THREAT-MODEL · LEARNING
+└── docs/                     PROTOCOL · ARCHITECTURE · THREAT-MODEL · SECURITY-REVIEW · LEARNING
 ```
 
 ## Documentation
@@ -255,6 +255,7 @@ murmur/
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the pieces talk, why this design, what fails and how to debug it
 - **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — byte-level specification of codes, handshake, frames, re-key
 - **[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md)** — what Murmur defends against, and what it honestly can't
+- **[docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md)** — the Nov 2026 code review: 4 findings (1 high), each reproduced by a test and fixed, plus what was checked and is sound
 - **[docs/LEARNING.md](docs/LEARNING.md)** — guided tour + exercises (debugging, attacking, extending)
 
 ## Verified vs. not yet verified

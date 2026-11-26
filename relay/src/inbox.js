@@ -68,12 +68,22 @@ export function makeInbox(Base) {
 
     /** Hibernatable accept. Exposed so the Node test server can hand over its own sockets. */
     accept(ws, addr) {
+      this.sweepUnauthed();
       this.ctx.acceptWebSocket(ws);
       ws.serializeAttachment({ addr, authed: false, since: Date.now() });
     }
+    /** Close sockets that never proved the secret within AUTH_TIMEOUT_MS (otherwise anyone could
+     *  park idle sockets on a mailbox forever — the auto-answered pings keep them alive). */
+    sweepUnauthed() {
+      const now = Date.now();
+      for (const ws of this.ctx.getWebSockets()) {
+        const a = ws.deserializeAttachment();
+        if (a && !a.authed && now - (a.since || 0) > AUTH_TIMEOUT_MS) try { ws.close(4008, 'auth timeout'); } catch {}
+      }
+    }
 
     async deposit(data) {
-      this.prune();
+      this.prune(); this.sweepUnauthed();
       if (data.length === 0 || data.length > MAX_MESSAGE) return new Response('message too large', { status: 413 });
       const { n, bytes } = this.ctx.storage.sql.exec('SELECT COUNT(*) AS n, COALESCE(SUM(size),0) AS bytes FROM m').one();
       if (n >= MAX_BOX_MESSAGES || bytes + data.length > MAX_BOX_BYTES) return new Response('mailbox full', { status: 507 });
@@ -134,7 +144,16 @@ export function makeInbox(Base) {
 
     gate() { return this.ctx.storage.sql.exec('SELECT v, fails, until, last FROM g WHERE k = 0').toArray()[0] || null; }
     /** On a gated mailbox, check the PIN token. Tells the client why it failed, then closes. */
-    async pinOk(ws, pin) {
+    pinOk(ws, pin) {
+      // ONE AT A TIME per mailbox. The check awaits a hash; while it waits, the runtime can deliver
+      // other sockets' messages. Unserialised, 100 parallel guesses all read "0 wrong tries" before any
+      // wrote "1" — the limit would count a burst as one. (Found in the Nov 2026 security review.)
+      const run = () => this.#pinCheck(ws, pin);
+      const p = (this.pinQueue || Promise.resolve()).then(run, run);
+      this.pinQueue = p.catch(() => {});
+      return p;
+    }
+    async #pinCheck(ws, pin) {
       const g = this.gate(); if (!g) return true;
       const now = Date.now();
       const refuse = (o) => { try { ws.send(JSON.stringify({ t: 'pin', ...o })); } catch {} ws.close(4003, 'pin'); return false; };
