@@ -78,7 +78,7 @@ export function deviceState(rows, me, now = Date.now()) {
   rows.forEach((r, i) => {
     if (r.k === 'out') {
       // Only the active phone (at that point in the log) may sign others out — not a stale copy.
-      if (r.id === activeId && r.to !== r.id) { const d = by.get(r.to); if (d) d.out = true; else by.set(r.to, { id: r.to, name: 'A phone', out: true, last: 0 }); }
+      if (r.id === activeId && r.to !== r.id) { const d = by.get(r.to); if (d) d.out = true; else by.set(r.to, { id: r.to, name: 'A device', out: true, last: 0 }); }
       return;
     }
     const d = by.get(r.id) || { id: r.id, last: 0 };
@@ -111,5 +111,5 @@ export function deviceName(ua = '', platformHint = '') {
 
 export const VIA_TEXT = {
   new: 'Created the account', online: 'Logged in with username + passphrase', file: 'Restored from a backup file',
-  move: 'Moved from another phone', back: 'Took the account back', existing: 'Signed in',
+  move: 'Moved from another device', back: 'Took the account back', existing: 'Signed in',
 };

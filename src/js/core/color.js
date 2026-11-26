@@ -49,8 +49,9 @@ export const BUBBLES = [
   { id: 'mint', name: 'Mint (light)', hex: '#a8f0dc' },
   { id: 'sky', name: 'Sky (light)', hex: '#bfe3ff' },
 ];
-// Wallpapers drawn in CSS (no files): `.wall-<id>` classes in app.css.
+// Wallpapers: `.wall-<id>` classes in app.css — drawn in CSS, except the default doodle tile (an SVG).
 export const WALLS = [
+  { id: 'murmur', name: 'Murmur (default)' }, // doodles from Murmur's own symbols: src/img/doodle-*.svg (tools/doodle.mjs)
   { id: 'none', name: 'None' },
   { id: 'dusk', name: 'Dusk' },
   { id: 'aurora', name: 'Aurora' },
@@ -59,7 +60,7 @@ export const WALLS = [
   { id: 'dots', name: 'Dots' },
   { id: 'ember', name: 'Ember' },
 ];
-export const DEFAULT_LOOK = Object.freeze({ bubble: 'teal', wall: 'none', dim: false });
+export const DEFAULT_LOOK = Object.freeze({ bubble: 'teal', wall: 'murmur', dim: false });
 
 /**
  * Validate a stored look (it comes back from the vault or a backup): unknown values fall back to

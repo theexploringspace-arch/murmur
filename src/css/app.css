@@ -446,7 +446,7 @@ button.linkish { background: none; border: 0; padding: 0.4rem 0; min-height: 0; 
 /* ---- bottom tab bar (Chats · Status · Settings) ---- */
 .screen.tabbed { padding-bottom: calc(76px + var(--safe-b)); }
 .tabbar {
-  position: fixed; left: 50%; bottom: calc(10px + var(--safe-b)); transform: translateX(-50%); z-index: 20;
+  position: fixed; left: 50%; bottom: calc(10px + var(--safe-b)); transform: translateX(-50%); z-index: 20; box-sizing: border-box; height: 64px;
   display: flex; gap: 0.25rem; padding: 0.3rem; width: min(420px, calc(100% - 1.5rem));
   background: color-mix(in srgb, var(--bg2) 92%, transparent); backdrop-filter: blur(14px);
   border: 1px solid var(--line); border-radius: 22px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
@@ -560,6 +560,12 @@ button.round { width: 48px; height: 48px; min-height: 48px; padding: 0; border-r
    --wall-img, a blob: URL of the encrypted-at-rest image. Bubbles keep their own solid colours,
    so text stays readable on any wallpaper; "Dim" darkens it further for the time stamps & notes. */
 .wall-none { background: none; }
+/* Default: Murmur's doodle tile (tools/doodle.mjs). Scrolls with nothing — it stays put behind the
+   messages, like a wallpaper. Light version for the light theme (and "match my phone" in light). */
+.wall-murmur { background: url('../img/doodle-dark.svg') 0 0 / 420px repeat, var(--bg); }
+:root[data-theme="light"] .wall-murmur { background: url('../img/doodle-light.svg') 0 0 / 420px repeat, var(--bg); }
+@media (prefers-color-scheme: light) { :root[data-theme="system"] .wall-murmur { background: url('../img/doodle-light.svg') 0 0 / 420px repeat, var(--bg); } }
+.walltile.wall-murmur { background-size: 160px; }
 .wall-dusk { background: linear-gradient(170deg, #1b2a48 0%, #2a2350 55%, #3a2340 100%); }
 .wall-aurora { background: radial-gradient(120% 80% at 10% 0%, rgba(67, 230, 193, 0.28), transparent 60%), radial-gradient(90% 70% at 100% 30%, rgba(122, 92, 255, 0.25), transparent 60%), #0e1a2b; }
 .wall-deep { background: linear-gradient(180deg, #0b2a3d 0%, #0a1a2c 60%, #07101c 100%); }
@@ -706,3 +712,21 @@ button.link.danger { color: var(--danger); }
 .replaced-actions { display: flex; flex-direction: column; gap: 0.55rem; margin-top: 0.4rem; }
 .replaced-actions button { justify-content: center; text-align: center; }
 .replaced-actions button.link { align-self: center; }
+
+/* Log in → the security PIN step appears only when the relay asks for it */
+.pinstep { display: flex; flex-direction: column; gap: 0.35rem; }
+.pinstep[hidden] { display: none; }
+
+/* An unverified contact asking for money or a code (safety.js riskyAsk) */
+.riskask { margin: 0.35rem 0 0; padding: 0.35rem 0.5rem; border-radius: 10px; font-size: 0.8rem; line-height: 1.35;
+  background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--fg); border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); }
+
+/* ── iOS 26: bottom-anchored things float up on pages that don't scroll ──────────────────────────
+   Installed (standalone) Murmur has no browser toolbar, so the LARGE viewport (lvh) is the real
+   screen. Pin the tab bar from the top using it, and let the chat (wallpaper + floating message bar)
+   reach the real bottom edge. Only in standalone: in a browser tab, lvh can include space hidden
+   behind the toolbar, and plain `bottom` is right there. */
+@media (display-mode: standalone) {
+  .tabbar { bottom: auto; top: calc(100lvh - 64px - 10px - var(--safe-b)); }
+  .chat { height: 100lvh; }
+}

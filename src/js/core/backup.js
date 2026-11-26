@@ -107,11 +107,41 @@ export async function openSealed(bytes, { passphrase, key }) {
  * open it. The relay sees only a random-looking mailbox address and ciphertext; to attack it someone
  * must know your username AND guess your passphrase at 600,000 PBKDF2 rounds per guess.
  */
-export async function onlineKeys(username, passphrase, { iterations = PBKDF2_ITERATIONS } = {}) {
-  const salt = await sha256(utf8(`murmur/online-backup/v1\u0000${String(username).trim().replace(/^@/, '').toLowerCase()}`));
+export async function onlineKeys(username, passphrase, { iterations = PBKDF2_ITERATIONS, pin = null } = {}) {
+  const salt = await sha256(utf8(`murmur/online-backup/v1\u0000${normUser(username)}`));
   const root = await pbkdf2(passphrase, salt.slice(0, 16), iterations, 32);
-  return { box: await hkdf(root, new Uint8Array(32), 'murmur/online-backup/box', 32), key: await hkdf(root, new Uint8Array(32), 'murmur/online-backup/key', 32) };
+  // The mailbox comes from username + passphrase only (so the relay can count PIN tries on it);
+  // the key that opens the backup needs the PIN token too.
+  return {
+    box: await hkdf(root, new Uint8Array(32), 'murmur/online-backup/box', 32),
+    key: await hkdf(pin ? concat(root, pin) : root, new Uint8Array(32), 'murmur/online-backup/key', 32),
+  };
 }
+const normUser = (u) => String(u).trim().replace(/^@/, '').toLowerCase();
+
+// ---------- security PIN (online backup / logging in on a new phone) ----------
+// What it adds: the relay counts wrong PINs per backup (4 free, then waits up to 24 h), so someone who
+// learned your username AND passphrase still can't download your backup without the PIN. On its own a
+// 6-digit PIN is weak (a million options) — the relay's counter is what makes it strong. See relay/src/inbox.js.
+export const PIN_MIN = 6, PIN_MAX = 12;
+export function pinProblem(pin) {
+  const p = String(pin ?? '');
+  if (!/^\d+$/.test(p)) return 'Use digits only';
+  if (p.length < PIN_MIN) return `Use at least ${PIN_MIN} digits`;
+  if (p.length > PIN_MAX) return `Use at most ${PIN_MAX} digits`;
+  if (/^(\d)\1+$/.test(p)) return 'Too easy to guess (all the same digit)';
+  const steps = [...p].slice(1).map((c, i) => (+c - +p[i] + 10) % 10);
+  if (steps.every((d) => d === 1) || steps.every((d) => d === 9)) return 'Too easy to guess (a run like 123456)';
+  for (const n of [2, 3]) if (p.length % n === 0 && p === p.slice(0, n).repeat(p.length / n)) return 'Too easy to guess (a repeating pattern)';
+  return null;
+}
+/** PIN → 32-byte token, bound to the username (the same PIN gives different tokens for different people). */
+export async function pinToken(username, pin, { iterations = 100_000 } = {}) {
+  const salt = await sha256(utf8(`murmur/online-pin/v1\u0000${normUser(username)}`));
+  return pbkdf2(String(pin), salt.slice(0, 16), iterations, 32);
+}
+/** What the relay stores and compares against: SHA-256(token), base64url — never the PIN or token. */
+export const pinVerifier = async (token) => toB64u(await sha256(token));
 /** Move-to-phone: one random code → mailbox for the package, key, and a mailbox for "received" */
 export async function moveKeys(code) {
   if (!(code instanceof Uint8Array) || code.length !== 32) throw new BackupError('That isn’t a valid move code');

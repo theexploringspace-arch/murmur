@@ -257,3 +257,30 @@ export function lookalikeNames(newName, existingNames) {
     return a === b || (a.length >= 4 && b.length >= 4 && editDistance(a, b) <= 1);
   });
 }
+
+/**
+ * Is this contact imitating someone you already have? Checks the display name AND the @username
+ * against your other contacts (a stranger can rename themselves "Mom" after you add them, or pick
+ * @prince_ next to your @prince). → { name: matched display name | null, user: matched @username | null }
+ */
+export function impersonates(contact, others) {
+  const rest = others.filter((o) => o.id !== contact.id);
+  const name = lookalikeNames(contact.name || '', rest.map((o) => o.name).filter(Boolean))[0] || null;
+  const user = contact.username ? lookalikeNames(contact.username, rest.map((o) => o.username).filter(Boolean))[0] || null : null;
+  return { name, user };
+}
+
+// ---------------------------------------------------------------- risky requests
+// The classic scam isn't a hacked account — it's a NEW account with a familiar name asking for money
+// or a code. Murmur can't know who someone is; it can make you pause when an UNVERIFIED contact asks.
+const RISKY = [
+  /\b(send|transfer|wire|lend|loan|borrow|pay|deposit)\b[^.?!\n]{0,40}\b(money|cash|funds|naira|dollars?|pounds?|euros?|\$|₦|£|€|\d{3,})/i,
+  /\b(gift ?cards?|itunes card|google play card|steam card|western union|moneygram)\b/i,
+  /\b(bitcoin|btc|usdt|crypto|wallet address)\b/i,
+  /\b(account (number|details)|bank (details|account)|sort code|routing number|iban)\b/i,
+  /\b(otp|one[- ]time (code|password|pin)|verification code|security code|the code (i|we|they) sent|code (you|u) (just )?(got|received))\b/i,
+  /\b(your|ur) (password|passphrase|pin)\b/i,
+  /\b(urgent(ly)?|emergency)\b[^.?!\n]{0,60}\b(money|send|transfer|help)\b/i,
+];
+/** True if a message looks like a request for money, a code or a password. */
+export const riskyAsk = (text) => typeof text === 'string' && RISKY.some((re) => re.test(text));

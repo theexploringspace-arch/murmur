@@ -6,7 +6,7 @@ import { IdbStore } from './core/storage.js';
 import { Conversation, MAX_FILE, MAX_TEXT, APP_VERSION, newId, fileExtra } from './core/conversation.js';
 import { Remote } from './core/remote.js';
 import { RELAY_URL } from './config.js';
-import { linkify, inspectFile, lookalikeNames } from './core/safety.js';
+import { linkify, inspectFile, lookalikeNames, impersonates, riskyAsk } from './core/safety.js';
 import { sha256 } from './core/crypto.js';
 import { stripMetadata } from './core/media.js';
 import { validLocation, relative, formatCoords, mapLinks } from './core/geo.js';
@@ -23,7 +23,7 @@ import { spotlightMenu } from './ui/menu.js';
 import { openSheet, closeSheet } from './ui/sheet.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 import * as BK from './core/backup.js';
-import { readBox, writeBox } from './core/relaybox.js';
+import { readBox, writeBox, gateBox, PinError } from './core/relaybox.js';
 import * as DEV from './core/devices.js';
 import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
@@ -243,6 +243,8 @@ function hideSplash() {
   }, wait);
 }
 
+// Older builds posted these into chats; they told contacts when you changed devices. Hidden on load.
+const OLD_RENEWAL_NOTICE = /restored Murmur on a new phone — secure link renewed|^🔐 Secure link renewed after restoring your account$/;
 async function openVault(vault) {
   // Load everything the timers and views read BEFORE publishing S.vault: they treat
   // "S.vault is set" as "the session is ready" (a tick in between used to crash).
@@ -257,7 +259,7 @@ async function openVault(vault) {
   await loadStatuses(vault);
   for (const c of S.contacts.values()) {
     if (c.verified === undefined) c.verified = !c.remote; // contacts from before internet mode were all paired in person
-    if (c.keepHistory) S.chats.set(c.id, (await vault.getRecord(`history/${c.id}`, [])).map((m) => (m.file ? { ...m, file: { ...m.file, stored: true } } : m)));
+    if (c.keepHistory) S.chats.set(c.id, (await vault.getRecord(`history/${c.id}`, [])).filter((m) => !(m.system && OLD_RENEWAL_NOTICE.test(m.text || ''))).map((m) => (m.file ? { ...m, file: { ...m.file, stored: true } } : m)));
   }
   S.lastActivity = Date.now();
   navigator.storage?.persist?.().catch(() => {}); // ask the browser not to evict our (encrypted) data under storage pressure
@@ -299,7 +301,11 @@ async function startRemote() {
       // They restored on a NEW phone: a nearby link still open to their OLD phone now leads to a copy
       // that no longer holds their account (devices.js) — close it so nothing more lands there.
       if (!info.initiator) S.convs.get(cid)?.close('their account moved');
-      callMsg(cid, info.initiator ? '🔐 Secure link renewed after restoring your account' : `🔐 ${displayName(S.contacts.get(cid))} restored Murmur on a new phone — secure link renewed (same safety number)`);
+      // No chat notice on EITHER side. The safety number is unchanged (same identity key), so a contact
+      // learns nothing they could act on — only that you changed devices, which is yours to know (Devices).
+      // The owner already got one "renewing secure links" toast. (data-renewed: a test hook, not shown.)
+      S.contacts.get(cid).renewedAt = Date.now();
+      rerenderIf('chat', () => S.viewArgs[0] === cid);
     });
   r.start();
 }
@@ -381,7 +387,7 @@ async function accountMovedHere() {
 function accountMovedAway(st) {
   if (!S.vault || S.replaced?.out || (S.replaced && !st.signedOut)) return;
   const by = st.devices.find((d) => d.id === st.activeId) || (S.replaced && { name: S.replaced.name });
-  const info = { out: !!st.signedOut, name: by?.name || 'another phone', via: by?.via || null, since: by?.since || null, at: Date.now() };
+  const info = { out: !!st.signedOut, name: by?.name || 'another device', via: by?.via || null, since: by?.since || null, at: Date.now() };
   S.replaced = info; S.devices = st;
   stopRemote(); // off the relay right now — not one more message taken from the other phone
   const vault = S.vault;
@@ -390,7 +396,7 @@ function accountMovedAway(st) {
   setTimeout(async () => {
     if (info.out) {
       await eraseThisPhone().catch((e) => console.warn('erase:', e.message));
-      await modal({ title: 'This phone was signed out', body: [`Your Murmur account was signed out of this phone from “${info.name}”, and its copy here was erased.`], actions: [['OK', 'ok']] });
+      await modal({ title: 'This device was signed out', body: [`Your Murmur account was signed out of this device from “${info.name}”, and its copy here was erased.`], actions: [['OK', 'ok']] });
       return;
     }
     await vault.putRecord('device/replaced', info).catch(() => {});
@@ -400,7 +406,7 @@ function accountMovedAway(st) {
 }
 async function takeAccountBack() {
   const r = S.replaced || {};
-  const ok = await modal({ title: 'Use Murmur on this phone?', body: [`Your account moves back here. “${r.name}” stops sending and receiving messages and shows that it was replaced.`, 'Each contact’s secure link is renewed automatically, like after a restore.'],
+  const ok = await modal({ title: 'Use Murmur on this device?', body: [`Your account moves back here. “${r.name}” stops sending and receiving messages and shows that it was replaced.`, 'Each contact’s secure link is renewed automatically, like after a restore.'],
     actions: [['Cancel', false], ['Use it here', 'take', 'primary']] });
   if (ok !== 'take') return;
   await S.vault.deleteRecord('device/replaced'); S.replaced = null;
@@ -408,14 +414,14 @@ async function takeAccountBack() {
   catch (e) { S.replaced = r; await S.vault.putRecord('device/replaced', r); toast(`Couldn’t reach the relay — ${e.message}`, 'error', 6000); return; }
   await startRemote().catch((e) => toast(`Internet mode unavailable: ${e.message}`, 'error'));
   await S.remote?.resyncAll().catch((e) => console.warn('resync:', e.message));
-  go('home'); toast('Murmur is active on this phone again', 'success');
+  go('home'); toast('Murmur is active on this device again', 'success');
 }
 async function eraseReplacedPhone() {
-  const ok = await modal({ title: 'Erase Murmur from this phone?', body: ['Your account stays on the other phone. Everything Murmur kept here — chats, photos, keys — is erased from this phone.'], actions: [['Cancel', false], ['Erase', 'erase', 'danger']] });
-  if (ok === 'erase') { await eraseThisPhone(); toast('Erased from this phone'); }
+  const ok = await modal({ title: 'Erase Murmur from this device?', body: ['Your account stays on the other device. Everything Murmur kept here — chats, photos, keys — is erased from this phone.'], actions: [['Cancel', false], ['Erase', 'erase', 'danger']] });
+  if (ok === 'erase') { await eraseThisPhone(); toast('Erased from this device'); }
 }
 async function signOutDevice(d) {
-  const ok = await modal({ title: `Sign out “${d.name}”?`, body: ['That phone erases its copy of your account the next time Murmur opens there with internet.', 'If you don’t recognise it, also change your passphrase (Settings → Security) — whoever logged in knew it.'],
+  const ok = await modal({ title: `Sign out “${d.name}”?`, body: ['That device erases its copy of your account the next time Murmur opens there with internet.', 'If you don’t recognise it, also change your passphrase (Settings → Security) — whoever logged in knew it.'],
     actions: [['Cancel', false], ['Sign out', 'out', 'danger']] });
   if (ok !== 'out') return;
   try {
@@ -425,8 +431,8 @@ async function signOutDevice(d) {
   } catch (e) { toast(`Couldn’t reach the relay — ${e.message}`, 'error', 6000); }
 }
 async function renameThisDevice() {
-  const input = h('input', { type: 'text', maxlength: 60, value: thisDeviceName(), 'data-testid': 'device-name', 'aria-label': 'Name for this phone' });
-  const ok = await modal({ title: 'Name this phone', body: ['Shown in the device list on your other phones.', input], actions: [['Cancel', false], ['Save', 'save', 'primary']] });
+  const input = h('input', { type: 'text', maxlength: 60, value: thisDeviceName(), 'data-testid': 'device-name', 'aria-label': 'Name for this device' });
+  const ok = await modal({ title: 'Name this device', body: ['Shown in the device list on your other devices.', input], actions: [['Cancel', false], ['Save', 'save', 'primary']] });
   if (ok !== 'save') return;
   try { const v = input.value.trim().slice(0, 60); if (v) localStorage.setItem(DEVICE_NAME_KEY, v); else localStorage.removeItem(DEVICE_NAME_KEY); } catch {}
   syncDevices({ force: true }).catch(() => {}); render();
@@ -746,7 +752,7 @@ async function adoptConversation(conv) {
     S.contacts.set(id, c);
   }
   // Scanning each other's codes face to face IS verification.
-  c.verified = true; c.request = false; delete c.lookalike;
+  c.verified = true; c.request = false; delete c.lookalike; delete c.lookalikeUser;
   await persistContacts();
   const old = S.convs.get(id);
   if (old && old !== conv) old.close('replaced by new connection');
@@ -1324,6 +1330,10 @@ function bubble(m, key = S.viewArgs?.[0]) {
   if (m.sos) body.push(sosCard(m));
   if (m.loc) body.push(locCard(m));
   if (m.text != null) body.push(richText(m, cid));
+  // An UNVERIFIED contact asking for money / a code / a password: the classic impostor move.
+  if (m.dir === 'in' && m.text && riskyAsk(m.text) && !S.contacts.get(cid)?.verified)
+    body.push(h('p.riskask', { 'data-testid': 'risky-ask' }, icon('alert', 13),
+      ' Asking for money or a code? You haven’t verified this contact — anyone can use any name. Call them or compare safety numbers first.'));
   let overMeta = false;
   if (m.file) {
     const f = m.file, sf = f.safety;
@@ -1425,7 +1435,7 @@ VIEWS.chat = (id) => {
   const sub = h('span.sub', { 'data-online': live, 'data-kind': linkState(id)[1], 'data-testid': 'conn-state' },
     linkState(id)[0], ttlLabel ? h('span.subttl', { title: 'Disappearing messages' }, ' · ', icon('timer', 12), ` ${ttlLabel}`) : null);
 
-  const view = h('div.screen.chat',
+  const view = h('div.screen.chat', { 'data-renewed': c.renewedAt || null },
     header(displayName(c), {
       back: () => go('home'),
       lead: avatar(c, { size: 'sm', online: live }),
@@ -1443,9 +1453,12 @@ VIEWS.chat = (id) => {
       h('div.share',
         h('button.primary', { 'data-testid': 'accept-request', onclick: async () => { c.request = false; await persistContacts(); syncProfiles([id]); render(); } }, 'Accept'),
         h('button.danger', { onclick: () => deleteContact(id) }, 'Delete'))) : null,
-    !c.request && c.remote && !c.verified ? h('div.banner', { 'data-testid': 'verify-banner' },
-      h('p', icon('shield', 14), ' Not verified yet. Call them and compare safety numbers to be sure nobody swapped the invite.'),
-      h('button', { onclick: () => go('contact', id) }, 'Compare numbers')) : null,
+    c.request && c.lookalikeUser ? h('p.banner.warn', { 'data-testid': 'lookalike-user' }, icon('alert', 14), ` Their @${c.username} looks like your contact’s @${c.lookalikeUser} — a different person can pick any username.`) : null,
+    !c.request && c.remote && !c.verified ? h(`div.banner${c.lookalike || c.lookalikeUser ? '.warn' : ''}`, { 'data-testid': 'verify-banner' },
+      h('p', icon('shield', 14), ' Not verified. Anyone can choose any name or @username — compare safety numbers (on a call or in person) before trusting who this is.'),
+      c.lookalike ? h('p', { 'data-testid': 'lookalike-name' }, icon('alert', 14), ` The name looks like your contact “${c.lookalike[0]}” — but it is a different person’s key.`) : null,
+      c.lookalikeUser ? h('p', { 'data-testid': 'lookalike-user' }, icon('alert', 14), ` @${c.username} looks like your contact’s @${c.lookalikeUser} — but it is a different person’s key.`) : null,
+      h('button', { onclick: () => go('contact', id), 'data-testid': 'verify-now' }, 'Verify')) : null,
     live || (hasRemote(id) && c.hideNearby) ? null : hasRemote(id)
       // Already reachable over the internet: one slim line, so the chat keeps the screen.
       ? h('div.reconnect.slim', { 'data-testid': 'nearby-card' },
@@ -1785,6 +1798,12 @@ async function onProfile(cid, m) {
   const c = S.contacts.get(cid); const p = readProfile(m);
   if (!c || !p || p.v < (c.profileV || 0)) return;
   Object.assign(c, { name: p.name, username: p.user, pic: p.pic, calls: p.calls, profileV: p.v });
+  // Rechecked on every profile change: someone can rename themselves "Mom" AFTER you added them.
+  if (!c.verified) {
+    const look = impersonates(c, [...S.contacts.values()].map((o) => ({ id: o.id, name: displayName(o), username: o.username })));
+    if (look.name) c.lookalike = [look.name]; else delete c.lookalike;
+    if (look.user) c.lookalikeUser = look.user; else delete c.lookalikeUser;
+  }
   await persistContacts();
   rerenderIf('home'); rerenderIf('chat', () => S.viewArgs[0] === cid); rerenderIf('contact', () => S.viewArgs[0] === cid);
 }
@@ -2676,38 +2695,81 @@ async function saveBackupFile() {
   } catch (e) { toast(`Backup failed: ${e.message}`, 'error'); }
 }
 
-// 2. Online backup (log in on any phone with username + passphrase)
+// 2. Online backup (log in on any phone with username + passphrase + security PIN)
+/** Ask for a new security PIN twice. → the PIN, or null if cancelled. */
+async function askNewPin(title, body) {
+  const p1 = h('input', { type: 'password', inputmode: 'numeric', pattern: '[0-9]*', autocomplete: 'new-password', maxlength: BK.PIN_MAX, placeholder: `New PIN (${BK.PIN_MIN}–${BK.PIN_MAX} digits)`, 'data-testid': 'pin-1', 'aria-label': 'New security PIN' });
+  const p2 = h('input', { type: 'password', inputmode: 'numeric', pattern: '[0-9]*', autocomplete: 'new-password', maxlength: BK.PIN_MAX, placeholder: 'Type it again', 'data-testid': 'pin-2', 'aria-label': 'Repeat the security PIN' });
+  const err = h('p.error', { 'data-testid': 'pin-error' });
+  for (;;) {
+    const v = await modal({ title, body: [...[].concat(body), p1, p2, err], actions: [['Cancel', false], ['Save PIN', 'ok', 'primary']] });
+    if (v !== 'ok') return null;
+    const problem = BK.pinProblem(p1.value) || (p1.value !== p2.value ? 'The two PINs don’t match' : null);
+    if (!problem) return p1.value;
+    err.textContent = problem; toast(problem, 'error');
+  }
+}
+const pinBody = () => [
+  h('p', 'You’ll be asked for this PIN when you log in on a device that doesn’t have your account yet. Not on this one, and not to unlock.'),
+  h('p.hint', icon('shield', 14), ' The relay counts wrong PINs: 4 tries, then waits of up to 24 hours. So even someone who learns your username and passphrase can’t get your backup.'),
+  h('p.warn', icon('alert', 14), ' Forget it, and you can still change it on a device where you’re signed in — but a lost device + a forgotten PIN means the online backup can’t be opened.'),
+];
 async function uploadOnline(rec) {
+  // Save the settings FIRST: the package is a copy of the vault, and a device that logs in from it
+  // must get the CURRENT key and PIN token (sealing first shipped the previous ones — a PIN change then
+  // made the next device's first backup a "wrong PIN" on the relay).
+  await S.vault.putRecord('cloud', { ...rec, pinStale: undefined });
   let media = true;
   let sealed = await BK.sealWithKey(await makePackage({ includeMedia: true }), fromB64u(rec.key));
   if (sealed.length > ONLINE_MAX_BYTES) { media = false; sealed = await BK.sealWithKey(await makePackage({ includeMedia: false }), fromB64u(rec.key)); }
   if (sealed.length > ONLINE_MAX_BYTES) throw new Error('Your messages alone are too big for an online backup — use a backup file');
-  await writeBox(RELAY_URL, fromB64u(rec.box), BK.toChunks(sealed), { replace: true });
+  const { pinFails } = await writeBox(RELAY_URL, fromB64u(rec.box), BK.toChunks(sealed), { replace: true, pin: rec.pin ? fromB64u(rec.pin) : null });
   Object.assign(rec, { at: Date.now(), size: sealed.length, media });
+  delete rec.pinStale;
+  const fresh = pinFails && pinFails.last > (rec.pinSeen || 0);
+  if (fresh) rec.pinSeen = pinFails.last;
   await S.vault.putRecord('cloud', rec);
+  if (fresh) wrongPinAlert(pinFails.n, pinFails.last);
   rerenderIf('settings');
   return rec;
 }
 async function enableOnlineBackup() {
   if (!S.profile.username) { toast('Choose a username first (Settings → You)', 'error'); return; }
   const pass = await askPassphrase('Turn on online backup',
-    [h('p', 'Your account is sealed with keys made from your username and passphrase, then stored on the Murmur relay. On a new phone you just log in with those two.'),
-      h('p.warn', icon('alert', 14), ' The trade-off: anyone who knows your username could download the sealed copy and try to guess your passphrase forever. It is only as strong as your passphrase.')]);
+    [h('p', 'Your account is sealed with keys made from your username, passphrase and a security PIN, then stored on the Murmur relay. On a new device you log in with those three.'),
+      h('p.warn', icon('alert', 14), ' The trade-off: someone who knows your username can try passphrases through the relay (slowly — it limits how fast). If they ever guessed it, your security PIN (next step) still stops them downloading the backup.')]);
   if (!pass) return;
   if (strength(pass).bits < ONLINE_MIN_BITS) {
     await modal({ title: 'Your passphrase is too weak for this', body: ['An online copy can be attacked offline, so Murmur requires a strong passphrase — for example 4–5 random words. Change it in Settings → Security, then try again.'], actions: [['OK', true, 'primary']] });
     return;
   }
+  const pin = await askNewPin('Choose a security PIN', pinBody());
+  if (!pin) return;
   toast('Making your online backup…');
   try {
-    const k = await BK.onlineKeys(S.profile.username, pass);
-    await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), user: S.profile.username });
-    toast('Online backup is on. Log in on any phone with your username and passphrase.', 'success', 6000);
+    const tok = await BK.pinToken(S.profile.username, pin);
+    const k = await BK.onlineKeys(S.profile.username, pass, { pin: tok });
+    // PIN first, then the backup: the copy is never on the relay without its PIN.
+    // A backup made earlier with this username + passphrase may still be on the relay with its PIN
+    // (e.g. turned on again from a restored phone). The same PIN opens it; a different one can't.
+    const v = await BK.pinVerifier(tok);
+    await gateBox(RELAY_URL, k.box, v).catch(async (e) => {
+      if (!(e instanceof PinError)) throw e;
+      await gateBox(RELAY_URL, k.box, v, { pin: tok }).catch((e2) => {
+        throw e2 instanceof PinError ? new Error(e2.state === 'locked'
+          ? 'An older online backup for this username and passphrase is locked after wrong PINs. Try again later.'
+          : 'An older online backup for this username and passphrase has a different PIN. Use that PIN, or change your passphrase first.') : e2;
+      });
+    });
+    await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), pin: toB64u(tok), user: S.profile.username });
+    toast('Online backup is on. Log in on any phone with your username, passphrase and PIN.', 'success', 6000);
   } catch (e) { toast(`Online backup failed: ${e.message}`, 'error', 6000); }
 }
 async function disableOnlineBackup(silent = false) {
   const rec = await S.vault.getRecord('cloud', null);
-  if (rec) await readBox(RELAY_URL, fromB64u(rec.box), { ack: true }).catch(() => {}); // delete it from the relay
+  const pin = rec?.pin ? fromB64u(rec.pin) : null;
+  if (rec) await readBox(RELAY_URL, fromB64u(rec.box), { ack: true, pin }).catch(() => {}); // delete it from the relay
+  if (pin) await gateBox(RELAY_URL, fromB64u(rec.box), null, { pin }).catch(() => {});     // …and its PIN
   await S.vault.deleteRecord('cloud');
   if (!silent) toast('Online backup turned off and deleted from the relay');
   rerenderIf('settings');
@@ -2716,14 +2778,65 @@ async function disableOnlineBackup(silent = false) {
 async function refreshOnlineBackup(force = false) {
   const rec = await S.vault?.getRecord('cloud', null);
   if (!rec || (!force && Date.now() - (rec.at || 0) < ONLINE_REFRESH_MS)) return;
-  await uploadOnline(rec);
+  if (rec.pinStale) { if (force) throw new Error('Enter your current security PIN first (Settings → Backups)'); return; } // no more wrong tries
+  try { await uploadOnline(rec); } catch (e) {
+    if (!(e instanceof PinError)) throw e;
+    if (e.state === 'locked') { // someone is trying PINs right now
+      if ((rec.lockSeen || 0) < e.until) { rec.lockSeen = e.until; await S.vault.putRecord('cloud', rec); wrongPinAlert(null, Date.now(), e.until); }
+      return;
+    }
+    // This phone's PIN is out of date (changed on another device): stop, and ask — don't keep guessing.
+    rec.pinStale = true; await S.vault.putRecord('cloud', rec); rerenderIf('settings');
+    toast('Your security PIN was changed on another device. Enter it in Settings → Backups to keep backing up.', 'error', 8000);
+  }
+}
+/** Wrong PINs on the online backup mean someone has the username AND passphrase. Say so, plainly. */
+function wrongPinAlert(n, last, until = 0) {
+  modal({ title: 'Someone tried to open your online backup', body: [
+    n ? `${n} wrong security ${n === 1 ? 'PIN was' : 'PINs were'} tried — the last one ${new Date(last).toLocaleString()}.` : `Wrong security PINs are being tried right now. The relay is making them wait until ${new Date(until).toLocaleString()}.`,
+    'To get that far they had to know your username AND your passphrase. Your PIN stopped them.',
+    h('strong', 'Change your passphrase now (Settings → Security).'), ' Your online backup moves to new keys, and their guesses stop working.',
+  ], actions: [['Later', false], ['Change passphrase', 'go', 'primary']] }).then((v) => { if (v === 'go') go('settings', 'security'); });
+}
+/** This phone's PIN is out of date: enter the current one (checked by the relay — counts as a try). */
+async function enterCurrentPin() {
+  const rec = await S.vault.getRecord('cloud', null); if (!rec) return;
+  const inp = h('input', { type: 'password', inputmode: 'numeric', pattern: '[0-9]*', maxlength: BK.PIN_MAX, placeholder: 'Current security PIN', 'data-testid': 'current-pin', 'aria-label': 'Current security PIN' });
+  if ((await modal({ title: 'Enter your current PIN', body: ['It was changed on another device. Wrong tries count on the relay.', inp], actions: [['Cancel', false], ['Continue', 'ok', 'primary']] })) !== 'ok') return;
+  const pass = await askPassphrase('Confirm it’s you', ['The backup is re-sealed with the PIN.']);
+  if (!pass) return;
+  try {
+    const tok = await BK.pinToken(S.profile.username, inp.value);
+    await readBox(RELAY_URL, fromB64u(rec.box), { pin: tok });           // the relay checks it
+    const k = await BK.onlineKeys(S.profile.username, pass, { pin: tok });
+    await uploadOnline({ ...rec, key: toB64u(k.key), pin: toB64u(tok) });
+    toast('Backing up again', 'success');
+  } catch (e) { toast(e instanceof PinError ? (e.state === 'locked' ? `Too many wrong PINs — try after ${new Date(e.until).toLocaleTimeString()}` : 'Wrong PIN') : e.message, 'error', 6000); }
 }
 /** The passphrase changed (we have the new one): move the online copy to the new keys. */
 async function rekeyOnlineBackup(newPass) {
   const rec = await S.vault.getRecord('cloud', null); if (!rec) return;
-  await readBox(RELAY_URL, fromB64u(rec.box), { ack: true }).catch(() => {});
-  const k = await BK.onlineKeys(S.profile.username, newPass);
-  await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), user: S.profile.username });
+  const pin = rec.pin ? fromB64u(rec.pin) : null; // the PIN token depends on username + PIN only: it carries over
+  await readBox(RELAY_URL, fromB64u(rec.box), { ack: true, pin }).catch(() => {});
+  if (pin) await gateBox(RELAY_URL, fromB64u(rec.box), null, { pin }).catch(() => {});
+  const k = await BK.onlineKeys(S.profile.username, newPass, { pin });
+  if (pin) await gateBox(RELAY_URL, k.box, await BK.pinVerifier(pin));
+  await uploadOnline({ box: toB64u(k.box), key: toB64u(k.key), ...(rec.pin ? { pin: rec.pin } : {}), user: S.profile.username });
+}
+/** Add or change the security PIN (works without the old PIN: this phone holds its token). */
+async function changeOnlinePin() {
+  const rec = await S.vault.getRecord('cloud', null); if (!rec) return;
+  const pass = await askPassphrase(rec.pin ? 'Change security PIN' : 'Add a security PIN', ['Confirm it’s you first.']);
+  if (!pass) return;
+  const pin = await askNewPin(rec.pin ? 'New security PIN' : 'Choose a security PIN', pinBody());
+  if (!pin) return;
+  try {
+    const tok = await BK.pinToken(S.profile.username, pin);
+    const k = await BK.onlineKeys(S.profile.username, pass, { pin: tok });
+    await gateBox(RELAY_URL, fromB64u(rec.box), await BK.pinVerifier(tok), { pin: rec.pin ? fromB64u(rec.pin) : null });
+    await uploadOnline({ ...rec, key: toB64u(k.key), pin: toB64u(tok) }); // re-sealed: the key includes the PIN
+    toast(rec.pin ? 'Security PIN changed' : 'Security PIN added', 'success');
+  } catch (e) { toast(`Couldn’t change the PIN: ${e.message}`, 'error', 6000); }
 }
 
 // 3. Move to a new phone (old phone erases itself once the new one has everything)
@@ -2817,23 +2930,45 @@ VIEWS.restore = (mode = null) => {
   if (mode === 'online') {
     const user = h('input', { type: 'text', autocapitalize: 'none', spellcheck: false, autocomplete: 'username', placeholder: 'Username', 'data-testid': 'login-user' });
     const pass = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Passphrase', 'data-testid': 'login-pass' });
+    const pin = h('input', { type: 'password', inputmode: 'numeric', pattern: '[0-9]*', autocomplete: 'one-time-code', maxlength: BK.PIN_MAX, placeholder: 'Security PIN', 'data-testid': 'login-pin' });
+    const pinWrap = h('div.pinstep', { hidden: true }, h('label', 'Security PIN'), pin,
+      h('p.hint', 'Forgot it? On a device where you’re still signed in: Settings → Backups → Change PIN.'));
     const btn = h('button.primary.big', { type: 'submit', 'data-testid': 'login-go' }, 'Log in');
+    const until = (t) => new Date(t).toLocaleString([], new Date(t).toDateString() === new Date().toDateString() ? { hour: 'numeric', minute: '2-digit' } : { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+    let cache = null; // username + passphrase → keys: 600,000 PBKDF2 rounds, don't redo them per PIN try
     return h('form.screen.narrow', { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = '';
       if (!(await confirmReplace())) return;
       busy(btn, true, 'Log in');
       try {
-        const k = await BK.onlineKeys(user.value, pass.value);
-        const rows = await readBox(RELAY_URL, k.box);
+        const id = `${normalizeUsername(user.value)}\u0000${pass.value}`;
+        if (cache?.id !== id) cache = { id, k: await BK.onlineKeys(user.value, pass.value) };
+        const tok = pinWrap.hidden ? null : await BK.pinToken(user.value, pin.value);
+        const rows = await readBox(RELAY_URL, cache.k.box, { pin: tok });
         const sealed = BK.fromChunks(rows.map((r) => r.data));
         if (!sealed) throw new Error('No online backup found for that username and passphrase.');
-        await finishRestore(await BK.openSealed(sealed, { key: k.key }), pass.value, 'online');
+        // A PIN typed for a backup that has none is ignored by the relay — so fall back to the no-PIN key.
+        const keys = tok ? [(await BK.onlineKeys(user.value, pass.value, { pin: tok })).key, cache.k.key] : [cache.k.key];
+        let pkg = null, last = null;
+        for (const key of keys) { try { pkg = await BK.openSealed(sealed, { key }); break; } catch (x) { last = x; } }
+        if (!pkg) throw last;
+        await finishRestore(pkg, pass.value, 'online');
         toast('Welcome back — your account is on this phone', 'success', 6000);
-      } catch (ex) { err.textContent = ex.message; busy(btn, false, 'Log in'); }
+      } catch (ex) {
+        if (ex instanceof PinError) {
+          pinWrap.hidden = false;
+          err.textContent = ex.state === 'required' ? 'This account has a security PIN. Enter it to continue.'
+            : ex.state === 'locked' ? `Too many wrong PINs. Try again after ${until(ex.until)}.`
+            : ex.left > 0 ? `Wrong PIN. ${ex.left} more ${ex.left === 1 ? 'try' : 'tries'} before you have to wait.`
+            : `Wrong PIN. Try again after ${until(ex.until)}.`;
+          pin.value = ''; setTimeout(() => pin.focus(), 0);
+        } else err.textContent = ex.message;
+        busy(btn, false, 'Log in');
+      }
     } },
     header('Log in', { back }),
     h('p', 'Works if you turned on ', h('strong', 'online backup'), ' on your old phone.'),
-    h('label', 'Username'), user, h('label', 'Passphrase'), pass, err, btn,
+    h('label', 'Username'), user, h('label', 'Passphrase'), pass, pinWrap, err, btn,
     h('p.hint', 'Messages that arrived after the last backup (and were already read on the old phone) aren’t included. Your contacts’ phones renew the secure link automatically the next time they’re online.'));
   }
   if (mode === 'file') {
@@ -2898,7 +3033,18 @@ function backupSection() {
     info.textContent = rec ? `On — last backup ${new Date(rec.at).toLocaleString()} (${fmtBytes(rec.size)}${rec.media ? '' : ', without photos — too big'}). Refreshed daily while you use Murmur; the relay keeps it 30 days.` : 'Off.';
     toggle.textContent = rec ? 'Turn off and delete it' : 'Turn on online backup';
     toggle.onclick = () => (rec ? disableOnlineBackup() : enableOnlineBackup());
+    pinLine.hidden = pinBtn.hidden = !rec;
+    pinLine.className = rec && !rec.pin ? 'warn' : 'hint';
+    pinLine.replaceChildren(icon(rec?.pin ? 'shield' : 'alert', 14), rec?.pin ? ' Security PIN on — asked when you log in on a new phone.' : ' No security PIN yet: your username + passphrase alone open this backup. Add one.');
+    pinBtn.textContent = rec?.pin ? 'Change PIN' : 'Add a security PIN';
+    if (rec?.pinStale) {
+      pinLine.className = 'warn';
+      pinLine.replaceChildren(icon('alert', 14), ' Your PIN was changed on another device — enter it to keep backing up.');
+      pinBtn.textContent = 'Enter current PIN'; pinBtn.onclick = enterCurrentPin;
+    } else pinBtn.onclick = changeOnlinePin;
   });
+  const pinLine = h('p.hint', { hidden: true, 'data-testid': 'online-pin-status' });
+  const pinBtn = h('button', { hidden: true, 'data-testid': 'online-pin' }, 'Change PIN'); // click handler set once the record is read (one handler only)
   return h('div.backup',
     h('h2', 'Backup & new phone'),
     h('p.hint', 'Your account lives only on this phone. Make a backup so a lost or broken phone doesn’t mean lost chats.'),
@@ -2906,7 +3052,10 @@ function backupSection() {
     h('div.row', h('button', { onclick: saveBackupFile, 'data-testid': 'backup-file' }, icon('share', 18), ' Save backup file')),
     h('p.hint', S.settings.backupFileAt ? `Last saved ${new Date(S.settings.backupFileAt).toLocaleString()}.` : 'Never saved.'),
     h('label', 'Online backup — log in on any phone'),
+    // PIN line + button go BELOW the main buttons: they appear a moment later (after reading the record),
+    // and inserting them above or between would shift "Back up now" under a finger mid-tap.
     info, h('div.row', toggle, h('button', { onclick: () => refreshOnlineBackup(true).then(() => toast('Backed up', 'success')).catch((e) => toast(e.message, 'error')), 'data-testid': 'online-now' }, 'Back up now')),
+    pinLine, h('div.row', pinBtn),
     h('label', 'Move to a new phone'),
     h('p.hint', 'Old phone in hand: scan a code on the new one. Everything moves; this phone then erases itself.'),
     h('button', { onclick: startMove, 'data-testid': 'move-start' }, icon('qr', 18), ' Move to a new phone'));
@@ -3506,7 +3655,7 @@ const SETTINGS_PAGES = [
   { id: 'account', icon: 'user', title: 'Account', sub: () => `${S.profile.name || 'Your name'}${S.profile.username ? ` · @${S.profile.username}` : ''}`,
     words: 'profile name photo picture avatar username login identity key remember' },
   { id: 'devices', icon: 'devices', title: 'Devices', sub: () => devicesSub(),
-    words: 'devices linked signed in logged in login sessions another phone other phone where log out sign out remove' },
+    words: 'devices linked signed in logged in login sessions another phone other phone laptop computer where log out sign out remove' },
   { id: 'appearance', icon: 'palette', title: 'Appearance', sub: () => `${(THEMES.find(([v]) => v === themeChoice()) || THEMES[0])[1]} · chat colour · wallpaper`,
     words: 'theme dark light midnight colour color chat colour bubble wallpaper background image photo dim' },
   { id: 'chats', icon: 'chat', title: 'Chats', sub: () => (S.settings.voiceSend === 'release' ? 'Voice: send when you let go' : 'Voice: listen before sending'),
@@ -3667,11 +3816,11 @@ const SETTINGS_PAGE = {
 function devicesSub() {
   if (!S.remote) return 'Needs internet mode';
   const n = S.devices?.devices.filter((d) => !d.out).length;
-  return n ? `${n} ${n === 1 ? 'phone' : 'phones'} · this one active` : 'Where your account is signed in';
+  return n ? `${n} ${n === 1 ? 'device' : 'devices'} · this one active` : 'Where your account is signed in';
 }
 const sinceText = (t) => (t ? new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : '');
 function devicesBody() {
-  const intro = h('p.hint', 'Your account is active on one phone at a time. Log in on another phone and it moves there — the old phone stops receiving messages and says so. Every phone that used your account in the last 30 days is listed.');
+  const intro = h('p.hint', 'Your account is active on one device at a time. Log in on another device and it moves there — the old one stops receiving messages and says so. Every device that used your account in the last 30 days is listed.');
   if (!S.remote) return [intro, h('p.empty', { 'data-testid': 'devices-off' }, 'Turn on Internet mode to see where your account is signed in — the list is kept (encrypted) on the relay.')];
   if (!S.devices || Date.now() - devCheckedAt > 30_000) syncDevices().catch((e) => { const el = document.querySelector('[data-testid="devices-error"]'); if (el) { el.hidden = false; el.textContent = `Couldn’t check right now — ${e.message}`; } });
   const me = deviceId(), list = S.devices?.devices || [];
@@ -3682,7 +3831,7 @@ function devicesBody() {
   const row = (d) => h('li.devrow', { 'data-testid': d.id === me ? 'device-me' : 'device', 'data-state': d.id === me ? 'me' : d.out ? 'out' : d.active ? 'active' : 'replaced' },
     h('span.devicon', icon('devices', 22)),
     h('span.devtext',
-      h('strong', d.name, d.id === me ? h('span.devbadge', 'This phone') : null),
+      h('strong', d.name, d.id === me ? h('span.devbadge', 'This device') : null),
       h('small.devstate', status(d)),
       d.via ? h('small', `${DEV.VIA_TEXT[d.via] || 'Signed in'}${d.since ? ` · ${sinceText(d.since)}` : ''}`) : null),
     d.id === me ? h('button.link', { type: 'button', onclick: renameThisDevice, 'data-testid': 'device-rename' }, 'Rename')
@@ -3691,7 +3840,7 @@ function devicesBody() {
     intro,
     list.length ? h('ul.devlist', { 'data-testid': 'devices-list' }, list.map(row)) : h('p.empty', { 'data-testid': 'devices-loading' }, 'Checking…'),
     h('p.error', { 'data-testid': 'devices-error', hidden: true }),
-    h('p.hint', icon('shield', 14), ' Don’t recognise a phone? Sign it out, then change your passphrase in Security — whoever logged in knew your username and passphrase. The list is end-to-end encrypted: the relay can’t read it.'),
+    h('p.hint', icon('shield', 14), ' Don’t recognise a device? Sign it out, then change your passphrase in Security — whoever logged in knew your username and passphrase. The list is end-to-end encrypted: the relay can’t read it.'),
   ];
 }
 
@@ -3699,14 +3848,14 @@ VIEWS.replaced = () => {
   const r = S.replaced || {};
   return h('main.screen.center.replaced', { 'data-testid': 'replaced' },
     h('span.replaced-icon', icon('devices', 40)),
-    h('h1', 'Your account is active on another phone'),
-    h('p.replaced-by', { 'data-testid': 'replaced-by' }, h('strong', r.name || 'Another phone'),
+    h('h1', 'Your account is active on another device'),
+    h('p.replaced-by', { 'data-testid': 'replaced-by' }, h('strong', r.name || 'Another device'),
       r.via ? h('small', `${DEV.VIA_TEXT[r.via] || 'Signed in'}${r.since ? ` · ${sinceText(r.since)}` : ''}`) : null),
-    h('p', 'Murmur works on one phone at a time, so this phone stopped sending and receiving messages — otherwise the two would take each other’s messages.'),
-    h('p.hint', 'Wasn’t you? Take your account back, sign that phone out in Settings → Devices, and change your passphrase.'),
+    h('p', 'Murmur works on one device at a time, so this one stopped sending and receiving messages — otherwise the two would take each other’s messages.'),
+    h('p.hint', 'Wasn’t you? Take your account back, sign that device out in Settings → Devices, and change your passphrase.'),
     h('div.replaced-actions',
-      h('button.primary', { type: 'button', onclick: takeAccountBack, 'data-testid': 'take-back' }, 'Use Murmur on this phone'),
-      h('button', { type: 'button', onclick: eraseReplacedPhone, 'data-testid': 'replaced-erase' }, 'Erase Murmur from this phone'),
+      h('button.primary', { type: 'button', onclick: takeAccountBack, 'data-testid': 'take-back' }, 'Use Murmur on this device'),
+      h('button', { type: 'button', onclick: eraseReplacedPhone, 'data-testid': 'replaced-erase' }, 'Erase Murmur from this device'),
       h('button.link', { type: 'button', onclick: () => lock(), 'data-testid': 'replaced-lock' }, 'Lock')));
 };
 
