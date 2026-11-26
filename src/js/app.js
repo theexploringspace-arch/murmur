@@ -244,6 +244,9 @@ function hideSplash() {
 }
 
 // Older builds posted these into chats; they told contacts when you changed devices. Hidden on load.
+/** A sender-chosen timestamp, kept honest: never in the future (a message dated 2099 would sit pinned
+ *  at the bottom of the chat). Late is fine — messages wait on the relay for up to 30 days. */
+const inTs = (t, now = Date.now()) => (Number.isFinite(+t) && +t > 0 ? Math.min(+t, now) : now);
 const OLD_RENEWAL_NOTICE = /restored Murmur on a new phone — secure link renewed|^🔐 Secure link renewed after restoring your account$/;
 async function openVault(vault) {
   // Load everything the timers and views read BEFORE publishing S.vault: they treat
@@ -498,7 +501,7 @@ async function onRemoteMessage(cid, m) {
     case 'hello': if (!c.remote) { c.remote = true; await persistContacts(); } rerenderIf('chat', () => S.viewArgs[0] === cid); rerenderIf('home'); break;
     case 'msg':
       if (typeof m.text !== 'string' || m.text.length > MAX_TEXT || typeof m.id !== 'string') return;
-      addMessage(cid, { id: m.id.slice(0, 32), dir: 'in', ts: +m.ts || Date.now(), text: m.text, ttl: Math.max(0, m.ttl | 0), ...msgMeta(m) });
+      addMessage(cid, { id: m.id.slice(0, 32), dir: 'in', ts: inTs(m.ts), text: m.text, ttl: Math.max(0, m.ttl | 0), ...msgMeta(m) });
       S.remote.send(cid, { t: 'ack', id: m.id }).catch(() => {});
       break;
     case 'ack': markDelivered(cid, String(m.id)); break;
@@ -1691,7 +1694,7 @@ async function onAppMessage(cid, m) {
       }
       const L = { lat: m.lat, lon: m.lon, acc: m.acc, lid: typeof m.lid === 'string' ? m.lid.slice(0, 32) : undefined, until: Number.isFinite(m.until) ? m.until : undefined };
       if (L.lid && updateLiveBubble(key, L.lid, { ...m, ...L })) return;
-      addMessage(key, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), loc: L, from, ...msgMeta(m) }); ack();
+      addMessage(key, { id: m.id, dir: 'in', ts: inTs(m.ts), loc: L, from, ...msgMeta(m) }); ack();
       break;
     }
     case 'sos': {
@@ -1699,7 +1702,7 @@ async function onAppMessage(cid, m) {
       if (findMsg(cid, m.id)) { ack(); return; } // same SOS arrived twice (nearby + relay backstop): one alarm
       const loc = validLocation(m.loc) ? { lat: m.loc.lat, lon: m.loc.lon, acc: m.loc.acc } : null;
       const text = String(m.text || 'SOS').slice(0, 500);
-      addMessage(cid, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), sos: { text, loc } }); ack();
+      addMessage(cid, { id: m.id, dir: 'in', ts: inTs(m.ts), sos: { text, loc } }); ack();
       navigator.vibrate?.([400, 150, 400, 150, 400]);
       const v = await modal({ title: `🚨 SOS from ${displayName(c)}`, body: [h('p.sostext', { 'data-testid': 'sos-alert' }, text),
         loc ? h('p', formatCoords(loc), ' ', relative(S.myLoc, loc) || '') : h('p.hint', 'No location was included.'),
@@ -1723,7 +1726,7 @@ async function onAppMessage(cid, m) {
       const g = S.groups.get(m.gid);
       if (!isMember(g, cid) || typeof m.text !== 'string' || m.text.length > MAX_TEXT) return;
       const from = groupOrigin(g, cid, m); if (!from) return;
-      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: +m.ts || Date.now(), text: m.text, from, ...msgMeta(m) }); ack();
+      addMessage(`g:${g.id}`, { id: m.id, dir: 'in', ts: inTs(m.ts), text: m.text, from, ...msgMeta(m) }); ack();
       forwardIfAdmin(g, m, cid);
       break;
     }

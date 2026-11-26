@@ -88,6 +88,7 @@ export async function openSealed(bytes, { passphrase, key }) {
     if (passphrase == null) throw new BackupError('This backup needs your passphrase');
     const r = new Reader(bytes.slice(10)); const it = r.u32();
     if (it < 100_000 && it !== 1000) throw new BackupError('Backup uses weak settings');   // 1000: unit tests only
+    if (it > 10_000_000) throw new BackupError('Not a Murmur backup (impossible settings)'); // a crafted file could freeze the page
     const salt = r.raw(16); iv = r.raw(12); ct = bytes.slice(10 + 4 + 16 + 12);
     k = await importAesKey(await pbkdf2(passphrase, salt, it, 32));
   } else if (mode === MODE_KEY) {
