@@ -29,6 +29,13 @@
   <script type="module" src="./js/app.js"></script>
 </head>
 <body>
+  <!-- Launch screen: plain markup so it paints before any script loads. app.js fades it out once
+       the first real screen is drawn (and never sooner than ~0.8 s, so it doesn't flicker). -->
+  <div id="splash" class="splash" role="presentation" data-testid="splash">
+    <img class="splash-logo" src="./icons/icon.svg" alt="" width="96" height="96">
+    <p class="splash-name">Murmur</p>
+    <p class="splash-from"><span>from</span> Prince Is Genius</p>
+  </div>
   <div id="app" aria-live="polite"><noscript>Murmur needs JavaScript — it runs entirely on your device.</noscript></div>
 </body>
 </html>

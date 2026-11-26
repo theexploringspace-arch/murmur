@@ -24,6 +24,7 @@ import { openSheet, closeSheet } from './ui/sheet.js';
 import { slots, anyVault, ensureSlots, unlockAny, setDuress, clearDuress, opensOther } from './core/duress.js';
 import * as BK from './core/backup.js';
 import { readBox, writeBox } from './core/relaybox.js';
+import * as DEV from './core/devices.js';
 import { Call, readSignal, callDecision, callButtons, formatDuration } from './core/call.js';
 import { canEdit, canDeleteForEveryone, minutesLeft, acceptChange, EDIT_WINDOW, DELETE_WINDOW } from './core/edits.js';
 import { normalizeUsername, usernameProblem, makeLogin, checkLogin, profileFor, readProfile, LOGIN_KEY, MAX_PIC } from './core/profile.js';
@@ -225,6 +226,21 @@ async function boot() {
     // Older installs have one slot; add the second (an unopenable placeholder) in the background.
     ensureSlots(store).catch((e) => console.warn('slot setup:', e.message));
   } else go('welcome');
+  hideSplash();
+}
+
+/** Fade the launch screen once the first real screen exists. It stays at least SPLASH_MIN_MS from
+ *  page start so a fast load doesn't flash it, and is removed (not just hidden) afterwards so it
+ *  can never sit over the app or catch taps. */
+const SPLASH_MIN_MS = 800;
+function hideSplash() {
+  const el = document.getElementById('splash'); if (!el) return;
+  const wait = Math.max(0, SPLASH_MIN_MS - performance.now());
+  setTimeout(() => {
+    el.classList.add('out');
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    setTimeout(() => el.remove(), reduce ? 0 : 350);
+  }, wait);
 }
 
 async function openVault(vault) {
@@ -246,7 +262,15 @@ async function openVault(vault) {
   S.lastActivity = Date.now();
   navigator.storage?.persist?.().catch(() => {}); // ask the browser not to evict our (encrypted) data under storage pressure
   for (const id of S.chats.keys()) hydrateMedia(id).catch((e) => console.warn('media:', e.message));
+  // This account moved to another phone while this one was closed: stay off the relay (devices.js).
+  const take = S.slot === 'a' ? (await store.get('device/take'))?.via : null;
+  if (take) await vault.deleteRecord('device/replaced');
+  S.replaced = take ? null : await vault.getRecord('device/replaced', null);
+  if (S.replaced) { go('replaced'); syncDevices().catch(() => {}); return; } // (still notices a sign-out)
   await startRemote().catch((e) => toast(`Internet mode unavailable: ${e.message}`, 'error'));
+  // Announce this phone — and, after a restore, take the account over — BEFORE renewing links, so the
+  // old copy knows the re-keyed messages aren't its to throw away.
+  await syncDevices().catch((e) => console.warn('devices:', e.message)); // performs a pending take-over
   // Restored from a file/online backup (an older copy): renew every secure link once.
   if (S.remote && S.slot === 'a' && (await store.get('restore/pending'))) {
     await S.remote.resyncAll().catch((e) => console.warn('resync:', e.message));
@@ -262,6 +286,7 @@ async function startRemote() {
   if (S.settings.internet === false || S.remote) return;
   const r = new Remote({ vault: S.vault, identity: S.vault.identity, relayUrl: RELAY_URL, origin: location.origin, getName: () => S.profile.name });
   await r.load();
+  r.beforeDrop = accountMovedHere;
   S.remote = r;
   r.on('status', (v) => { S.relayOnline = v; if (v) syncProfiles(); rerenderIf('home'); rerenderIf('chat'); rerenderIf('settings'); })
     .on('message', (cid, m) => onRemoteMessage(cid, m).catch((e) => console.warn(e)))
@@ -271,11 +296,144 @@ async function startRemote() {
     .on('warning', (w) => console.warn('relay:', w))
     .on('resynced', (cid, info) => {
       if (!S.contacts.has(cid)) return;
+      // They restored on a NEW phone: a nearby link still open to their OLD phone now leads to a copy
+      // that no longer holds their account (devices.js) — close it so nothing more lands there.
+      if (!info.initiator) S.convs.get(cid)?.close('their account moved');
       callMsg(cid, info.initiator ? '🔐 Secure link renewed after restoring your account' : `🔐 ${displayName(S.contacts.get(cid))} restored Murmur on a new phone — secure link renewed (same safety number)`);
     });
   r.start();
 }
 function stopRemote() { S.remote?.stop(); S.remote = null; S.relayOnline = false; }
+
+// ---------------------------------------------------------------- devices ("where you're signed in")
+// One account is active on one phone at a time; see core/devices.js for why and how. This phone's id
+// and name live in localStorage, NOT in the vault: a backup copied to another phone must not carry
+// this phone's identity with it.
+const DEVICE_ID_KEY = 'murmur-device-id', DEVICE_NAME_KEY = 'murmur-device-name';
+let memDeviceId = null; // if storage is blocked: one id per launch (each launch then looks like a new phone)
+function deviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!/^[A-Za-z0-9_-]{16}$/.test(id || '')) { id = toB64u(random(12)); localStorage.setItem(DEVICE_ID_KEY, id); }
+    return id;
+  } catch { return (memDeviceId ||= toB64u(random(12))); }
+}
+function thisDeviceName() {
+  try { const n = (localStorage.getItem(DEVICE_NAME_KEY) || '').trim(); if (n) return n.slice(0, 60); } catch {}
+  return DEV.deviceName(navigator.userAgent, navigator.userAgentData?.platform);
+}
+async function devicesSecret() {
+  if (S.remote) return S.remote.secret;
+  const rec = await S.vault?.getRecord('remote', null);
+  return rec?.secret ? fromB64u(rec.secret) : null;
+}
+
+let devQueue = Promise.resolve(), devLastHere = 0, devCheckedAt = 0;
+/**
+ * Read the devices box, write what this phone needs to (take-over / heartbeat), and react if the
+ * account has moved to another phone. Serialised: two overlapping checks could both "take".
+ * → the folded state (DEV.deviceState), or null when there's nothing to check (internet mode off).
+ */
+function syncDevices({ take = null, force = false } = {}) {
+  const run = async () => {
+    if (!S.vault || S.settings?.internet === false) return null;
+    const vault = S.vault, secret = await devicesSecret(); if (!secret) return null;
+    // A restore / new account left a marker: take over. It's cleared only once the take row is
+    // really on the relay — an offline first start must not make the NEW phone look replaced later.
+    const marked = !take && S.slot === 'a' ? (await store.get('device/take'))?.via : null;
+    take ||= marked;
+    const k = await DEV.deviceKeys(secret), me = deviceId(), name = thisDeviceName();
+    const rows = [];
+    for (const r of await readBox(RELAY_URL, k.box)) { const row = await DEV.openRow(k.key, r.data); if (row) rows.push(row); }
+    if (S.vault !== vault) return null; // locked meanwhile
+    const now = Date.now();
+    let st = DEV.deviceState(rows, me, now);
+    // A parked (replaced) phone only READS — it must still notice being signed out, nothing else.
+    if (S.replaced) { if (st.signedOut) accountMovedAway(st); return st; }
+    if (!take && (st.superseded || st.signedOut)) { accountMovedAway(st); return st; }
+    const write = async (row) => { await writeBox(RELAY_URL, k.box, [await DEV.sealRow(k.key, row)]); rows.push(row); devLastHere = now; };
+    // An empty box (a new feature on an old account, or 30 quiet days) means nobody holds it: this phone does.
+    if (take || st.activeId === null) {
+      await write({ k: 'take', id: me, at: now, via: take || 'existing', name });
+      if (marked) await store.delete('device/take');
+    }
+    else if (force || now - devLastHere >= DEV.HEARTBEAT_MS) await write({ k: 'here', id: me, at: now, name });
+    st = DEV.deviceState(rows, me, now);
+    S.devices = st; devCheckedAt = now;
+    rerenderIf('settings', () => S.viewArgs?.[0] === 'devices');
+    return st;
+  };
+  const p = devQueue.then(run, run); devQueue = p.catch(() => {}); return p;
+}
+/**
+ * Remote asks before discarding a message it can't decrypt: is it the new phone's?
+ * The answer must come from a check that STARTED after the message arrived — an earlier "no" may
+ * predate the other phone's take-over (that bug lost messages in testing). A burst of failures shares
+ * one such check instead of one relay read each.
+ */
+let devFresh = null;
+async function accountMovedHere() {
+  if (S.replaced) return true;
+  devFresh ||= devQueue.then(() => { devFresh = null; return syncDevices(); });
+  const st = await devFresh.catch(() => null);
+  return !!(st && (st.superseded || st.signedOut)) || !!S.replaced;
+}
+function accountMovedAway(st) {
+  if (!S.vault || S.replaced?.out || (S.replaced && !st.signedOut)) return;
+  const by = st.devices.find((d) => d.id === st.activeId) || (S.replaced && { name: S.replaced.name });
+  const info = { out: !!st.signedOut, name: by?.name || 'another phone', via: by?.via || null, since: by?.since || null, at: Date.now() };
+  S.replaced = info; S.devices = st;
+  stopRemote(); // off the relay right now — not one more message taken from the other phone
+  const vault = S.vault;
+  // Outside the Remote's queue on purpose: this can be called from inside it (beforeDrop), and
+  // eraseThisPhone waits for that queue to finish — awaiting it here would wait for itself.
+  setTimeout(async () => {
+    if (info.out) {
+      await eraseThisPhone().catch((e) => console.warn('erase:', e.message));
+      await modal({ title: 'This phone was signed out', body: [`Your Murmur account was signed out of this phone from “${info.name}”, and its copy here was erased.`], actions: [['OK', 'ok']] });
+      return;
+    }
+    await vault.putRecord('device/replaced', info).catch(() => {});
+    for (const conv of S.convs.values()) conv.close('moved');
+    go('replaced');
+  }, 0);
+}
+async function takeAccountBack() {
+  const r = S.replaced || {};
+  const ok = await modal({ title: 'Use Murmur on this phone?', body: [`Your account moves back here. “${r.name}” stops sending and receiving messages and shows that it was replaced.`, 'Each contact’s secure link is renewed automatically, like after a restore.'],
+    actions: [['Cancel', false], ['Use it here', 'take', 'primary']] });
+  if (ok !== 'take') return;
+  await S.vault.deleteRecord('device/replaced'); S.replaced = null;
+  try { await syncDevices({ take: 'back' }); } // claim it FIRST, then go online
+  catch (e) { S.replaced = r; await S.vault.putRecord('device/replaced', r); toast(`Couldn’t reach the relay — ${e.message}`, 'error', 6000); return; }
+  await startRemote().catch((e) => toast(`Internet mode unavailable: ${e.message}`, 'error'));
+  await S.remote?.resyncAll().catch((e) => console.warn('resync:', e.message));
+  go('home'); toast('Murmur is active on this phone again', 'success');
+}
+async function eraseReplacedPhone() {
+  const ok = await modal({ title: 'Erase Murmur from this phone?', body: ['Your account stays on the other phone. Everything Murmur kept here — chats, photos, keys — is erased from this phone.'], actions: [['Cancel', false], ['Erase', 'erase', 'danger']] });
+  if (ok === 'erase') { await eraseThisPhone(); toast('Erased from this phone'); }
+}
+async function signOutDevice(d) {
+  const ok = await modal({ title: `Sign out “${d.name}”?`, body: ['That phone erases its copy of your account the next time Murmur opens there with internet.', 'If you don’t recognise it, also change your passphrase (Settings → Security) — whoever logged in knew it.'],
+    actions: [['Cancel', false], ['Sign out', 'out', 'danger']] });
+  if (ok !== 'out') return;
+  try {
+    const k = await DEV.deviceKeys(await devicesSecret());
+    await writeBox(RELAY_URL, k.box, [await DEV.sealRow(k.key, { k: 'out', id: deviceId(), to: d.id, at: Date.now() })]);
+    await syncDevices(); toast(`${d.name} will be signed out`, 'success');
+  } catch (e) { toast(`Couldn’t reach the relay — ${e.message}`, 'error', 6000); }
+}
+async function renameThisDevice() {
+  const input = h('input', { type: 'text', maxlength: 60, value: thisDeviceName(), 'data-testid': 'device-name', 'aria-label': 'Name for this phone' });
+  const ok = await modal({ title: 'Name this phone', body: ['Shown in the device list on your other phones.', input], actions: [['Cancel', false], ['Save', 'save', 'primary']] });
+  if (ok !== 'save') return;
+  try { const v = input.value.trim().slice(0, 60); if (v) localStorage.setItem(DEVICE_NAME_KEY, v); else localStorage.removeItem(DEVICE_NAME_KEY); } catch {}
+  syncDevices({ force: true }).catch(() => {}); render();
+}
+// While the app is open and visible, look every couple of minutes (reading is free; see devices.js).
+setInterval(() => { if (S.vault && document.visibilityState === 'visible') syncDevices().catch(() => {}); }, DEV.CHECK_MS);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.vault) syncDevices().catch(() => {}); });
 
 function setMsgStatus(cid, mid, status) {
   const m = (S.chats.get(cid) || []).find((x) => x.id === mid && x.dir === 'out');
@@ -424,7 +582,7 @@ function lock(reason) {
   closeStatusOverlay(); closeViewer();
   endCall('locked');
   S.vault?.lock();
-  Object.assign(S, { vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), replyTo: new Map(), statuses: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
+  Object.assign(S, { devices: null, replaced: null, vault: null, profile: null, settings: null, contacts: new Map(), chats: new Map(), convs: new Map(), unread: new Map(), typing: new Map(), drafts: new Map(), replyTo: new Map(), statuses: new Map(), rfiles: new Map(), groups: new Map(), myCid: null, myLoc: null });
   document.querySelectorAll('.modal-backdrop').forEach((m) => m.remove());
   go('unlock');
   if (reason) toast(reason);
@@ -681,6 +839,7 @@ VIEWS.create = () => {
         await v.putRecord('settings', { autoLockMin: 5 });
         p1.value = p2.value = '';
         S.slot = 'a';
+        await store.put('device/take', { via: 'new' });
         await openVault(v);
         ensureSlots(store).catch((e) => console.warn('slot setup:', e.message));
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; btn.textContent = 'Create my keys'; }
@@ -1303,8 +1462,9 @@ VIEWS.chat = (id) => {
           h('button', { onclick: () => go('join', id), 'data-testid': 'reconnect-join' }, icon('scan', 18), ' Scan theirs'))),
     liveBanner(id),
     log,
-    h('p#typing.typing', { hidden: !S.typing.get(id) }, `${displayName(c)} is typing…`),
-    h('p#chatstatus.chatstatus', { hidden: true }),
+    // Floats just above the floating message bar (the bar is over the messages, not under them).
+    h('div.floatnotes', h('p#typing.typing', { hidden: !S.typing.get(id) }, `${displayName(c)} is typing…`), h('p#chatstatus.chatstatus', { hidden: true })),
+    scrollDownButton(log),
     comp);
   requestAnimationFrame(() => { log.scrollTop = log.scrollHeight; if (online) input.focus(); });
   confirmReads(id);
@@ -2108,7 +2268,7 @@ VIEWS.group = (gid) => {
       h('button.icon', { onclick: () => go('groupinfo', gid), 'aria-label': 'Group info', 'data-testid': 'group-info' }, icon('info'))] }),
     liveBanner(key),
     g.members.some((m) => m.cid !== S.myCid && !S.contacts.has(m.cid)) ? h('div.banner', h('p', icon('shield', 14), ' Some members aren’t your contacts: their names come from the group creator, and their messages reach you only through people you know.')) : null,
-    log, h('p#chatstatus.chatstatus', { hidden: true }), comp);
+    log, h('div.floatnotes', h('p#chatstatus.chatstatus', { hidden: true })), scrollDownButton(log), comp);
   applyLook(view, log, key);
   return view;
 };
@@ -2229,7 +2389,28 @@ function composer({ key, disabled, placeholder, onText, onFile, onLocation }) {
     vr.button,
     h('button.icon.send', { type: 'submit', disabled, 'aria-label': 'Send', 'data-testid': 'send' }, icon('send')));
   vr.form = form;
+  // The bar floats over the chat (like WhatsApp), so the list needs bottom room equal to the bar's
+  // height — which changes (reply preview, a 5-line message, recording). Measure it, don't guess.
+  if (typeof ResizeObserver === 'function') {
+    let wasAtBottom = true;
+    new ResizeObserver(() => {
+      const screen = form.parentElement; if (!screen) return;
+      const log = screen.querySelector('#log');
+      wasAtBottom = !log || log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+      screen.style.setProperty('--composer-h', `${Math.ceil(form.getBoundingClientRect().height)}px`);
+      if (log && wasAtBottom) log.scrollTop = log.scrollHeight;
+    }).observe(form);
+  }
   return form;
+}
+
+/** A round "jump to the latest message" button that appears once you've scrolled up a bit. */
+function scrollDownButton(log) {
+  const btn = h('button.icon.tobottom', { type: 'button', hidden: true, 'aria-label': 'Jump to the latest message', 'data-testid': 'to-bottom',
+    onclick: () => log.scrollTo({ top: log.scrollHeight, behavior: 'smooth' }) }, icon('chevron', 20));
+  const check = () => { btn.hidden = log.scrollHeight - log.scrollTop - log.clientHeight < 240; };
+  log.addEventListener('scroll', check, { passive: true });
+  return btn;
 }
 /** Show exactly what is about to be sent (the cleaned copy) and wait for an explicit Send. */
 async function reviewBeforeSend(prep, kind) {
@@ -2605,9 +2786,10 @@ async function eraseThisPhone() {
 }
 
 // ---- the new phone: "I already have an account" ----
-async function finishRestore(pkg, passphrase) {
+async function finishRestore(pkg, passphrase, via) {
   if (await anyVault(store)) await store.clear(); // replacing (the person confirmed)
   await BK.importVault(store, SLOTS.a, pkg);
+  await store.put('device/take', { via }); // the next unlock takes the account over on this phone (devices.js)
   await ensureSlots(store);
   if (passphrase) {
     const { vault, slot } = await unlockAny(store, passphrase);
@@ -2645,7 +2827,7 @@ VIEWS.restore = (mode = null) => {
         const rows = await readBox(RELAY_URL, k.box);
         const sealed = BK.fromChunks(rows.map((r) => r.data));
         if (!sealed) throw new Error('No online backup found for that username and passphrase.');
-        await finishRestore(await BK.openSealed(sealed, { key: k.key }), pass.value);
+        await finishRestore(await BK.openSealed(sealed, { key: k.key }), pass.value, 'online');
         toast('Welcome back — your account is on this phone', 'success', 6000);
       } catch (ex) { err.textContent = ex.message; busy(btn, false, 'Log in'); }
     } },
@@ -2665,7 +2847,7 @@ VIEWS.restore = (mode = null) => {
       busy(btn, true, 'Restore');
       try {
         const pkg = await BK.openSealed(new Uint8Array(await f.arrayBuffer()), { passphrase: pass.value });
-        await finishRestore(pkg, pass.value);
+        await finishRestore(pkg, pass.value, 'file');
         toast('Restored — your account is on this phone', 'success', 6000);
       } catch (ex) { err.textContent = ex.message; busy(btn, false, 'Restore'); }
     } },
@@ -2686,7 +2868,7 @@ VIEWS.restore = (mode = null) => {
       if (!sealed) throw new Error('Nothing waiting for this code — keep the old phone on the code screen, then try again.');
       const pkg = await BK.openSealed(sealed, { key: k.key });
       await writeBox(RELAY_URL, k.ack, [utf8('received')]);     // tells the old phone it can erase itself
-      await finishRestore(pkg, null);
+      await finishRestore(pkg, null, 'move');
       toast('Moved! Unlock with your username and passphrase.', 'success', 8000);
       return false;
     } catch (ex) { err.textContent = ex.message; return true; }
@@ -3039,7 +3221,7 @@ VIEWS.status = () => {
       fresh.length ? [h('h2', 'Recent'), h('ul.contacts', fresh.map(row))] : null,
       seen.length ? [h('h2', 'Viewed'), h('ul.contacts', seen.map(row))] : null,
       !rows.length ? h('p.empty', 'No status updates from your contacts right now. Theirs appear here for 24 hours.') : null,
-      h('p.hint.center', icon('shield', 14), ` Visible to ${statusAudienceLabel()} · end-to-end encrypted · gone after 24 h. `,
+      h('p.hint.center', icon('shield', 14), ` Visible to ${statusAudienceLabel()} · end-to-end encrypted · disappears after 24 hours. `,
         h('button.linkish', { onclick: () => go('settings', 'privacy'), 'data-testid': 'status-privacy-link' }, 'Change'))),
     tabBar('status'));
 };
@@ -3323,6 +3505,8 @@ const THEMES = [['dark', 'Midnight (default)'], ['light', 'Light'], ['system', '
 const SETTINGS_PAGES = [
   { id: 'account', icon: 'user', title: 'Account', sub: () => `${S.profile.name || 'Your name'}${S.profile.username ? ` · @${S.profile.username}` : ''}`,
     words: 'profile name photo picture avatar username login identity key remember' },
+  { id: 'devices', icon: 'devices', title: 'Devices', sub: () => devicesSub(),
+    words: 'devices linked signed in logged in login sessions another phone other phone where log out sign out remove' },
   { id: 'appearance', icon: 'palette', title: 'Appearance', sub: () => `${(THEMES.find(([v]) => v === themeChoice()) || THEMES[0])[1]} · chat colour · wallpaper`,
     words: 'theme dark light midnight colour color chat colour bubble wallpaper background image photo dim' },
   { id: 'chats', icon: 'chat', title: 'Chats', sub: () => (S.settings.voiceSend === 'release' ? 'Voice: send when you let go' : 'Voice: listen before sending'),
@@ -3344,7 +3528,7 @@ const SETTINGS_PAGES = [
 function settingsHome() {
   const rowFor = (p) => h('li', h('button.setrow', { type: 'button', onclick: () => go('settings', p.id), 'data-testid': `settings-${p.id}` },
     h('span.seticon', icon(p.icon, 20)), h('span.settext', h('strong', p.title), h('small', p.sub())), icon('chevron', 18)));
-  const groups = [['account', 'appearance'], ['chats', 'privacy', 'security', 'calls'], ['backups', 'internet'], ['help']];
+  const groups = [['account', 'devices', 'appearance'], ['chats', 'privacy', 'security', 'calls'], ['backups', 'internet'], ['help']];
   const lists = h('div.setgroups', groups.map((ids) => h('ul.setlist', ids.map((id) => rowFor(SETTINGS_PAGES.find((p) => p.id === id))))));
   const results = h('ul.setlist', { hidden: true, 'data-testid': 'settings-results' });
   const search = h('input.setsearch', { type: 'search', placeholder: 'Search settings', 'aria-label': 'Search settings', 'data-testid': 'settings-search', oninput: (e) => {
@@ -3368,6 +3552,7 @@ function settingsHome() {
 }
 
 const SETTINGS_PAGE = {
+  devices: () => devicesBody(),
   account() {
     const nameIn = h('input', { type: 'text', value: S.profile.name, maxlength: 40, 'aria-label': 'Display name' });
     const myId = h('code.small', '…');
@@ -3476,6 +3661,53 @@ const SETTINGS_PAGE = {
       h('button', { onclick: () => go('about') }, icon('shield', 18), ' How Murmur protects you'),
     ];
   },
+};
+
+// ---- Settings → Devices ----
+function devicesSub() {
+  if (!S.remote) return 'Needs internet mode';
+  const n = S.devices?.devices.filter((d) => !d.out).length;
+  return n ? `${n} ${n === 1 ? 'phone' : 'phones'} · this one active` : 'Where your account is signed in';
+}
+const sinceText = (t) => (t ? new Date(t).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) : '');
+function devicesBody() {
+  const intro = h('p.hint', 'Your account is active on one phone at a time. Log in on another phone and it moves there — the old phone stops receiving messages and says so. Every phone that used your account in the last 30 days is listed.');
+  if (!S.remote) return [intro, h('p.empty', { 'data-testid': 'devices-off' }, 'Turn on Internet mode to see where your account is signed in — the list is kept (encrypted) on the relay.')];
+  if (!S.devices || Date.now() - devCheckedAt > 30_000) syncDevices().catch((e) => { const el = document.querySelector('[data-testid="devices-error"]'); if (el) { el.hidden = false; el.textContent = `Couldn’t check right now — ${e.message}`; } });
+  const me = deviceId(), list = S.devices?.devices || [];
+  const status = (d) => (d.id === me ? 'Active now'
+    : d.out ? 'Signed out'
+    : d.active ? `Active · seen ${ago(d.last)}`
+    : `Replaced · last seen ${ago(d.last)}`);
+  const row = (d) => h('li.devrow', { 'data-testid': d.id === me ? 'device-me' : 'device', 'data-state': d.id === me ? 'me' : d.out ? 'out' : d.active ? 'active' : 'replaced' },
+    h('span.devicon', icon('devices', 22)),
+    h('span.devtext',
+      h('strong', d.name, d.id === me ? h('span.devbadge', 'This phone') : null),
+      h('small.devstate', status(d)),
+      d.via ? h('small', `${DEV.VIA_TEXT[d.via] || 'Signed in'}${d.since ? ` · ${sinceText(d.since)}` : ''}`) : null),
+    d.id === me ? h('button.link', { type: 'button', onclick: renameThisDevice, 'data-testid': 'device-rename' }, 'Rename')
+      : !d.out ? h('button.link.danger', { type: 'button', onclick: () => signOutDevice(d), 'data-testid': 'device-signout' }, 'Sign out') : null);
+  return [
+    intro,
+    list.length ? h('ul.devlist', { 'data-testid': 'devices-list' }, list.map(row)) : h('p.empty', { 'data-testid': 'devices-loading' }, 'Checking…'),
+    h('p.error', { 'data-testid': 'devices-error', hidden: true }),
+    h('p.hint', icon('shield', 14), ' Don’t recognise a phone? Sign it out, then change your passphrase in Security — whoever logged in knew your username and passphrase. The list is end-to-end encrypted: the relay can’t read it.'),
+  ];
+}
+
+VIEWS.replaced = () => {
+  const r = S.replaced || {};
+  return h('main.screen.center.replaced', { 'data-testid': 'replaced' },
+    h('span.replaced-icon', icon('devices', 40)),
+    h('h1', 'Your account is active on another phone'),
+    h('p.replaced-by', { 'data-testid': 'replaced-by' }, h('strong', r.name || 'Another phone'),
+      r.via ? h('small', `${DEV.VIA_TEXT[r.via] || 'Signed in'}${r.since ? ` · ${sinceText(r.since)}` : ''}`) : null),
+    h('p', 'Murmur works on one phone at a time, so this phone stopped sending and receiving messages — otherwise the two would take each other’s messages.'),
+    h('p.hint', 'Wasn’t you? Take your account back, sign that phone out in Settings → Devices, and change your passphrase.'),
+    h('div.replaced-actions',
+      h('button.primary', { type: 'button', onclick: takeAccountBack, 'data-testid': 'take-back' }, 'Use Murmur on this phone'),
+      h('button', { type: 'button', onclick: eraseReplacedPhone, 'data-testid': 'replaced-erase' }, 'Erase Murmur from this phone'),
+      h('button.link', { type: 'button', onclick: () => lock(), 'data-testid': 'replaced-lock' }, 'Lock')));
 };
 
 VIEWS.settings = (page) => {

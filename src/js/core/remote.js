@@ -232,6 +232,12 @@ export class Remote {
       else if (data[0] === V && data[1] === KIND_RESYNC) await this.#onResync(data.slice(2));
       else if (data[0] === V && data[1] === KIND_MSG && data.length > 22) await this.#onMessage(data);
     } catch (e) {
+      // Before throwing a message away for good, ask whether this account has moved to another phone
+      // (devices.js). If it has, the message is the OTHER phone's — leave it on the relay for it.
+      // Without this, an old copy of the account silently deleted the new phone's messages.
+      let theirs = false;
+      try { theirs = !!(await this.beforeDrop?.()); } catch {}
+      if (theirs) { this.emit('warning', 'Left a message for the phone this account moved to'); return; }
       this.emit('warning', `Dropped an undecryptable message (${e.message})`);
     }
     this.#ack([relayId]); // processed (or provably garbage): never redeliver
