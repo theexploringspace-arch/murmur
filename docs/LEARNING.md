@@ -134,3 +134,14 @@ Group bubbles show `✓ 1/2`. Add a tap-to-see list of who has received the mess
 5. Debugging drill: the browser e2e suite takes ~8 minutes. How did we prove the new device test
    would catch the bug, without waiting for a real user to lose a message?
 
+## Exercise 17 — PINs, rate limits and impostors
+1. Compute it: a 6-digit PIN mixed only into the key (no relay counter), PBKDF2 100k rounds, an attacker
+   who knows your passphrase and does 20,000 guesses/s on a GPU. How long to try all 10⁶? Now with the
+   relay's schedule (`pinWait`). Which one did we build, and why does the order "gate, then upload" matter?
+2. Why does the PIN change the **key** but not the **mailbox address**? What would break if it changed both?
+3. The relay never wipes after wrong PINs. Write down who could abuse a wipe, and what they'd need to know.
+4. `riskyAsk` is a word list. Write three scam messages that slip past it, then decide: add patterns, or
+   accept it as a nudge? (Hint: what is the real check, and where does the app send you for it?)
+5. Threat model: your contacts list has "Ada" and a stranger joins as "Ade". Why does Murmur not flag it,
+   but flags "Adaeze" vs "Adaize"? What's the cost of flagging short names?
+

@@ -297,7 +297,8 @@ Sealed: `"MURMURBK" ‖ 01 ‖ mode ‖ …`
 - mode 2 (key): `iv12 ‖ AES-GCM(key32, json, aad="MURMURBK"‖01‖02)`
 
 Online keys: `root = PBKDF2(pass, SHA-256("murmur/online-backup/v1\0"‖lower(username))[0..16], 600k)`;
-`box = HKDF(root, 0³², "…/box")`, `key = HKDF(root, 0³², "…/key")`. Move: `code` = 32 random bytes →
+`box = HKDF(root, 0³², "…/box")`, `key = HKDF(root ‖ pinToken, 0³², "…/key")` (just `root` for backups
+made before security PINs). The PIN never changes the mailbox, only the key — see §17. Move: `code` = 32 random bytes →
 `box`, `key`, `ack` by HKDF with labels `murmur/move/{box,key,ack}`. QR/text: `murmur-move:` ‖ base64url(code).
 
 Relay chunks: `"MBK1" ‖ id8 ‖ u32 created ‖ u16 i ‖ u16 n ‖ ≤ 900 KiB` in an ordinary mailbox (box secret
@@ -305,7 +306,9 @@ Relay chunks: `"MBK1" ‖ id8 ‖ u32 created ‖ u16 i ‖ u16 n ‖ ≤ 900 Ki
 
 Renewal (envelope kind 6): `[01, 06] ‖ invite` (the usual signed invite) to each contact's inbox; the
 contact answers with a normal join + hello. Accepted only if `invite.identityPub` equals the stored key
-for that contact, `created ≥ last renewal` and the invite id is new.
+for that contact, `created ≥ last renewal` and the invite id is new. **No chat notice on either side**: the safety number
+doesn't change, so telling the contact only leaks that you changed devices (the owner sees it in
+*Devices*; older builds' notices are hidden on load).
 
 ## 14. Replies, forwards and read receipts (`meta.js`)
 
@@ -401,4 +404,34 @@ look replaced. A restoring phone writes its `take` **before** sending renewal in
 waits for a devices check that **started after** the envelope arrived (a burst shares one). If the
 account moved, the envelope is left on the relay for the active phone. A contact that receives a
 renewal from a new phone (§13) closes any nearby link to the old phone.
+
+## 17. Security PIN for online backup (`backup.js`, `relaybox.js`, relay `inbox.js`)
+
+A PIN alone is weak (6 digits = 10⁶ options, ~20 bits). It is only worth having because the **relay
+counts wrong tries** on the backup's mailbox, which a passphrase-derived key can't do on its own.
+
+- `pinToken = PBKDF2(PIN, SHA-256("murmur/online-pin/v1\0"‖lower(username))[0..16], 100k)` — 32 bytes,
+  different for the same PIN under another username. PIN rules (`pinProblem`): 6–12 digits, not one
+  repeated digit, not a ±1 run (123456, 890123, 654321), not a 2- or 3-digit repeating pattern.
+- The relay stores `v = base64url(SHA-256(pinToken))` per mailbox ("gate"): never the PIN or the token.
+- Auth on a gated mailbox: `{ t:'auth', secret, pin: base64url(pinToken) }`. Before ANY row is sent the
+  relay checks it and on failure sends `{ t:'pin', state }` and closes with 4003:
+  `required` (no PIN; not counted) · `wrong` (+ `left`, `until`) · `locked` (+ `until`; not counted).
+- Wrong tries in a row: 1–3 no wait; after the 4th wait 1 min, then 10 min, 1 h, 6 h, and 24 h from then
+  on (`pinWait`). A correct PIN resets the count. The relay **never wipes** on wrong PINs (that would let
+  anyone who knows your passphrase destroy your backup).
+- Authenticated (so already past the PIN): `{ t:'gate', v }` sets/replaces it, `{ t:'ungate' }` removes
+  it; the relay answers `{ t:'gated', on }`. Order when turning backup on: gate first, then upload, so the
+  copy is never on the relay without its PIN. A phone that's signed in stores `pinToken` in its vault
+  (inside the `cloud` record), so it can refresh and **change the PIN without the old one** — confirmed
+  with the passphrase.
+- Turning backup on finds an existing gate (an older backup with the same username + passphrase): the
+  new PIN is tried as the current one; same PIN → continues, different → a plain explanation.
+- Rate limit (router): WebSocket opens to any mailbox are limited per IP (`INBOX_LIMIT`, 300/min) — a
+  phone needs a handful; it slows a single machine trying passphrases.
+
+Effect: with the PIN, knowing username **and** passphrase lets someone learn that a backup exists (the
+relay asks for a PIN instead of "not found") but not download it; at ≤ 1 try/day after the first few,
+a random 6-digit PIN takes ~1,370 years on average. The PIN is also mixed into the key, so even
+someone who bypassed the relay (or ran it) would still need the passphrase **and** the PIN.
 

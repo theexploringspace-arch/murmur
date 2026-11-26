@@ -161,3 +161,41 @@ test('restoring an OLD backup: links are renewed (only by the real identity), he
   await a2.next(() => texts(a2).includes('still fine'));
   a2.stop(); bob.stop(); mallory.stop();
 });
+
+// ---------------------------------------------------------------- security PIN
+import { pinProblem, pinToken, pinVerifier, onlineKeys as keysFor, PIN_MIN, PIN_MAX } from '../../src/js/core/backup.js';
+import { toB64u as b64 } from '../../src/js/core/bytes.js';
+
+test('PIN rules: 6–12 digits, no repeats, runs or short patterns', () => {
+  assert.equal(PIN_MIN, 6); assert.equal(PIN_MAX, 12);
+  for (const ok of ['482916', '305718', '90210477', '120398475611']) assert.equal(pinProblem(ok), null, ok);
+  const bad = {
+    '12345': /at least 6/, '1234567890123': /at most 12/, '48a916': /digits only/, '': /digits only/,
+    '000000': /same digit/, '123456': /run/, '654321': /run/, '890123': /run/, '7890123': /run/,
+    '121212': /repeating/, '123123': /repeating|run/, '696969': /repeating/,
+  };
+  for (const [pin, re] of Object.entries(bad)) assert.match(pinProblem(pin), re, pin);
+});
+
+test('PIN token: deterministic, bound to the username (case/@-insensitive), never the PIN itself', async () => {
+  const it = { iterations: 1000 };
+  const a = await pinToken('Prince', '482916', it), b = await pinToken('@prince', '482916', it);
+  assert.equal(b64(a), b64(b));
+  assert.notEqual(b64(a), b64(await pinToken('prince2', '482916', it)), 'same PIN, other person → other token');
+  assert.notEqual(b64(a), b64(await pinToken('prince', '482917', it)));
+  assert.equal(a.length, 32);
+  const v = await pinVerifier(a);
+  assert.match(v, /^[A-Za-z0-9_-]{43}$/, 'what the relay stores: a 32-byte hash');
+  assert.notEqual(v, b64(a), 'the relay never gets the token itself as its stored value');
+});
+
+test('online keys: the PIN changes the KEY but not the MAILBOX (so the relay can count PIN tries on it)', async () => {
+  const it = { iterations: 1000 };
+  const tok = await pinToken('prince', '482916', it);
+  const plain = await keysFor('prince', 'correct horse battery staple', it);
+  const withPin = await keysFor('prince', 'correct horse battery staple', { ...it, pin: tok });
+  const otherPin = await keysFor('prince', 'correct horse battery staple', { ...it, pin: await pinToken('prince', '305718', it) });
+  assert.equal(b64(plain.box), b64(withPin.box));
+  assert.notEqual(b64(plain.key), b64(withPin.key));
+  assert.notEqual(b64(withPin.key), b64(otherPin.key), 'a wrong PIN can’t open the backup even if the relay were bypassed');
+});

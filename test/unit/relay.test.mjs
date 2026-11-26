@@ -133,3 +133,107 @@ test('calls: /v1/turn mints short-lived credentials server-side, filters port 53
     assert.ok(!JSON.stringify(bad).includes('wrong-token'));
   } finally { r3.server.close(); }
 });
+
+// ---------------------------------------------------------------- security PIN (gated mailboxes)
+import { pinWait, PIN_FREE } from '../../relay/src/inbox.js';
+import { route } from '../../relay/src/router.js';
+
+/** Open + auth (optionally with a PIN token) and collect every text frame until the socket closes or syncs. */
+function session(b, pin) {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(`${relay.url.replace('http', 'ws')}/v1/inbox/${b.addr}`, { headers: { Origin: ORIGIN } });
+    const texts = [];
+    ws.onopen = () => ws.send(JSON.stringify({ t: 'auth', secret: toB64u(b.secret), ...(pin ? { pin: toB64u(pin) } : {}) }));
+    ws.onmessage = (e) => { if (typeof e.data !== 'string') return; const m = JSON.parse(e.data); texts.push(m); if (m.t === 'synced') resolve({ ws, texts, ok: true }); };
+    ws.onclose = (e) => resolve({ ws, texts, ok: false, code: e.code });
+  });
+}
+const sha = async (u8) => toB64u(new Uint8Array(await crypto.subtle.digest('SHA-256', u8)));
+const reply = (ws, msg) => new Promise((r) => { ws.onmessage = (e) => { if (typeof e.data === 'string' && JSON.parse(e.data).t === 'gated') r(JSON.parse(e.data)); }; ws.send(JSON.stringify(msg)); });
+
+test('PIN wait schedule: 4 tries, then 1 min, 10 min, 1 h, 6 h, 24 h and stays at 24 h', () => {
+  assert.equal(PIN_FREE, 4);
+  assert.deepEqual([1, 2, 3].map(pinWait), [0, 0, 0]);
+  assert.deepEqual([4, 5, 6, 7, 8, 9, 50].map(pinWait), [60e3, 600e3, 3600e3, 6 * 3600e3, 86400e3, 86400e3, 86400e3]);
+  // 1,000,000 PINs at ~1 try/day after the first few ≈ 1,370 years on average to hit it.
+});
+
+test('gated mailbox: needs the PIN, counts wrong tries, makes you wait, resets on success, can be removed', async () => {
+  const b = await box();
+  const good = new Uint8Array(32).fill(7), bad = new Uint8Array(32).fill(8);
+  await post(b.addr, new TextEncoder().encode('sealed backup'));
+  // Owner gates it (no PIN yet → plain auth works).
+  let s = await session(b); assert.equal(s.ok, true);
+  assert.deepEqual(await reply(s.ws, { t: 'gate', v: await sha(good) }), { t: 'gated', on: true }); s.ws.close();
+
+  // No PIN → refused, not counted.
+  s = await session(b);
+  assert.equal(s.ok, false); assert.equal(s.code, 4003); assert.deepEqual(s.texts, [{ t: 'pin', state: 'required' }]);
+  // Wrong PIN → refused BEFORE any stored row is sent; tries left counts down.
+  const real = Date.now; let now = real();
+  Date.now = () => now;
+  try {
+    for (const left of [3, 2, 1, 0]) {
+      s = await session(b, bad);
+      assert.equal(s.ok, false);
+      assert.equal(s.texts[0].state, 'wrong'); assert.equal(s.texts[0].left, left);
+    }
+    assert.equal(s.texts[0].until, now + 60_000, '4th wrong try (0 left) → wait 1 minute');
+    // During the wait even the RIGHT PIN is refused, and the refusal isn't counted.
+    s = await session(b, good);
+    assert.deepEqual(s.texts[0], { t: 'pin', state: 'locked', until: now + 60_000 });
+    now += 61_000;
+    s = await session(b, bad);
+    const lastWrong = now;
+    assert.equal(s.texts[0].until, now + 600_000, '5th wrong → 10 minutes');
+    now += 601_000;
+    // Right PIN: in — and the owner is TOLD how many wrong tries there were (someone knows the passphrase).
+    s = await session(b, good);
+    assert.equal(s.ok, true);
+    assert.deepEqual(s.texts.find((m) => m.t === 'pinfails'), { t: 'pinfails', n: 5, last: lastWrong });
+    s.ws.close();
+    // …but the count is NOT reset by the owner's success (that would give an attacker a fresh ladder
+    // every time the owner's phone refreshes its backup): the next wrong try waits 1 hour.
+    s = await session(b, bad);
+    assert.equal(s.texts[0].until, now + 3600_000, '6th wrong → 1 hour, despite the right PIN in between');
+    // After a quiet week the count fades.
+    now += 8 * 86400_000;
+    s = await session(b, good); assert.equal(s.texts.some((m) => m.t === 'pinfails'), false, 'old tries aren’t reported forever'); s.ws.close();
+    s = await session(b, bad);
+    assert.equal(s.texts[0].left, 3, 'a week later the count starts again');
+    // Malformed token: counted as wrong, never crashes the object.
+    s = await new Promise((resolve) => {
+      const ws = new WebSocket(`${relay.url.replace('http', 'ws')}/v1/inbox/${b.addr}`, { headers: { Origin: ORIGIN } });
+      const texts = []; ws.onopen = () => ws.send(JSON.stringify({ t: 'auth', secret: toB64u(b.secret), pin: '!!not base64!!' }));
+      ws.onmessage = (e) => texts.push(JSON.parse(e.data)); ws.onclose = () => resolve({ texts });
+    });
+    assert.equal(s.texts[0].state, 'wrong');
+    // The owner removes the PIN; plain auth works again.
+    s = await session(b, good); assert.equal(s.ok, true);
+    assert.deepEqual(await reply(s.ws, { t: 'ungate' }), { t: 'gated', on: false }); s.ws.close();
+    s = await session(b); assert.equal(s.ok, true); s.ws.close();
+  } finally { Date.now = real; }
+});
+
+test('gate commands need an authenticated socket, and a gate value must be a 32-byte hash', async () => {
+  const b = await box();
+  const c = connect(b, { auth: false }); await c.opened;
+  c.ws.send(JSON.stringify({ t: 'gate', v: 'A'.repeat(43) }));
+  assert.equal(await c.closed, 4001);
+  const s = await session(b); assert.equal(s.ok, true);
+  s.ws.send(JSON.stringify({ t: 'gate', v: 'short' }));           // ignored
+  await new Promise((r) => setTimeout(r, 100)); s.ws.close();
+  const again = await session(b); again.ws.close();
+  assert.equal(again.ok, true, 'still ungated');
+});
+
+test('mailbox opens are rate-limited per IP when the limiter is configured (429 before touching the mailbox)', async () => {
+  let touched = false;
+  const env = { ALLOWED_ORIGINS: ORIGIN, INBOX_LIMIT: { limit: async ({ key }) => ({ success: key !== '203.0.113.9' }) },
+    INBOX: { idFromName: (n) => n, get: () => ({ fetch: async () => { touched = true; return new Response(null, { status: 200 }); } }) } };
+  const req = (ip) => new Request(`https://relay.test/v1/inbox/${'A'.repeat(43)}`, { headers: { Origin: ORIGIN, Upgrade: 'websocket', 'CF-Connecting-IP': ip } });
+  assert.equal((await route(req('203.0.113.9'), env)).status, 429);
+  assert.equal(touched, false);
+  assert.equal((await route(req('198.51.100.1'), env)).status, 200);
+  assert.equal(touched, true);
+});

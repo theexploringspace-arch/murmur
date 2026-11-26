@@ -59,6 +59,12 @@ async function profile(browser, name) {
 }
 
 const tid = (id) => `[data-testid="${id}"]`;
+const PIN = '482916';
+/** Online backup asks for a security PIN right after the passphrase. */
+async function choosePin(page, pin = PIN) {
+  await page.waitForSelector(tid('pin-1'));
+  await page.fill(tid('pin-1'), pin); await page.fill(tid('pin-2'), pin); await page.click(tid('modal-ok'));
+}
 
 /** The lock screen fills in a remembered username asynchronously; wait for it before typing. */
 const userReady = (page) => page.waitForSelector('[data-testid="unlock-form"][data-ready="1"]', { timeout: 15000 });
@@ -679,7 +685,8 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await openBob(C);
     await logHas(C, 'before backup'); // history came back
     await send(C, 'hello from my restored phone');   // held until the secure link is renewed
-    await logHas(B, 'restored Murmur on a new phone');
+    await B.page.waitForSelector('.screen.chat[data-renewed]', { timeout: 30000 }); // renewed…
+    assert.doesNotMatch(await B.page.textContent(tid('log')), /restored Murmur|new phone/, '…silently: contacts aren’t told you changed devices');
     await logHas(B, 'hello from my restored phone');
     await send(B, 'welcome back');
     await logHas(C, 'welcome back');
@@ -688,7 +695,18 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await C.page.click(tid('back')); await openSetting(C.page, 'backups');
     await C.page.click(tid('online-toggle'));
     await C.page.fill(tid('confirm-pass'), PASS); await C.page.click(tid('modal-ok'));
+    // A weak PIN is refused with the reason, then a good one is accepted.
+    await C.page.waitForSelector(tid('pin-1'));
+    await C.page.fill(tid('pin-1'), '123456'); await C.page.fill(tid('pin-2'), '123456'); await C.page.click(tid('modal-ok'));
+    await C.page.waitForFunction(() => /run like 123456/.test(document.querySelector('[data-testid="pin-error"]')?.textContent || ''));
+    await C.page.fill(tid('pin-1'), PIN); await C.page.fill(tid('pin-2'), PIN); await C.page.click(tid('modal-ok'));
     await C.page.waitForFunction(() => /^On — last backup/.test(document.querySelector('[data-testid="online-status"]')?.textContent || ''), null, { timeout: 60000 });
+    assert.match(await C.page.textContent(tid('online-pin-status')), /Security PIN on/);
+    // Change the PIN (needs the passphrase, not the old PIN — this phone is signed in).
+    await C.page.click(tid('online-pin'));
+    await C.page.fill(tid('confirm-pass'), PASS); await C.page.click(tid('modal-ok'));
+    await choosePin(C.page, '305718');
+    await C.page.waitForFunction(() => /Security PIN changed/.test(document.body.textContent), null, { timeout: 60000 });
     await C.page.context().close();
 
     const D = await profile(browser, 'alice-login'); P.push(D);
@@ -697,6 +715,14 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await D.page.click(tid('login-go'));
     await D.page.waitForFunction(() => /No online backup found/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 60000 });
     await D.page.fill(tid('login-pass'), PASS); await D.page.click(tid('login-go'));
+    // Right username + passphrase isn't enough any more: the relay asks for the PIN…
+    await D.page.waitForFunction(() => /has a security PIN/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 60000 });
+    await D.page.fill(tid('login-pin'), '000111'); await D.page.click(tid('login-go'));
+    // …and counts wrong ones.
+    await D.page.waitForFunction(() => /Wrong PIN\. 3 more tries/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 60000 });
+    await D.page.fill(tid('login-pin'), PIN); await D.page.click(tid('login-go')); // the OLD PIN no longer works
+    await D.page.waitForFunction(() => /Wrong PIN\. 2 more tries/.test(document.querySelector('[data-testid="restore-error"]')?.textContent || ''), null, { timeout: 60000 });
+    await D.page.fill(tid('login-pin'), '305718'); await D.page.click(tid('login-go'));
     await openBob(D);
     await logHas(D, 'welcome back');
     await send(D, 'logged in on yet another phone');
@@ -704,8 +730,15 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
     await send(B, 'got it');
     await logHas(D, 'got it');
 
-    // --- 3. move to a new phone: exact copy, then the old phone erases itself ---
+    // The two wrong PINs above are REPORTED to the owner at the next backup: whoever typed them knew
+    // the username and passphrase.
     await D.page.click(tid('back')); await openSetting(D.page, 'backups');
+    await D.page.click(tid('online-now'));
+    await D.page.waitForFunction(() => /2 wrong security PINs were tried/.test(document.querySelector('.modal')?.textContent || ''), null, { timeout: 60000 });
+    assert.match(await D.page.textContent('.modal'), /Change your passphrase now/);
+    await D.page.click(tid('modal-false'));
+
+    // --- 3. move to a new phone: exact copy, then the old phone erases itself ---
     await D.page.click(tid('move-start'));
     await D.page.fill(tid('confirm-pass'), PASS); await D.page.click(tid('modal-ok'));
     await D.page.waitForFunction(() => document.querySelector('[data-testid="move-code"]')?.value.startsWith('murmur-move:'), null, { timeout: 60000 });
@@ -729,7 +762,7 @@ test('a new phone: backup file, online login (username + passphrase) and move-to
 
 test('devices: see where your account is signed in; logging in elsewhere parks the old phone (no lost messages), take it back, sign a phone out', { timeout: 300000 }, async () => {
   const browser = await chromium.launch({ executablePath: CHROME, args: ['--disable-features=WebRtcHideLocalIpsWithMdns'] });
-  const PASS = 'correct horse battery staple';
+  const PASS = 'violet comet harbor lantern'; // own passphrase: the test above leaves a PIN-locked backup for alice_test + the usual one
   const A = await profile(browser, 'alice-phone1'), B = await profile(browser, 'bob-dev');
   const P = [A, B];
   const logHas = (p, t) => p.page.waitForFunction((x) => (document.querySelector('[data-testid="log"]')?.textContent || '').includes(x), t, { timeout: 30000 });
@@ -748,7 +781,7 @@ test('devices: see where your account is signed in; logging in elsewhere parks t
     let r = await rows(A);
     assert.equal(r.length, 1);
     assert.equal(r[0][0], 'me');
-    assert.match(r[0][1], /This phone[\s\S]*Active now[\s\S]*Created the account/);
+    assert.match(r[0][1], /This device[\s\S]*Active now[\s\S]*Created the account/);
     await A.page.click(tid('device-rename'));
     await A.page.fill(tid('device-name'), 'Alice’s Tecno'); await A.page.click(tid('modal-save'));
     await A.page.waitForFunction(() => /Alice’s Tecno/.test(document.querySelector('[data-testid="device-me"]')?.textContent || ''));
@@ -758,6 +791,7 @@ test('devices: see where your account is signed in; logging in elsewhere parks t
     await A.page.click(tid('back')); await A.page.click(tid('settings-backups'));
     await A.page.click(tid('online-toggle'));
     await A.page.fill(tid('confirm-pass'), PASS); await A.page.click(tid('modal-ok'));
+    await choosePin(A.page);
     await A.page.waitForFunction(() => /^On — last backup/.test(document.querySelector('[data-testid="online-status"]')?.textContent || ''), null, { timeout: 60000 });
     await leaveSettings(A.page);
 
@@ -766,8 +800,11 @@ test('devices: see where your account is signed in; logging in elsewhere parks t
     await D.page.click(tid('have-account')); await D.page.click(tid('restore-online'));
     await D.page.fill(tid('login-user'), 'alice_test'); await D.page.fill(tid('login-pass'), PASS);
     await D.page.click(tid('login-go'));
+    await D.page.waitForSelector(tid('login-pin'), { state: 'visible', timeout: 60000 });
+    await D.page.fill(tid('login-pin'), PIN); await D.page.click(tid('login-go'));
     await openContact(D, 'Bob');
-    await logHas(B, 'restored Murmur on a new phone');
+    await B.page.waitForSelector('.screen.chat[data-renewed]', { timeout: 30000 }); // renewed…
+    assert.doesNotMatch(await B.page.textContent(tid('log')), /restored Murmur|new phone/, '…silently: contacts aren’t told you changed devices');
     // Bob writes after the move. The new phone gets it; the old one must NOT swallow it (it used to:
     // it grabbed the message, couldn't decrypt it, and deleted it from the relay for good).
     // The case that used to LOSE messages: the new phone is closed, the old one is open. The old
@@ -808,7 +845,7 @@ test('devices: see where your account is signed in; logging in elsewhere parks t
     await A.page.click(tid('device-signout')); await A.page.click(tid('modal-out'));
     await A.page.waitForSelector('[data-testid="devices-list"] li[data-state="out"]', { timeout: 30000 });
     await D.page.evaluate(() => document.dispatchEvent(new Event('visibilitychange'))); // the owner opens it again
-    await D.page.waitForFunction(() => /signed out of this phone from “Alice’s Tecno”/.test(document.body.textContent), null, { timeout: 30000 });
+    await D.page.waitForFunction(() => /signed out of this device from “Alice’s Tecno”/.test(document.body.textContent), null, { timeout: 30000 });
     await D.page.click(tid('modal-ok'));
     await D.page.waitForSelector(tid('get-started')); // erased: back to a fresh start
     // And phone one keeps working.
@@ -1067,8 +1104,11 @@ test('Midnight theme, Settings sections, compact message menu, chat colour & wal
     assert.match(await chatPaint(A), /radial-gradient/);
     // The look is private: Bob's phone is untouched.
     await inLog(B, /hi in violet/);
-    assert.equal(await B.page.$eval('.screen.chat', (e) => e.classList.contains('wall-none')), true);
-    assert.equal(await chatPaint(B), 'none');
+    // Bob never chose one: he gets the default — Murmur's doodle wallpaper, really drawn.
+    assert.equal(await B.page.$eval('.screen.chat', (e) => e.classList.contains('wall-murmur')), true);
+    assert.match(await chatPaint(B), /doodle-dark\.svg/);
+    await shot(B.page, 'n03b-default-doodles');
+    assert.equal(await B.page.evaluate(async () => { const r = await fetch('./img/doodle-dark.svg'); return r.ok && (await r.text()).includes('<path'); }), true, 'the tile loads (CSP allows it, it is deployed)');
     // Reset brings Bob's chat back to the default.
     await A.page.click(tid('back')); await A.page.click(tid('contact-Bob')); await A.page.click(tid('contact-info')); await A.page.click(tid('contact-look'));
     await A.page.click(tid('look-reset'));
@@ -1337,6 +1377,15 @@ test('internet mode: invite link, stranger gating, scam warnings, offline queue,
     assert.match(await C.page.textContent(tid('link-risk')), /Danger/);
     assert.match(await C.page.textContent('.modal'), /Looks like Paypal, but it is NOT paypal\.com/);
     await C.page.click(tid('modal-cancel'));
+    // Accepted but NOT verified: the banner says plainly that names prove nothing, and a request for
+    // money gets a pause-and-check note right under the message (ordinary messages don't).
+    await C.page.waitForSelector(tid('verify-banner'));
+    assert.match(await C.page.textContent(tid('verify-banner')), /Anyone can choose any name or @username/);
+    assert.equal(await C.page.$$eval(tid('risky-ask'), (e) => e.length), 0);
+    await send(D, 'It’s urgent — please send 20000 naira to my account today');
+    await C.page.waitForSelector(tid('risky-ask'), { timeout: 20000 });
+    assert.match(await C.page.textContent(tid('risky-ask')), /haven’t verified this contact/);
+    assert.equal(await C.page.$$eval(tid('risky-ask'), (e) => e.length), 1, 'only the money request is flagged');
 
     // Carol replies; Dave sees it and Carol gets ✓✓.
     await send(C, 'Hi Dave — not clicking that 😄');

@@ -85,3 +85,29 @@ test('lookalike contact names are caught (impersonation of an existing contact)'
   assert.deepEqual(lookalikeNames('Tunde', existing), []);
   assert.equal(skeleton('Ｐｒｉｎｃｅ'), 'prince', 'full-width letters normalised');
 });
+
+// ---------------------------------------------------------------- impostors & risky asks
+import { impersonates, riskyAsk } from '../../src/js/core/safety.js';
+
+test('impersonates: catches copycat display names AND @usernames, ignores the contact itself', () => {
+  const mine = [{ id: 'a', name: 'Prince', username: 'prince' }, { id: 'b', name: 'Mommy', username: 'adaeze.o' }];
+  assert.deepEqual(impersonates({ id: 'x', name: 'Pr1nce', username: 'prince_' }, mine), { name: 'Prince', user: 'prince' });
+  assert.deepEqual(impersonates({ id: 'x', name: 'Mummy', username: 'adaeze_o' }, mine), { name: 'Mommy', user: 'adaeze.o' });
+  // Names under 4 letters only match exactly ("Mom" vs "Mum" would flag half of everyone's contacts).
+  assert.equal(impersonates({ id: 'x', name: 'Ada' }, [{ id: 'y', name: 'Ade' }]).name, null);
+  assert.deepEqual(impersonates({ id: 'x', name: 'Tunde', username: 'tunde99' }, mine), { name: null, user: null });
+  assert.deepEqual(impersonates({ id: 'x', name: 'Tunde' }, mine), { name: null, user: null }, 'no username yet');
+  assert.deepEqual(impersonates(mine[0], mine), { name: null, user: null }, 'not compared with itself');
+});
+
+test('riskyAsk: money, gift cards, crypto, bank details, codes and passwords — not ordinary chat', () => {
+  for (const t of [
+    'Please send me 50000 naira, I will pay back tomorrow', 'can you transfer $200 to this account', 'Buy me an iTunes card and send the code',
+    'I need USDT urgently', 'send me your account number', 'What is the OTP you just got?', 'forward the verification code they sent you',
+    'tell me your passcode? no — tell me your password', 'It’s an emergency, please send money now', 'Kindly lend me ₦20000',
+  ]) assert.equal(riskyAsk(t), true, t);
+  for (const t of [
+    'See you at 5', 'I paid for lunch already', 'the code compiles now', 'my password manager is great', 'send me the photos from yesterday',
+    'Happy birthday!', 'transfer the files when you can', 'what’s the wifi password', '', null,
+  ]) assert.equal(riskyAsk(t), false, String(t));
+});

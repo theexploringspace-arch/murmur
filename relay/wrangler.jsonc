@@ -12,6 +12,10 @@
   // Calls: at most 20 TURN credential requests per minute per IP address (per Cloudflare location).
   // The TURN key itself is set as secrets (never in this file):
   //   npx wrangler secret put TURN_KEY_ID      and      npx wrangler secret put TURN_KEY_API_TOKEN
-  "ratelimits": [{ "name": "TURN_LIMIT", "namespace_id": "4271", "simple": { "limit": 20, "period": 60 } }],
+  // Mailboxes: at most 300 opens per minute per IP (a phone needs a handful; caps passphrase guessing).
+  "ratelimits": [
+    { "name": "TURN_LIMIT", "namespace_id": "4271", "simple": { "limit": 20, "period": 60 } },
+    { "name": "INBOX_LIMIT", "namespace_id": "4272", "simple": { "limit": 300, "period": 60 } }
+  ],
   "observability": { "enabled": false }
 }

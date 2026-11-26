@@ -79,7 +79,7 @@ test('every chat colour keeps text, time and ticks readable (text colour picked 
 
 test('looks: stored values are validated; a chat overrides the default field by field', () => {
   assert.deepEqual(cleanLook(undefined), { ...DEFAULT_LOOK });
-  assert.deepEqual(cleanLook({ bubble: 'nope', wall: '<script>', dim: 'yes' }), { bubble: 'teal', wall: 'none', dim: true });
+  assert.deepEqual(cleanLook({ bubble: 'nope', wall: '<script>', dim: 'yes' }), { bubble: 'teal', wall: 'murmur', dim: true });
   assert.equal(cleanLook({ bubble: '#123456' }).bubble, '#123456', 'a custom hex is allowed');
   assert.equal(cleanLook({ wall: 'photo' }).wall, 'photo');
   assert.equal(bubbleHex('nope'), BUBBLES[0].hex);
@@ -98,4 +98,23 @@ test('every wallpaper and text-status background has its CSS, and white text rea
     assert.ok(m, `.stbg-${id} missing or not a two-stop gradient`);
     for (const stop of [m[1], m[2]]) assert.ok(contrast('#ffffff', stop) >= AA, `status background ${id}: white on ${stop} = ${contrast('#ffffff', stop).toFixed(2)}`);
   }
+});
+
+test('default wallpaper: Murmur doodles, a seamless tile shipped as two SVGs, reproducible from tools/doodle.mjs', async () => {
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { layout, svg } = await import('../../tools/doodle.mjs');
+  assert.equal(DEFAULT_LOOK.wall, 'murmur');
+  for (const f of ['dark', 'light']) assert.ok(existsSync(new URL(`../../src/img/doodle-${f}.svg`, import.meta.url)), f);
+  // Same seed → byte-identical file (a hand edit would be overwritten on the next run, so catch it here).
+  const dark = svg(layout(), { ink: '#b8c6d8', logoInk: '#43e6c1', inkOpacity: 0.11, logoOpacity: 0.17 });
+  assert.equal(readFileSync(new URL('../../src/img/doodle-dark.svg', import.meta.url), 'utf8'), dark);
+  // Quiet enough to sit behind text, and only paths: no scripts, no external references.
+  assert.doesNotMatch(dark, /<script|href=|url\(/i);
+  assert.match(css, /\.wall-murmur\s*\{[^}]*doodle-dark\.svg/);
+  assert.match(css, /data-theme="light"\] \.wall-murmur\s*\{[^}]*doodle-light\.svg/);
+  // Seamless: every doodle near an edge is also drawn on the opposite side.
+  const placed = layout(); const W = 420;
+  const near = placed.filter((p) => p.x - p.rad < 0);
+  assert.ok(near.length > 0);
+  for (const p of near) assert.match(dark, new RegExp(`translate\\(${(p.x + W).toFixed(1)} `), 'wrapped copy');
 });

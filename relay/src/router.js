@@ -70,6 +70,12 @@ export async function route(request, env) {
     const len = Number(request.headers.get('Content-Length') || 0);
     if (len > MAX_MESSAGE) return new Response('message too large', { status: 413, headers: cors(env, origin) });
   }
+  // Opening a mailbox is the step a guesser repeats (every passphrase guess = one mailbox to try).
+  // Generous for real phones — many people can share one carrier IP — but caps a single machine.
+  if (isWs && env.INBOX_LIMIT) {
+    const { success } = await env.INBOX_LIMIT.limit({ key: request.headers.get('CF-Connecting-IP') || 'unknown' });
+    if (!success) return new Response('slow down', { status: 429, headers: cors(env, origin) });
+  }
   const stub = env.INBOX.get(env.INBOX.idFromName(addr));
   const fwd = new Request(request, { headers: new Headers(request.headers) });
   fwd.headers.set('x-murmur-addr', addr);

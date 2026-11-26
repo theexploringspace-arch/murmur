@@ -284,6 +284,14 @@ later in the file, same specificity as `.wall-aurora`, so it won. The e2e test c
 screen *had* the class `wall-photo`, which it did. It now checks the computed `background-image`
 (the thing a person sees), and was re-run with the bad rule restored to prove it fails.
 
+## Lesson: a PIN is only as strong as whoever counts
+Asked for "a security PIN on new devices", the tempting build is a PIN field mixed into the key. That
+adds ~20 bits to a passphrase — almost nothing. What makes Signal's PIN strong is a service that counts
+wrong tries. Murmur has exactly one such place, the relay mailbox, so the count lives there (per backup,
+never wiping). Two bugs the tests caught: "0 tries left" with no wait (an off-by-one between *free tries*
+and *when the wait starts*), and a test that hung for minutes because one WebSocket was left open and
+kept the test server alive — find the leak, don't raise the timeout.
+
 ## History storage
 `history/<contact>` is the list; each file's bytes are their own record `media/<contact>/<message>`,
 written once and deleted when the message is deleted (for me / for everyone), cleared, aged out
